@@ -124,7 +124,11 @@ cp bin/systemd.svc.sh.template ./svc.sh && chmod +x ./svc.sh
 
 echo "Setup finished - waiting for Workflow Job"
 sleep 60
-journalctl -u actions.runner.service -o json --no-pager | jq -e '.|.MESSAGE|match("Running job:")' || shutdown now
-echo "Accepted Workflow Job - processing"
+if journalctl -u actions.runner.service --no-pager | grep -q "Running job:"; then
+  echo "Accepted Workflow Job - processing"
+else
+  echo "No job accepted, shutting down"
+  shutdown now
+fi
 EOT
 }
