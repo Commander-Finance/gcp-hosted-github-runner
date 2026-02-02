@@ -25,8 +25,8 @@ resource "google_cloud_run_v2_service" "autoscaler" {
     max_instance_request_concurrency = var.max_concurrency
     timeout                          = format("%ds", var.autoscaler_timeout)
     scaling {
-      min_instance_count = 0
-      max_instance_count = 1
+      min_instance_count = 1
+      max_instance_count = 10
     }
     containers {
       image = "${local.region}-docker.pkg.dev/${local.projectId}/${google_artifact_registry_repository.ghcr.name}/${local.runnerDockerImage}:${local.runnerDockerTag}"
