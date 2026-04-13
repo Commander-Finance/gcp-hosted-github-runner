@@ -113,6 +113,17 @@ func IsMagicLabel(label string) bool {
 	return false
 }
 
+// FilterMagicLabels returns a new slice with all magic labels removed
+func FilterMagicLabels(labels []string) []string {
+	filtered := []string{}
+	for _, label := range labels {
+		if !IsMagicLabel(label) {
+			filtered = append(filtered, label)
+		}
+	}
+	return filtered
+}
+
 func (j Job) GetMagicLabelValue(key MagicLabel) *string {
 
 	matchMagicLabel := regexp.MustCompile("@(" + string(key) + "):(.+)")
@@ -598,6 +609,10 @@ func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 	if data, src, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
 		json.Unmarshal(data, &job)
+		// magic labels (e.g. @machine:c2d-standard-16) are not valid GitHub runner labels
+		// and would cause the JIT config API to reject the request, so strip them before
+		// sending to GitHub. The machine type is still extracted from the unfiltered job.Labels.
+		filteredLabels := FilterMagicLabels(job.Labels)
 		// use jit config
 		switch src.SourceType {
 		case TypeEnterprise:
@@ -605,20 +620,20 @@ func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_ENTERPRISE_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, VmSettings{
 				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
 				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, job.Labels)
+			}, filteredLabels)
 		case TypeOrganization:
 			log.Infof("Using jit config for runner registration for organization: %s", src.Name)
 			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_ORG_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, VmSettings{
 				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
 				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, job.Labels)
+			}, filteredLabels)
 		case TypeRepository:
 			log.Infof("Using jit config for runner registration for repository: %s", src.Name)
 			// for repositories there is an implicit runner group with id 1
 			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_REPO_JIT_CONFIG_ENDPOINT, src.Name), 1, VmSettings{
 				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
 				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, job.Labels)
+			}, filteredLabels)
 		default:
 			log.Errorf("Missing source type for %s", src.Name)
 			ctx.Status(http.StatusBadRequest)

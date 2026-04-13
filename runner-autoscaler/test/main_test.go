@@ -114,6 +114,29 @@ func TestHasAllLabels(t *testing.T) {
 	assert.Len(t, missing, 1)
 }
 
+func TestFilterMagicLabels(t *testing.T) {
+
+	// Mixed labels: magic labels should be removed, regular labels kept
+	result := pkg.FilterMagicLabels([]string{"self-hosted", "@machine:c2d-standard-16", "linux", "@machine:e2-standard-4"})
+	assert.Equal(t, []string{"self-hosted", "linux"}, result)
+
+	// No magic labels: all labels should be returned
+	result = pkg.FilterMagicLabels([]string{"self-hosted", "linux", "x64"})
+	assert.Equal(t, []string{"self-hosted", "linux", "x64"}, result)
+
+	// All magic labels: should return empty slice
+	result = pkg.FilterMagicLabels([]string{"@machine:c2d-standard-16"})
+	assert.Equal(t, []string{}, result)
+
+	// Empty input: should return empty slice
+	result = pkg.FilterMagicLabels([]string{})
+	assert.Equal(t, []string{}, result)
+
+	// Labels that look similar but are NOT magic labels (no @ prefix or unknown key)
+	result = pkg.FilterMagicLabels([]string{"machine:c2d-standard-16", "@unknown:value", "self-hosted"})
+	assert.Equal(t, []string{"machine:c2d-standard-16", "@unknown:value", "self-hosted"}, result)
+}
+
 func TestDeleteNotExistingVM(t *testing.T) {
 
 	job := pkg.Job{
