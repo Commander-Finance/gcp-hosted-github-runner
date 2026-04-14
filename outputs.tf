@@ -18,3 +18,8 @@ output "machine_zones" {
   value       = local.zones
   description = "The zones where VM instances will be created in"
 }
+
+output "autoscaler_service_account_member" {
+  value       = "serviceAccount:${google_service_account.autoscaler_sa.email}"
+  description = "IAM member string for the github-runner-autoscaler Cloud Run service account (format: serviceAccount:<email>). Use this in IAM policies to grant additional permissions."
+}

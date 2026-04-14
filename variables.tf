@@ -37,7 +37,7 @@ variable "machine_creation_delay" {
 variable "max_concurrency" {
   type        = number
   description = "The estimated maximum number of concurrent workflow jobs"
-  default     = 100
+  default     = 500
   validation {
     condition     = var.max_concurrency <= 1000 && var.max_concurrency > 0
     error_message = "The value must be between 0 < x <= 1000"
@@ -154,4 +154,10 @@ variable "simulate" {
   type        = bool
   description = "Use only for development: If enabled no VMs will be created/deleted."
   default     = false
+}
+
+variable "run_setup_on_runner_machines" {
+  type        = bool
+  description = "If true, the startup script will install required dependencies (docker.io, docker-buildx, curl, sed, jq, and any github_runner_packages) and add the 'agent' user with required permissions. Set to false if you are using a custom image that already contains all required dependencies."
+  default     = true
 }
