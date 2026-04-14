@@ -15,6 +15,7 @@ import (
 
 	"github.com/Tereius/gcp-hosted-github-runner/pkg"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var PORT = 9999
@@ -81,18 +82,64 @@ func TestGenerateRunnerJitConfig(t *testing.T) {
 func TestGetMagicLabelValue(t *testing.T) {
 
 	job := pkg.Job{
-		Labels: []string{"test", "@foo:bar", "@machine:test"},
+		Labels: []string{"self-hosted", "gce-machine-c2d-standard-16", "linux"},
 	}
 	result := job.GetMagicLabelValue(pkg.MagicLabelMachine)
-	assert.NotNil(t, result)
-	assert.Equal(t, "test", *result)
+	require.NotNil(t, result)
+	assert.Equal(t, "c2d-standard-16", *result)
+}
+
+func TestGetMagicLabelValueRejectsLegacy(t *testing.T) {
+
+	job := pkg.Job{Labels: []string{"self-hosted", "@machine:c2d-standard-16"}}
+	assert.Nil(t, job.GetMagicLabelValue(pkg.MagicLabelMachine))
+}
+
+func TestHasLegacyMagicLabel(t *testing.T) {
+
+	assert.True(t, pkg.Job{Labels: []string{"self-hosted", "@machine:c2d-standard-16"}}.HasLegacyMagicLabel())
+	assert.True(t, pkg.Job{Labels: []string{"@machine:"}}.HasLegacyMagicLabel())
+
+	assert.False(t, pkg.Job{Labels: []string{"self-hosted", "gce-machine-c2d-standard-16"}}.HasLegacyMagicLabel())
+	assert.False(t, pkg.Job{Labels: []string{"self-hosted", "linux"}}.HasLegacyMagicLabel())
+	assert.False(t, pkg.Job{Labels: []string{}}.HasLegacyMagicLabel())
+}
+
+func TestIsMagicLabel(t *testing.T) {
+
+	positive := []string{
+		"gce-machine-c2d-standard-16",
+		"gce-machine-e2-highmem-8",
+		"gce-machine-t2d-standard-1",
+		"gce-machine-n2d-highcpu-96",
+		// shared-core types are only 2 segments (series-variety) — must still match.
+		"gce-machine-f1-micro",
+		"gce-machine-g1-small",
+		"gce-machine-e2-micro",
+		"gce-machine-e2-medium",
+	}
+	for _, label := range positive {
+		assert.True(t, pkg.IsMagicLabel(label), "expected %q to be recognised as a magic label", label)
+	}
+
+	negative := []string{
+		"gce-machine-foo",                // only 1 segment after prefix, not shape-valid
+		"gce-machine-learning",           // same: 1 segment
+		"self-hosted",                    // not a magic label at all
+		"@machine:c2d-standard-16",       // legacy syntax — deliberately rejected
+		"GCE-MACHINE-c2d-standard-16",    // wrong case
+		"foogce-machine-c2d-standard-16", // full-label-anchored: prefix not at start
+	}
+	for _, label := range negative {
+		assert.False(t, pkg.IsMagicLabel(label), "expected %q NOT to be recognised as a magic label", label)
+	}
 }
 
 func TestCreateCallbackTask(t *testing.T) {
 
 	job := pkg.Job{
 		Id:     rand.Int63n(math.MaxInt64),
-		Labels: []string{"test", "@foo:bar", "@machine:test"},
+		Labels: []string{"test", "gce-machine-c2d-standard-16"},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -103,7 +150,7 @@ func TestCreateCallbackTask(t *testing.T) {
 func TestHasAllLabels(t *testing.T) {
 
 	job := pkg.Job{
-		Labels: []string{"test", "@foo:bar", "@machine:test"},
+		Labels: []string{"test", "gce-machine-c2d-standard-16"},
 	}
 	result, missing := job.HasAllLabels([]string{"test"})
 	assert.True(t, result)
@@ -112,48 +159,6 @@ func TestHasAllLabels(t *testing.T) {
 	assert.False(t, result)
 	assert.NotEmpty(t, missing)
 	assert.Len(t, missing, 1)
-}
-
-func TestFilterMagicLabels(t *testing.T) {
-
-	// Mixed labels: magic labels should be removed, regular labels kept
-	result := pkg.FilterMagicLabels([]string{"self-hosted", "@machine:c2d-standard-16", "linux", "@machine:e2-standard-4"})
-	assert.Equal(t, []string{"self-hosted", "linux"}, result)
-
-	// No magic labels: all labels should be returned
-	result = pkg.FilterMagicLabels([]string{"self-hosted", "linux", "x64"})
-	assert.Equal(t, []string{"self-hosted", "linux", "x64"}, result)
-
-	// All magic labels: should return empty slice
-	result = pkg.FilterMagicLabels([]string{"@machine:c2d-standard-16"})
-	assert.Equal(t, []string{}, result)
-
-	// Empty input: should return empty slice
-	result = pkg.FilterMagicLabels([]string{})
-	assert.Equal(t, []string{}, result)
-
-	// Labels that look similar but are NOT magic labels (no @ prefix or unknown key)
-	result = pkg.FilterMagicLabels([]string{"machine:c2d-standard-16", "@unknown:value", "self-hosted"})
-	assert.Equal(t, []string{"machine:c2d-standard-16", "@unknown:value", "self-hosted"}, result)
-
-	// Labels containing the magic-label pattern as a substring must NOT be filtered
-	// (the pattern must span the entire label).
-	result = pkg.FilterMagicLabels([]string{"self-hosted", "foo@machine:bar"})
-	assert.Equal(t, []string{"self-hosted", "foo@machine:bar"}, result)
-
-	// Malformed magic labels (known key prefix but missing value, e.g. a user
-	// typo of "@machine:") must still be filtered out — they would otherwise
-	// reach the GitHub JIT-config API and trigger the exact label-validation
-	// failure this filter exists to prevent.
-	result = pkg.FilterMagicLabels([]string{"self-hosted", "@machine:"})
-	assert.Equal(t, []string{"self-hosted"}, result)
-}
-
-func TestGetMagicLabelValueRequiresFullMatch(t *testing.T) {
-
-	// Substring matches on a non-magic label must not yield a machine type.
-	job := pkg.Job{Labels: []string{"self-hosted", "foo@machine:bar"}}
-	assert.Nil(t, job.GetMagicLabelValue(pkg.MagicLabelMachine))
 }
 
 func TestDeleteNotExistingVM(t *testing.T) {
