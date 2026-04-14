@@ -109,6 +109,10 @@ echo "Setup of agent '$agent_name' started"
 
 ${var.run_setup_on_runner_machines ? local.setup_and_install_subscript : ""}
 
+if [ ! -d /home/agent ]; then
+  echo "ERROR: /home/agent directory does not exist. When using a custom image, ensure the runner is pre-installed at /home/agent."
+  shutdown now
+fi
 cd /home/agent
 
 encoded_jit_config=$1
