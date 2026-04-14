@@ -135,6 +135,18 @@ func TestFilterMagicLabels(t *testing.T) {
 	// Labels that look similar but are NOT magic labels (no @ prefix or unknown key)
 	result = pkg.FilterMagicLabels([]string{"machine:c2d-standard-16", "@unknown:value", "self-hosted"})
 	assert.Equal(t, []string{"machine:c2d-standard-16", "@unknown:value", "self-hosted"}, result)
+
+	// Labels containing the magic-label pattern as a substring must NOT be filtered
+	// (the pattern must span the entire label).
+	result = pkg.FilterMagicLabels([]string{"self-hosted", "foo@machine:bar"})
+	assert.Equal(t, []string{"self-hosted", "foo@machine:bar"}, result)
+}
+
+func TestGetMagicLabelValueRequiresFullMatch(t *testing.T) {
+
+	// Substring matches on a non-magic label must not yield a machine type.
+	job := pkg.Job{Labels: []string{"self-hosted", "foo@machine:bar"}}
+	assert.Nil(t, job.GetMagicLabelValue(pkg.MagicLabelMachine))
 }
 
 func TestDeleteNotExistingVM(t *testing.T) {

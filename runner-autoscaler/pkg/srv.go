@@ -103,14 +103,13 @@ const (
 )
 
 var magicLabels = []string{string(MagicLabelMachine)}
-var matchMagicLabels = regexp.MustCompile(`@(` + strings.Join(magicLabels, "|") + `):`)
+
+// matchMagicLabels anchors the whole label so that strings merely *containing*
+// an "@<key>:" substring aren't misclassified as magic labels.
+var matchMagicLabels = regexp.MustCompile(`^@(` + strings.Join(magicLabels, "|") + `):(.+)$`)
 
 func IsMagicLabel(label string) bool {
-
-	if matches := matchMagicLabels.FindStringSubmatch(label); len(matches) >= 2 {
-		return true
-	}
-	return false
+	return matchMagicLabels.MatchString(label)
 }
 
 // FilterMagicLabels returns a new slice with all magic labels removed
@@ -126,7 +125,7 @@ func FilterMagicLabels(labels []string) []string {
 
 func (j Job) GetMagicLabelValue(key MagicLabel) *string {
 
-	matchMagicLabel := regexp.MustCompile("@(" + string(key) + "):(.+)")
+	matchMagicLabel := regexp.MustCompile("^@(" + string(key) + "):(.+)$")
 	for _, l := range j.Labels {
 		matches := matchMagicLabel.FindStringSubmatch(l)
 		if len(matches) >= 3 {
