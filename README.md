@@ -100,15 +100,18 @@ This are the most common variables you may want to change:
 
 #### Magic Labels
 
-Each workflow job can select a different machine type than the configured default `machine_type`. This is done by the special label `@machine:c2d-standard-16`. Make sure that the configured `disk_type` is supported by the machine.
+Each workflow job can select a different machine type than the configured default `machine_type`. Use the special label `gce-machine-<type>`, e.g. `gce-machine-c2d-standard-16`. Make sure the configured `disk_type` is supported by the machine.
 
-```
+```yaml
 jobs:
   example:
-    runs-on: [self-hosted, @machine:c2d-standard-16] // this job will run on a c2d-standard-16 machine
+    runs-on: [self-hosted, gce-machine-c2d-standard-16]  # runs on a c2d-standard-16 VM
     steps:
-    - run: echo Hello world!
+      - run: echo Hello world!
 ```
+
+> [!NOTE]
+> Earlier versions of this module documented `@machine:<type>` (e.g. `@machine:c2d-standard-16`). That syntax does not work: GitHub's JIT runner-registration API rejects labels containing `@` or `:`, so runners spawned for such jobs could not match the job's required labels and the job timed out. Replace `@machine:<type>` with `gce-machine-<type>` in any existing workflows. Jobs still using the old syntax are detected in the webhook handler and skipped (no VM is created) with a warning logged pointing at this section.
 
 ## Expected Cost
 

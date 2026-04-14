@@ -102,48 +102,45 @@ const (
 	MagicLabelMachine MagicLabel = "machine"
 )
 
-var magicLabels = []string{string(MagicLabelMachine)}
+// matchMachineLabel matches GCE machine-type overrides like
+// "gce-machine-c2d-standard-16". These characters are all valid GitHub runner
+// labels, so the same string is both a parseable override for us AND a label
+// we can register with GitHub — which is what lets the spawned runner match
+// the job's `runs-on`. The 3+ segment shape keeps arbitrary user labels like
+// "gce-machine-foo" from being misclassified.
+var matchMachineLabel = regexp.MustCompile(`^gce-machine-([a-z0-9]+(?:-[a-z0-9]+){2,})$`)
 
-// matchMagicLabels anchors the whole label so that strings merely *containing*
-// an "@<key>:" substring aren't misclassified as magic labels. Requires a
-// non-empty value so that only well-formed magic labels pass IsMagicLabel
-// (used for machine-type extraction and label-match skipping).
-var matchMagicLabels = regexp.MustCompile(`^@(` + strings.Join(magicLabels, "|") + `):(.+)$`)
-
-// matchMagicLabelPrefix matches the magic-label key prefix regardless of
-// whether a value is present. FilterMagicLabels uses this so that malformed
-// inputs like "@machine:" (user typo) are still stripped from the JIT-config
-// payload — otherwise they'd reach GitHub's label validator and cause the
-// exact failure the filter exists to prevent.
-var matchMagicLabelPrefix = regexp.MustCompile(`^@(` + strings.Join(magicLabels, "|") + `):`)
+// matchLegacyMagicLabel detects the historical "@<key>:" syntax, which
+// GitHub's JIT API rejects because labels may not contain "@" or ":". Kept
+// only so handleWebhook can emit a migration warning.
+var matchLegacyMagicLabel = regexp.MustCompile(`^@` + string(MagicLabelMachine) + `:`)
 
 func IsMagicLabel(label string) bool {
-	return matchMagicLabels.MatchString(label)
-}
-
-// FilterMagicLabels returns a new slice with all magic labels removed, including
-// malformed ones that match the magic-label key prefix but lack a value.
-func FilterMagicLabels(labels []string) []string {
-	filtered := make([]string, 0, len(labels))
-	for _, label := range labels {
-		if !matchMagicLabelPrefix.MatchString(label) {
-			filtered = append(filtered, label)
-		}
-	}
-	return filtered
+	return matchMachineLabel.MatchString(label)
 }
 
 func (j Job) GetMagicLabelValue(key MagicLabel) *string {
 
-	matchMagicLabel := regexp.MustCompile("^@(" + string(key) + "):(.+)$")
+	if key != MagicLabelMachine {
+		return nil
+	}
 	for _, l := range j.Labels {
-		matches := matchMagicLabel.FindStringSubmatch(l)
-		if len(matches) >= 3 {
-			ret := matches[2]
+		if matches := matchMachineLabel.FindStringSubmatch(l); len(matches) >= 2 {
+			ret := matches[1]
 			return &ret
 		}
 	}
 	return nil
+}
+
+func (j Job) HasLegacyMagicLabel() bool {
+
+	for _, l := range j.Labels {
+		if matchLegacyMagicLabel.MatchString(l) {
+			return true
+		}
+	}
+	return false
 }
 
 // returns true if all labels were found (excluding magic labels). false otherwise. Returns also all labels that were missing
@@ -618,31 +615,26 @@ func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 	if data, src, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
 		json.Unmarshal(data, &job)
-		// magic labels (e.g. @machine:c2d-standard-16) are not valid GitHub runner labels
-		// and would cause the JIT config API to reject the request, so strip them before
-		// sending to GitHub. The machine type is still extracted from the unfiltered job.Labels.
-		filteredLabels := FilterMagicLabels(job.Labels)
-		// use jit config
 		switch src.SourceType {
 		case TypeEnterprise:
 			log.Infof("Using jit config for runner registration for enterprise: %s", src.Name)
 			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_ENTERPRISE_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, VmSettings{
 				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
 				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, filteredLabels)
+			}, job.Labels)
 		case TypeOrganization:
 			log.Infof("Using jit config for runner registration for organization: %s", src.Name)
 			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_ORG_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, VmSettings{
 				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
 				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, filteredLabels)
+			}, job.Labels)
 		case TypeRepository:
 			log.Infof("Using jit config for runner registration for repository: %s", src.Name)
 			// for repositories there is an implicit runner group with id 1
 			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_REPO_JIT_CONFIG_ENDPOINT, src.Name), 1, VmSettings{
 				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
 				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, filteredLabels)
+			}, job.Labels)
 		default:
 			log.Errorf("Missing source type for %s", src.Name)
 			ctx.Status(http.StatusBadRequest)
@@ -680,7 +672,11 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 				ctx.AbortWithError(http.StatusBadRequest, err)
 			} else {
 				if payload.Action == QUEUED {
-					if ok, missingLabels := payload.Job.HasAllLabels(s.conf.RunnerLabels); ok {
+					if payload.Job.HasLegacyMagicLabel() {
+						// Skip the create-vm callback: a runner we spawn for this job can
+						// never match its `runs-on` (see matchLegacyMagicLabel).
+						log.Warnf("Job %d uses deprecated magic-label syntax (@machine:<type>). Use \"gce-machine-<type>\" (e.g. \"gce-machine-c2d-standard-16\") instead. See README \u2192 Magic Labels. Skipping VM creation; the job will time out.", payload.Job.Id)
+					} else if ok, missingLabels := payload.Job.HasAllLabels(s.conf.RunnerLabels); ok {
 						createUrl := createCallbackUrl(ctx, s.conf.RouteCreateVm, s.conf.SourceQueryParam, src.Name)
 						// delay the create vm callback so we have a chance to delete it if the workflow job is changing its state to 'waiting'
 						if err := s.CreateCallbackTaskWithToken(ctx, createUrl, src.Secret, payload.Job, time.Duration(s.conf.CreateVmDelay)*time.Second); err != nil {

@@ -8,7 +8,7 @@ require (
 	cloud.google.com/go/secretmanager v1.13.5
 	github.com/gin-gonic/gin v1.10.0
 	github.com/sirupsen/logrus v1.9.3
-	github.com/stretchr/testify v1.9.0
+	github.com/stretchr/testify v1.11.1
 	github.com/toorop/gin-logrus v0.0.0-20210225092905-2c785434f26f
 	google.golang.org/protobuf v1.34.2
 )
