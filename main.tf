@@ -18,14 +18,14 @@ locals {
   projectId                   = data.google_client_config.current.project
   projectNumber               = data.google_project.current.number
   region                      = data.google_client_config.current.region
-  zones                       = distinct(concat(var.machine_zones, data.google_client_config.current.zone != null ? [data.google_client_config.current.zone] : [] ))
+  zones                       = distinct(concat(var.machine_zones, data.google_client_config.current.zone != null ? [data.google_client_config.current.zone] : []))
   runnerLabel                 = join(",", var.github_runner_labels)
   runnerLabelInstanceTemplate = length(var.github_runner_labels) == 0 ? "" : format("--no-default-labels --labels '%s'", local.runnerLabel)
   hasEnterprise               = length(var.github_enterprise) > 0
   hasOrg                      = length(var.github_organization) > 0
   hasRepo                     = length(var.github_repositories) > 0
   sourceQueryParamName        = "src"
-  runnerDockerImage           = "privatehive/github-runner-autoscaler"
+  runnerDockerImage           = "commander-finance/github-runner-autoscaler"
   runnerDockerTag             = local.autoscaler_version
 }
 
