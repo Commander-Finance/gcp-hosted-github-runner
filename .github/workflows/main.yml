@@ -18,11 +18,11 @@ jobs:
           cache-dependency-path: runner-autoscaler/go.sum
       - name: "Run unit tests"
         working-directory: runner-autoscaler
-        # Excludes tests that require real GCP/GitHub credentials
-        # (TestCreateCallbackTask, TestGenerateRunnerJitConfig, TestDeleteNotExistingVM).
+        # Skip tests that require real GCP/GitHub credentials. Any new unit test
+        # is picked up automatically; only credentialed ones need listing here.
         run: |
           go test -v -count=1 ./test/... \
-            -run '^(TestFilterMagicLabels|TestHasAllLabels|TestGetMagicLabelValue|TestWebhookSignature)$'
+            -skip '^(TestCreateCallbackTask|TestGenerateRunnerJitConfig|TestDeleteNotExistingVM)$'
 
   extract_version:
     name: "Extract autoscaler version"
