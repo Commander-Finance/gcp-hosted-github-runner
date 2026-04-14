@@ -68,10 +68,12 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           sbom: false
           provenance: false
+          # github.ref_name on a pull_request event is "<PR#>/merge" (contains a
+          # slash, invalid as a Docker tag), and on push it's always "master" here
+          # (push trigger is gated to master) — redundant with :latest. Omit.
           tags: |
             ghcr.io/commander-finance/github-runner-autoscaler:latest
             ghcr.io/commander-finance/github-runner-autoscaler:${{ needs.extract_version.outputs.autoscaler_version }}
-            ghcr.io/commander-finance/github-runner-autoscaler:${{ github.ref_name }}
       - name: "Delete untagged Docker images"
         if: github.event_name == 'push'
         uses: actions/delete-package-versions@v5
