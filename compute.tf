@@ -127,12 +127,23 @@ cp bin/systemd.svc.sh.template ./svc.sh && chmod +x ./svc.sh
 ./svc.sh start || shutdown now
 
 echo "Setup finished - waiting for Workflow Job"
-sleep 60
-if journalctl -u actions.runner.service --no-pager | grep -q "Running job:"; then
-  echo "Accepted Workflow Job - processing"
-else
-  echo "No job accepted, shutting down"
-  shutdown now
-fi
+max_wait=180
+elapsed=0
+interval=1
+while [ $elapsed -lt $max_wait ]; do
+  if journalctl -u actions.runner.service --no-pager | grep -q "Running job:"; then
+    echo "Accepted Workflow Job - processing"
+    exit 0
+  fi
+  remaining=$((max_wait - elapsed))
+  if [ $interval -gt $remaining ]; then
+    interval=$remaining
+  fi
+  sleep $interval
+  elapsed=$((elapsed + interval))
+  interval=$((interval * 2))
+done
+echo "No job accepted after $${elapsed}s, shutting down"
+shutdown now
 EOT
 }
