@@ -140,6 +140,13 @@ func TestFilterMagicLabels(t *testing.T) {
 	// (the pattern must span the entire label).
 	result = pkg.FilterMagicLabels([]string{"self-hosted", "foo@machine:bar"})
 	assert.Equal(t, []string{"self-hosted", "foo@machine:bar"}, result)
+
+	// Malformed magic labels (known key prefix but missing value, e.g. a user
+	// typo of "@machine:") must still be filtered out — they would otherwise
+	// reach the GitHub JIT-config API and trigger the exact label-validation
+	// failure this filter exists to prevent.
+	result = pkg.FilterMagicLabels([]string{"self-hosted", "@machine:"})
+	assert.Equal(t, []string{"self-hosted"}, result)
 }
 
 func TestGetMagicLabelValueRequiresFullMatch(t *testing.T) {

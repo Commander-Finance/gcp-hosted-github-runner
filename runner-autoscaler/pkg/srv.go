@@ -105,18 +105,28 @@ const (
 var magicLabels = []string{string(MagicLabelMachine)}
 
 // matchMagicLabels anchors the whole label so that strings merely *containing*
-// an "@<key>:" substring aren't misclassified as magic labels.
+// an "@<key>:" substring aren't misclassified as magic labels. Requires a
+// non-empty value so that only well-formed magic labels pass IsMagicLabel
+// (used for machine-type extraction and label-match skipping).
 var matchMagicLabels = regexp.MustCompile(`^@(` + strings.Join(magicLabels, "|") + `):(.+)$`)
+
+// matchMagicLabelPrefix matches the magic-label key prefix regardless of
+// whether a value is present. FilterMagicLabels uses this so that malformed
+// inputs like "@machine:" (user typo) are still stripped from the JIT-config
+// payload — otherwise they'd reach GitHub's label validator and cause the
+// exact failure the filter exists to prevent.
+var matchMagicLabelPrefix = regexp.MustCompile(`^@(` + strings.Join(magicLabels, "|") + `):`)
 
 func IsMagicLabel(label string) bool {
 	return matchMagicLabels.MatchString(label)
 }
 
-// FilterMagicLabels returns a new slice with all magic labels removed
+// FilterMagicLabels returns a new slice with all magic labels removed, including
+// malformed ones that match the magic-label key prefix but lack a value.
 func FilterMagicLabels(labels []string) []string {
-	filtered := []string{}
+	filtered := make([]string, 0, len(labels))
 	for _, label := range labels {
-		if !IsMagicLabel(label) {
+		if !matchMagicLabelPrefix.MatchString(label) {
 			filtered = append(filtered, label)
 		}
 	}
