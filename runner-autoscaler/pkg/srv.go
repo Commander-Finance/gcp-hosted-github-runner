@@ -103,12 +103,15 @@ const (
 )
 
 // matchMachineLabel matches GCE machine-type overrides like
-// "gce-machine-c2d-standard-16". These characters are all valid GitHub runner
-// labels, so the same string is both a parseable override for us AND a label
-// we can register with GitHub — which is what lets the spawned runner match
-// the job's `runs-on`. The 3+ segment shape keeps arbitrary user labels like
-// "gce-machine-foo" from being misclassified.
-var matchMachineLabel = regexp.MustCompile(`^gce-machine-([a-z0-9]+(?:-[a-z0-9]+){2,})$`)
+// "gce-machine-c2d-standard-16" or "gce-machine-f1-micro". These characters
+// are all valid GitHub runner labels, so the same string is both a parseable
+// override for us AND a label we can register with GitHub — which is what
+// lets the spawned runner match the job's `runs-on`. The 2+ segment shape
+// accepts both 3-segment types (family-class-size, e.g. c2d-standard-16) and
+// 2-segment shared-core types (family-variety, e.g. f1-micro, e2-medium)
+// while still keeping arbitrary user labels like "gce-machine-foo" from being
+// misclassified.
+var matchMachineLabel = regexp.MustCompile(`^gce-machine-([a-z0-9]+(?:-[a-z0-9]+)+)$`)
 
 // matchLegacyMagicLabel detects the historical "@<key>:" syntax, which
 // GitHub's JIT API rejects because labels may not contain "@" or ":". Kept

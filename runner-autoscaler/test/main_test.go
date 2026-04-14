@@ -112,6 +112,11 @@ func TestIsMagicLabel(t *testing.T) {
 		"gce-machine-e2-highmem-8",
 		"gce-machine-t2d-standard-1",
 		"gce-machine-n2d-highcpu-96",
+		// shared-core types are only 2 segments (series-variety) — must still match.
+		"gce-machine-f1-micro",
+		"gce-machine-g1-small",
+		"gce-machine-e2-micro",
+		"gce-machine-e2-medium",
 	}
 	for _, label := range positive {
 		assert.True(t, pkg.IsMagicLabel(label), "expected %q to be recognised as a magic label", label)
