@@ -158,6 +158,6 @@ variable "simulate" {
 
 variable "run_setup_on_runner_machines" {
   type        = bool
-  description = "If true, the startup script will install required dependencies such as docker and curl, and add the 'agent' user with required permissions. Set to false if you are using a custom image that already contains all required dependencies."
+  description = "If true, the startup script will install required dependencies (docker.io, docker-buildx, curl, sed, jq, and any github_runner_packages) and add the 'agent' user with required permissions. Set to false if you are using a custom image that already contains all required dependencies."
   default     = true
 }
