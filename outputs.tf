@@ -20,6 +20,6 @@ output "machine_zones" {
 }
 
 output "autoscaler_service_account_member" {
-  value = "serviceAccount:${google_service_account.autoscaler_sa.email}"
-  description = "The service account email used by the github-runner-autoscaler Cloud Run service. Can be used in IAM policies to grant additional permissions if needed."
+  value       = "serviceAccount:${google_service_account.autoscaler_sa.email}"
+  description = "IAM member string for the github-runner-autoscaler Cloud Run service account (format: serviceAccount:<email>). Use this in IAM policies to grant additional permissions."
 }
