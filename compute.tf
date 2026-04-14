@@ -143,6 +143,10 @@ while [ $elapsed -lt $max_wait ]; do
   elapsed=$((elapsed + interval))
   interval=$((interval * 2))
 done
+if journalctl -u actions.runner.service --no-pager | grep -q "Running job:"; then
+  echo "Accepted Workflow Job - processing"
+  exit 0
+fi
 echo "No job accepted after $${elapsed}s, shutting down"
 shutdown now
 EOT
