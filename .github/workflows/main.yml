@@ -44,6 +44,7 @@ jobs:
     needs: [test, extract_version]
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       packages: write
     steps:
       - name: "Clone repository"
