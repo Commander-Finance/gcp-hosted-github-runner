@@ -114,6 +114,48 @@ func TestHasAllLabels(t *testing.T) {
 	assert.Len(t, missing, 1)
 }
 
+func TestFilterMagicLabels(t *testing.T) {
+
+	// Mixed labels: magic labels should be removed, regular labels kept
+	result := pkg.FilterMagicLabels([]string{"self-hosted", "@machine:c2d-standard-16", "linux", "@machine:e2-standard-4"})
+	assert.Equal(t, []string{"self-hosted", "linux"}, result)
+
+	// No magic labels: all labels should be returned
+	result = pkg.FilterMagicLabels([]string{"self-hosted", "linux", "x64"})
+	assert.Equal(t, []string{"self-hosted", "linux", "x64"}, result)
+
+	// All magic labels: should return empty slice
+	result = pkg.FilterMagicLabels([]string{"@machine:c2d-standard-16"})
+	assert.Equal(t, []string{}, result)
+
+	// Empty input: should return empty slice
+	result = pkg.FilterMagicLabels([]string{})
+	assert.Equal(t, []string{}, result)
+
+	// Labels that look similar but are NOT magic labels (no @ prefix or unknown key)
+	result = pkg.FilterMagicLabels([]string{"machine:c2d-standard-16", "@unknown:value", "self-hosted"})
+	assert.Equal(t, []string{"machine:c2d-standard-16", "@unknown:value", "self-hosted"}, result)
+
+	// Labels containing the magic-label pattern as a substring must NOT be filtered
+	// (the pattern must span the entire label).
+	result = pkg.FilterMagicLabels([]string{"self-hosted", "foo@machine:bar"})
+	assert.Equal(t, []string{"self-hosted", "foo@machine:bar"}, result)
+
+	// Malformed magic labels (known key prefix but missing value, e.g. a user
+	// typo of "@machine:") must still be filtered out — they would otherwise
+	// reach the GitHub JIT-config API and trigger the exact label-validation
+	// failure this filter exists to prevent.
+	result = pkg.FilterMagicLabels([]string{"self-hosted", "@machine:"})
+	assert.Equal(t, []string{"self-hosted"}, result)
+}
+
+func TestGetMagicLabelValueRequiresFullMatch(t *testing.T) {
+
+	// Substring matches on a non-magic label must not yield a machine type.
+	job := pkg.Job{Labels: []string{"self-hosted", "foo@machine:bar"}}
+	assert.Nil(t, job.GetMagicLabelValue(pkg.MagicLabelMachine))
+}
+
 func TestDeleteNotExistingVM(t *testing.T) {
 
 	job := pkg.Job{

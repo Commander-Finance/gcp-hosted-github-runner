@@ -103,19 +103,39 @@ const (
 )
 
 var magicLabels = []string{string(MagicLabelMachine)}
-var matchMagicLabels = regexp.MustCompile(`@(` + strings.Join(magicLabels, "|") + `):`)
+
+// matchMagicLabels anchors the whole label so that strings merely *containing*
+// an "@<key>:" substring aren't misclassified as magic labels. Requires a
+// non-empty value so that only well-formed magic labels pass IsMagicLabel
+// (used for machine-type extraction and label-match skipping).
+var matchMagicLabels = regexp.MustCompile(`^@(` + strings.Join(magicLabels, "|") + `):(.+)$`)
+
+// matchMagicLabelPrefix matches the magic-label key prefix regardless of
+// whether a value is present. FilterMagicLabels uses this so that malformed
+// inputs like "@machine:" (user typo) are still stripped from the JIT-config
+// payload — otherwise they'd reach GitHub's label validator and cause the
+// exact failure the filter exists to prevent.
+var matchMagicLabelPrefix = regexp.MustCompile(`^@(` + strings.Join(magicLabels, "|") + `):`)
 
 func IsMagicLabel(label string) bool {
+	return matchMagicLabels.MatchString(label)
+}
 
-	if matches := matchMagicLabels.FindStringSubmatch(label); len(matches) >= 2 {
-		return true
+// FilterMagicLabels returns a new slice with all magic labels removed, including
+// malformed ones that match the magic-label key prefix but lack a value.
+func FilterMagicLabels(labels []string) []string {
+	filtered := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if !matchMagicLabelPrefix.MatchString(label) {
+			filtered = append(filtered, label)
+		}
 	}
-	return false
+	return filtered
 }
 
 func (j Job) GetMagicLabelValue(key MagicLabel) *string {
 
-	matchMagicLabel := regexp.MustCompile("@(" + string(key) + "):(.+)")
+	matchMagicLabel := regexp.MustCompile("^@(" + string(key) + "):(.+)$")
 	for _, l := range j.Labels {
 		matches := matchMagicLabel.FindStringSubmatch(l)
 		if len(matches) >= 3 {
@@ -598,6 +618,10 @@ func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 	if data, src, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
 		json.Unmarshal(data, &job)
+		// magic labels (e.g. @machine:c2d-standard-16) are not valid GitHub runner labels
+		// and would cause the JIT config API to reject the request, so strip them before
+		// sending to GitHub. The machine type is still extracted from the unfiltered job.Labels.
+		filteredLabels := FilterMagicLabels(job.Labels)
 		// use jit config
 		switch src.SourceType {
 		case TypeEnterprise:
@@ -605,20 +629,20 @@ func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_ENTERPRISE_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, VmSettings{
 				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
 				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, job.Labels)
+			}, filteredLabels)
 		case TypeOrganization:
 			log.Infof("Using jit config for runner registration for organization: %s", src.Name)
 			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_ORG_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, VmSettings{
 				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
 				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, job.Labels)
+			}, filteredLabels)
 		case TypeRepository:
 			log.Infof("Using jit config for runner registration for repository: %s", src.Name)
 			// for repositories there is an implicit runner group with id 1
 			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_REPO_JIT_CONFIG_ENDPOINT, src.Name), 1, VmSettings{
 				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
 				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, job.Labels)
+			}, filteredLabels)
 		default:
 			log.Errorf("Missing source type for %s", src.Name)
 			ctx.Status(http.StatusBadRequest)
