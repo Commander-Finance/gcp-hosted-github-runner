@@ -146,13 +146,13 @@ variable "github_runner_packages" {
 
 variable "force_cloud_run_deployment" {
   type        = bool
-  description = "Use only for development: Each Terraform apply leads to a new revision of the cloud run. The module normally gates Cloud Run revisions on the resolved autoscaler image digest (see var.runner_image_tag) - use this escape hatch to force a revision regardless (e.g., after rotating a secret consumed at startup, or if the Artifact Registry remote-repo proxy is serving a stale manifest)."
+  description = "Use only for development: Each Terraform apply leads to a new revision of the cloud run. The module normally gates Cloud Run revisions on the resolved autoscaler image digest (see var.runner_image_tag) - use this escape hatch to force a revision regardless (e.g., after rotating a secret consumed at startup)."
   default     = false
 }
 
 variable "runner_image_tag" {
   type        = string
-  description = "Docker image tag for the autoscaler, resolved against the Artifact Registry mirror of ghcr.io/commander-finance/github-runner-autoscaler. Defaults to \"master\" (floats with the latest master build - the digest-based data source ensures Cloud Run redeploys only when the underlying image digest actually changes). Pin a specific release by setting this to a date-version tag (e.g. \"26.04.14.152345\") that matches the git ref you've pinned the module to. Use \"sha-<full-commit-sha>\" for debug pins to a specific commit."
+  description = "Docker image tag for the autoscaler, resolved at plan time to an immutable sha256 digest against ghcr.io/commander-finance/github-runner-autoscaler. Cloud Run pulls the resolved digest through the Artifact Registry remote-repo proxy (dockerRepository.tf) at runtime, which lazily caches from ghcr.io on first pull. Defaults to \"master\" (floats with the latest master build - each plan re-resolves to the current digest). Pin a specific release by setting this to a date-version tag (e.g. \"26.04.14.152345\") that matches the git ref you've pinned the module to. Use \"sha-<full-commit-sha>\" for debug pins to a specific commit."
   default     = "master"
 }
 
