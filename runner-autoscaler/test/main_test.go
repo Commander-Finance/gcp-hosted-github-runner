@@ -34,18 +34,18 @@ const PUBLIC_SECRET = "It's a Secret to Everybody"
 func init() {
 
 	scaler = pkg.NewAutoscaler(pkg.AutoscalerConfig{
-		RouteWebhook:     "/webhook",
-		RouteCreateVm:    "/create",
-		RouteDeleteVm:    "/delete",
-		ProjectId:        PROJECT_ID,
-		Zones:            []string{ZONE},
-		TaskQueue:        "projects/" + PROJECT_ID + "/locations/" + REGION + "/queues/autoscaler-callback-queue",
-		InstanceTemplate: "projects/" + PROJECT_ID + "/global/instanceTemplates/ephemeral-github-runner",
-		SecretVersion:    "projects/" + PROJECT_ID + "/secrets/github-pat-token/versions/latest",
-		RunnerPrefix:     "runner",
-		RunnerGroupId:    1,
-		RunnerLabels:     []string{"self-hosted"},
-		SourceQueryParam: SOURCE_QUERY_PARAM_NAME,
+		RouteWebhook:      "/webhook",
+		RouteCreateVm:     "/create",
+		RouteDeleteVm:     "/delete",
+		ProjectId:         PROJECT_ID,
+		Zones:             []string{ZONE},
+		TaskQueue:         "projects/" + PROJECT_ID + "/locations/" + REGION + "/queues/autoscaler-callback-queue",
+		InstanceTemplate:  "projects/" + PROJECT_ID + "/global/instanceTemplates/ephemeral-github-runner",
+		SecretVersion:     "projects/" + PROJECT_ID + "/secrets/github-pat-token/versions/latest",
+		RunnerPrefix:      "runner",
+		RunnerGroupId:     1,
+		RunnerLabelGroups: [][]string{{"self-hosted"}},
+		SourceQueryParam:  SOURCE_QUERY_PARAM_NAME,
 		RegisteredSources: map[string]pkg.Source{
 			TEST_REPO_KEY: {
 				Name:       TEST_REPO,
@@ -147,18 +147,114 @@ func TestCreateCallbackTask(t *testing.T) {
 	assert.Nil(t, err)
 }
 
-func TestHasAllLabels(t *testing.T) {
+func TestParseLabelGroups(t *testing.T) {
 
-	job := pkg.Job{
-		Labels: []string{"test", "gce-machine-c2d-standard-16"},
+	cases := []struct {
+		name string
+		raw  string
+		want [][]string
+	}{
+		{"single label single group", "self-hosted", [][]string{{"self-hosted"}}},
+		{"single group two labels", "self-hosted,linux", [][]string{{"self-hosted", "linux"}}},
+		{"two single-label groups", "spock;spock-prime", [][]string{{"spock"}, {"spock-prime"}}},
+		{"two two-label groups", "spock,linux;spock-prime,linux", [][]string{{"spock", "linux"}, {"spock-prime", "linux"}}},
+		{"whitespace trimmed", "spock, linux ; spock-prime", [][]string{{"spock", "linux"}, {"spock-prime"}}},
+		{"empty labels dropped", "spock,;,spock-prime", [][]string{{"spock"}, {"spock-prime"}}},
+		{"empty groups dropped", "spock;;spock-prime", [][]string{{"spock"}, {"spock-prime"}}},
+		{"trailing separators", "spock;", [][]string{{"spock"}}},
+		{"empty string", "", [][]string{}},
+		{"only separators", " ; , ; ", [][]string{}},
 	}
-	result, missing := job.HasAllLabels([]string{"test"})
-	assert.True(t, result)
-	assert.Empty(t, missing)
-	result, missing = job.HasAllLabels([]string{"test", "foo"})
-	assert.False(t, result)
-	assert.NotEmpty(t, missing)
-	assert.Len(t, missing, 1)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, pkg.ParseLabelGroups(tc.raw))
+		})
+	}
+}
+
+func TestHasAnyLabelGroup(t *testing.T) {
+
+	cases := []struct {
+		name    string
+		labels  []string
+		groups  [][]string
+		wantOk  bool
+		wantMsg string
+	}{
+		{
+			name:    "single group fully satisfied",
+			labels:  []string{"test", "gce-machine-c2d-standard-16"},
+			groups:  [][]string{{"test"}},
+			wantOk:  true,
+			wantMsg: "",
+		},
+		{
+			name:    "single group one missing preserves legacy text",
+			labels:  []string{"test"},
+			groups:  [][]string{{"test", "foo"}},
+			wantOk:  false,
+			wantMsg: `missing the label(s) "foo"`,
+		},
+		{
+			name:    "single group multiple missing comma-joined",
+			labels:  []string{"test"},
+			groups:  [][]string{{"test", "foo", "bar"}},
+			wantOk:  false,
+			wantMsg: `missing the label(s) "foo, bar"`,
+		},
+		{
+			name:    "single group magic label in config is skipped",
+			labels:  []string{"spock"},
+			groups:  [][]string{{"spock", "gce-machine-c2d-standard-16"}},
+			wantOk:  true,
+			wantMsg: "",
+		},
+		{
+			name:    "multi group first matches",
+			labels:  []string{"spock"},
+			groups:  [][]string{{"spock"}, {"spock-prime"}},
+			wantOk:  true,
+			wantMsg: "",
+		},
+		{
+			name:    "multi group second matches",
+			labels:  []string{"spock-prime", "gce-machine-t2d-standard-4"},
+			groups:  [][]string{{"spock"}, {"spock-prime"}},
+			wantOk:  true,
+			wantMsg: "",
+		},
+		{
+			name:    "multi group no match describes required groups",
+			labels:  []string{"ghost-pool"},
+			groups:  [][]string{{"spock"}, {"spock-prime"}},
+			wantOk:  false,
+			wantMsg: "none of the label groups matched (required one of: [spock], [spock-prime])",
+		},
+		{
+			name:    "multi group magic labels skipped per group",
+			labels:  []string{"spock-prime", "gce-machine-t2d-standard-4"},
+			groups:  [][]string{{"spock", "gce-machine-c2d-standard-16"}, {"spock-prime", "gce-machine-t2d-standard-4"}},
+			wantOk:  true,
+			wantMsg: "",
+		},
+		{
+			name:    "zero groups rejects all",
+			labels:  []string{"spock"},
+			groups:  [][]string{},
+			wantOk:  false,
+			wantMsg: "no label groups configured — rejecting all jobs",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			job := pkg.Job{Labels: tc.labels}
+			ok, msg := job.HasAnyLabelGroup(tc.groups)
+			assert.Equal(t, tc.wantOk, ok, "match outcome")
+			assert.Equal(t, tc.wantMsg, msg, "message text")
+		})
+	}
 }
 
 func TestDeleteNotExistingVM(t *testing.T) {

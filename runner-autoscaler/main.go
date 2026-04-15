@@ -75,7 +75,6 @@ func main() {
 		SecretVersion:     mustGetEnv("SECRET_VERSION"),
 		RunnerPrefix:      getEnvDefault("RUNNER_PREFIX", "runner"),
 		RunnerGroupId:     getEnvDefaultInt64("RUNNER_GROUP_ID", 1),
-		RunnerLabels:      []string{},
 		RegisteredSources: map[string]pkg.Source{},
 		SourceQueryParam:  getEnvDefault("SOURCE_QUERY_PARAM_NAME", "src"),
 		CreateVmDelay:     getEnvDefaultInt64("CREATE_VM_DELAY", 10),
@@ -123,10 +122,9 @@ func main() {
 		}
 	}
 
-	if labels := strings.Split(getEnvDefault("RUNNER_LABELS", "self-hosted"), ","); len(labels) == 0 {
-		log.Warn("No workflow runner labels were provided. You should at least add the label \"self-hosted\"")
-	} else {
-		config.RunnerLabels = labels
+	config.RunnerLabelGroups = pkg.ParseLabelGroups(getEnvDefault("RUNNER_LABELS", "self-hosted"))
+	if len(config.RunnerLabelGroups) == 0 {
+		log.Warn("RUNNER_LABELS parsed to zero label groups - every webhook will be rejected until configuration is fixed")
 	}
 
 	if config.Simulate {
@@ -134,6 +132,6 @@ func main() {
 	}
 
 	port, _ := strconv.Atoi(getEnvDefault("PORT", "8080"))
-	log.Infof("Starting autoscaler on port %d observing workflow jobs with labels \"%s\"", port, strings.Join(config.RunnerLabels, ", "))
+	log.Infof("Starting autoscaler on port %d observing workflow jobs matching label groups: %s", port, pkg.FormatLabelGroups(config.RunnerLabelGroups))
 	pkg.NewAutoscaler(config).Srv(port)
 }

@@ -41,7 +41,7 @@ locals {
   projectNumber        = data.google_project.current.number
   region               = data.google_client_config.current.region
   zones                = distinct(concat(var.machine_zones, data.google_client_config.current.zone != null ? [data.google_client_config.current.zone] : []))
-  runnerLabel          = join(",", var.github_runner_labels)
+  runnerLabel          = join(";", [for grp in var.github_runner_label_groups : join(",", grp)])
   hasEnterprise        = length(var.github_enterprise) > 0
   hasOrg               = length(var.github_organization) > 0
   hasRepo              = length(var.github_repositories) > 0
