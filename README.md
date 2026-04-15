@@ -37,7 +37,7 @@ output "runner_webhook_config" {
 }
 ```
 
-Authenticate with `gcloud` and apply the terraform module (apply twice if the first apply results in an error - wait some minutes in between)
+Authenticate with `gcloud` and apply the terraform module. On a brand-new GCP project, the first `apply` may fail with an API-not-enabled or NotFound error while newly enabled Google APIs (Cloud Run, Artifact Registry, Cloud Tasks, Secret Manager, Compute) finish propagating — wait a minute and re-run `apply`.
 
 ``` bash
 $ gcloud auth application-default login --project <gcp_project>
@@ -49,7 +49,7 @@ $ terraform init -upgrade && terraform apply
 
 #### Pinning the runner image
 
-Every push to `master` builds a new autoscaler image, publishes it to `ghcr.io/commander-finance/github-runner-autoscaler`, and cuts a matching GitHub release tagged with a UTC timestamp version `YY.MM.DD.HHMMSS` (e.g. `26.04.14.152345`). The Terraform module resolves the selected image tag to an Artifact Registry digest at plan time and pins Cloud Run to `image@sha256:<digest>`, so `terraform apply` rolls a new Cloud Run revision only when the underlying image has actually changed.
+Every push to `master` builds a new autoscaler image, publishes it to `ghcr.io/commander-finance/github-runner-autoscaler`, and cuts a matching GitHub release tagged with a UTC timestamp version `YY.MM.DD.HHMMSS` (e.g. `26.04.14.152345`). The Terraform module resolves the selected image tag to an immutable `sha256` digest by querying **ghcr.io directly at plan time**, and pins Cloud Run to `<artifact-registry-path>@sha256:<digest>`. At runtime, Cloud Run pulls that digest **through the Artifact Registry remote-repo proxy** (`dockerRepository.tf`), which lazily caches the layers from ghcr.io on first pull. So `terraform apply` rolls a new Cloud Run revision only when ghcr.io's manifest for the selected tag has actually changed, and AR provides in-region caching for subsequent pulls without gating plan-time resolution.
 
 Three pinning modes:
 

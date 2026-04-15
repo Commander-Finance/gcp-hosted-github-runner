@@ -1,8 +1,6 @@
-data "google_artifact_registry_docker_image" "autoscaler" {
-  location      = local.region
-  repository_id = google_artifact_registry_repository.ghcr.repository_id
-  image_name    = "${local.runnerDockerImage}:${local.runnerDockerTag}"
-  depends_on    = [google_artifact_registry_repository.ghcr]
+data "docker_registry_image" "autoscaler" {
+  provider = docker.ghcr_anonymous
+  name     = "ghcr.io/${local.runnerDockerImage}:${local.runnerDockerTag}"
 }
 
 resource "random_password" "webhook_enterprise_secret" {
@@ -36,7 +34,7 @@ resource "google_cloud_run_v2_service" "autoscaler" {
       max_instance_count = 1
     }
     containers {
-      image = data.google_artifact_registry_docker_image.autoscaler.self_link
+      image = local.autoscaler_image_ref
       env {
         name  = "ROUTE_WEBHOOK"
         value = local.webhookUrl
