@@ -242,7 +242,7 @@ You exceeded your projects vCPU limit for the machine type in the region or for 
 
 #### Nothing happens at all
 
-The job's `runs-on` labels don't fully satisfy any group in `github_runner_label_groups`. Either add the missing labels to your workflow job's `runs-on`, or add a new group to the module configuration. The autoscaler logs the parsed groups at startup and the rejection reason on every miss — check Cloud Run logs for the exact mismatch.
+The job's `runs-on` labels don't fully satisfy the non-magic labels of any group in `github_runner_label_groups`. Either add the missing labels to your workflow job's `runs-on`, or add a new group to the module configuration. The autoscaler logs the parsed groups at startup and the rejection reason on every miss — check Cloud Run logs for the exact mismatch.
 
 > [!TIP]
 > When bumping the module `source` ref, also bump `runner_image_tag` so the Terraform-side encoding (`;`/`,` for label groups) and the autoscaler image's parser advance together. The Cloud Run startup log renders the parsed groups in `[a, b], [c, d]` form — eyeball that after a version bump to confirm the parser saw what Terraform sent.
