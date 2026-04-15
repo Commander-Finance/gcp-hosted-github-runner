@@ -245,6 +245,34 @@ func TestHasAnyLabelGroup(t *testing.T) {
 			wantOk:  false,
 			wantMsg: "no label groups configured — rejecting all jobs",
 		},
+		{
+			name:    "single magic-only group does not match any job",
+			labels:  []string{"spock", "anything"},
+			groups:  [][]string{{"gce-machine-c2d-standard-16"}},
+			wantOk:  false,
+			wantMsg: "no label groups contain gating labels — gce-machine-* are per-job overrides, not gating labels",
+		},
+		{
+			name:    "all magic-only groups do not match any job",
+			labels:  []string{"spock"},
+			groups:  [][]string{{"gce-machine-c2d-standard-16"}, {"gce-machine-t2d-standard-4"}},
+			wantOk:  false,
+			wantMsg: "no label groups contain gating labels — gce-machine-* are per-job overrides, not gating labels",
+		},
+		{
+			name:    "mixed magic-only and valid group matches on valid group",
+			labels:  []string{"spock-prime"},
+			groups:  [][]string{{"gce-machine-c2d-standard-16"}, {"spock-prime"}},
+			wantOk:  true,
+			wantMsg: "",
+		},
+		{
+			name:    "mixed magic-only and valid group miss lists only matchable groups",
+			labels:  []string{"ghost"},
+			groups:  [][]string{{"gce-machine-c2d-standard-16"}, {"spock"}},
+			wantOk:  false,
+			wantMsg: `missing the label(s) "spock"`,
+		},
 	}
 
 	for _, tc := range cases {

@@ -193,27 +193,51 @@ func FormatLabelGroups(groups [][]string) string {
 	return strings.Join(rendered, ", ")
 }
 
+// groupHasGatingLabels reports whether the group contains at least one
+// non-magic label. A group consisting solely of magic labels (e.g.
+// gce-machine-*) can never match any job meaningfully — hasAllLabels would
+// return an empty missing set — so such groups are filtered before matching.
+func groupHasGatingLabels(group []string) bool {
+
+	for _, label := range group {
+		if !IsMagicLabel(label) {
+			return true
+		}
+	}
+	return false
+}
+
 // HasAnyLabelGroup reports whether the job satisfies at least one label group
-// (OR-of-ANDs). Magic labels in a group are ignored. On a miss, the second
-// return is a human-readable reason suitable for log output.
+// (OR-of-ANDs). Magic labels in a group are ignored for matching, and groups
+// containing only magic labels are filtered out entirely. On a miss, the
+// second return is a human-readable reason suitable for log output.
 func (j Job) HasAnyLabelGroup(groups [][]string) (bool, string) {
 
 	if len(groups) == 0 {
 		return false, "no label groups configured — rejecting all jobs"
 	}
-	if len(groups) == 1 {
-		missing := j.hasAllLabels(groups[0])
+	matchable := make([][]string, 0, len(groups))
+	for _, group := range groups {
+		if groupHasGatingLabels(group) {
+			matchable = append(matchable, group)
+		}
+	}
+	if len(matchable) == 0 {
+		return false, "no label groups contain gating labels — gce-machine-* are per-job overrides, not gating labels"
+	}
+	if len(matchable) == 1 {
+		missing := j.hasAllLabels(matchable[0])
 		if len(missing) == 0 {
 			return true, ""
 		}
 		return false, fmt.Sprintf("missing the label(s) %q", strings.Join(missing, ", "))
 	}
-	for _, group := range groups {
+	for _, group := range matchable {
 		if len(j.hasAllLabels(group)) == 0 {
 			return true, ""
 		}
 	}
-	return false, "none of the label groups matched (required one of: " + FormatLabelGroups(groups) + ")"
+	return false, "none of the label groups matched (required one of: " + FormatLabelGroups(matchable) + ")"
 }
 
 type Action string
