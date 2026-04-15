@@ -24,9 +24,84 @@ jobs:
           go test -v -count=1 ./test/... \
             -skip '^(TestCreateCallbackTask|TestGenerateRunnerJitConfig|TestDeleteNotExistingVM)$'
 
+  ghcr_digest_smoke:
+    name: "ghcr.io digest resolution smoke test"
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: "Write fixture"
+        run: |
+          mkdir -p /tmp/ghcr-digest-fixture
+          cat > /tmp/ghcr-digest-fixture/main.tf <<'EOF'
+          terraform {
+            required_providers {
+              docker = { source = "kreuzwerker/docker", version = "~>4.0" }
+            }
+          }
+          provider "docker" {
+            alias = "ghcr_anonymous"
+            registry_auth {
+              address       = "ghcr.io"
+              auth_disabled = true
+            }
+          }
+          data "docker_registry_image" "probe" {
+            provider = docker.ghcr_anonymous
+            name     = "ghcr.io/commander-finance/github-runner-autoscaler:master"
+          }
+          output "digest" { value = data.docker_registry_image.probe.sha256_digest }
+          EOF
+      - name: "Plan (scratch HOME, no docker config)"
+        working-directory: /tmp/ghcr-digest-fixture
+        env:
+          # Belt-and-suspenders isolation: kreuzwerker/docker also consults
+          # these vars in addition to ~/.docker/config.json. Clearing them
+          # ensures the aliased-provider retry path is actually exercised
+          # even if a future runner image exports one of them globally.
+          DOCKER_CONFIG: ""
+          DOCKER_HOST: ""
+          DOCKER_CONTEXT: ""
+        run: |
+          HOME=$(mktemp -d) terraform init
+          HOME=$(mktemp -d) terraform plan -out=tfplan
+          HOME=$(mktemp -d) terraform show -json tfplan | jq -e '.planned_values.outputs.digest.value | startswith("sha256:")'
+
+  module_validate:
+    name: "Module terraform init+validate"
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: "Write consuming-root fixture"
+        run: |
+          mkdir -p /tmp/module-validate/root
+          # Unquoted heredoc: $GITHUB_WORKSPACE must be expanded here.
+          cat > /tmp/module-validate/root/main.tf <<EOF
+          provider "google" {
+            # Dummy values: terraform validate does not hit cloud APIs,
+            # but declaring the provider explicitly keeps validate output
+            # clean and makes the fixture's intent obvious.
+            project = "validate-only"
+            region  = "us-central1"
+            zone    = "us-central1-a"
+          }
+          module "runner" {
+            source              = "${GITHUB_WORKSPACE}"
+            github_repositories = ["test/test"]
+          }
+          EOF
+      - name: "terraform init && terraform validate"
+        working-directory: /tmp/module-validate/root
+        run: |
+          HOME=$(mktemp -d) terraform init
+          HOME=$(mktemp -d) terraform validate
+
   build_docker_image:
     name: "Build (and push on master) autoscaler image"
-    needs: test
+    needs: [test, ghcr_digest_smoke, module_validate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
