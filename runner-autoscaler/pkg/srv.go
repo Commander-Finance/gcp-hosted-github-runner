@@ -193,18 +193,19 @@ func FormatLabelGroups(groups [][]string) string {
 	return strings.Join(rendered, ", ")
 }
 
-// groupHasGatingLabels reports whether the group contains at least one
-// non-magic label. A group consisting solely of magic labels (e.g.
-// gce-machine-*) can never match any job meaningfully — hasAllLabels would
-// return an empty missing set — so such groups are filtered before matching.
-func groupHasGatingLabels(group []string) bool {
+// gatingLabels returns the non-magic labels from group — the subset that
+// actually participates in matching. Magic labels (e.g. gce-machine-*) are
+// per-job overrides, not gating labels, so they're excluded from both the
+// match check and the human-readable miss reason.
+func gatingLabels(group []string) []string {
 
+	filtered := make([]string, 0, len(group))
 	for _, label := range group {
 		if !IsMagicLabel(label) {
-			return true
+			filtered = append(filtered, label)
 		}
 	}
-	return false
+	return filtered
 }
 
 // HasAnyLabelGroup reports whether the job satisfies at least one label group
@@ -218,8 +219,8 @@ func (j Job) HasAnyLabelGroup(groups [][]string) (bool, string) {
 	}
 	matchable := make([][]string, 0, len(groups))
 	for _, group := range groups {
-		if groupHasGatingLabels(group) {
-			matchable = append(matchable, group)
+		if gating := gatingLabels(group); len(gating) > 0 {
+			matchable = append(matchable, gating)
 		}
 	}
 	if len(matchable) == 0 {

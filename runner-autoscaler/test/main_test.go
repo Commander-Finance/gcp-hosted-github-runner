@@ -273,6 +273,13 @@ func TestHasAnyLabelGroup(t *testing.T) {
 			wantOk:  false,
 			wantMsg: `missing the label(s) "spock"`,
 		},
+		{
+			name:    "multi group miss strips magic labels from required-one-of render",
+			labels:  []string{"ghost"},
+			groups:  [][]string{{"spock", "gce-machine-c2d-standard-16"}, {"spock-prime"}},
+			wantOk:  false,
+			wantMsg: "none of the label groups matched (required one of: [spock], [spock-prime])",
+		},
 	}
 
 	for _, tc := range cases {
