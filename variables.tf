@@ -128,9 +128,10 @@ variable "github_runner_label_groups" {
   default     = [["self-hosted"]]
   validation {
     condition = length(var.github_runner_label_groups) > 0 && alltrue([
-      for g in var.github_runner_label_groups : length(g) > 0
+      for g in var.github_runner_label_groups :
+      length(g) > 0 && alltrue([for label in g : trimspace(label) != ""])
     ])
-    error_message = "github_runner_label_groups must contain at least one non-empty group."
+    error_message = "github_runner_label_groups must contain at least one non-empty group, and every label must be non-blank after trimming whitespace."
   }
 }
 
