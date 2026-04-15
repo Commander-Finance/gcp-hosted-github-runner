@@ -25,7 +25,7 @@ locals {
   hasRepo              = length(var.github_repositories) > 0
   sourceQueryParamName = "src"
   runnerDockerImage    = "commander-finance/github-runner-autoscaler"
-  runnerDockerTag      = local.autoscaler_version
+  runnerDockerTag      = var.runner_image_tag
 }
 
 resource "google_project_service" "compute_api" {

@@ -22,7 +22,7 @@ provider "google" {
 }
 
 module "github-runner" {
-  source                    = "github.com/Privatehive/gcp-hosted-github-runner"
+  source                    = "github.com/Commander-Finance/gcp-hosted-github-runner"
   machine_type              = "c2d-highcpu-8" // The default machine type of the VM instance.
   github_runner_group_id    = 1 // The GitHub Organization/Enterprise runner group ID. Has no effect for GitHub Repositories.
 
@@ -46,6 +46,40 @@ $ terraform init -upgrade && terraform apply
 
 > [!IMPORTANT]
 > After a successful initial setup you should remove the `runner_webhook_config` output because it prints the webhook secret(s). Also make sure that the Terraform state file is stored in a safe place (e.g. in a private [Cloud Storage bucket](https://cloud.google.com/docs/terraform/resource-management/store-state)). The state file contains the webhook secret as plaintext.
+
+#### Pinning the runner image
+
+Every push to `master` builds a new autoscaler image, publishes it to `ghcr.io/commander-finance/github-runner-autoscaler`, and cuts a matching GitHub release tagged with a UTC timestamp version `YY.MM.DD.HHMMSS` (e.g. `26.04.14.152345`). The Terraform module resolves the selected image tag to an Artifact Registry digest at plan time and pins Cloud Run to `image@sha256:<digest>`, so `terraform apply` rolls a new Cloud Run revision only when the underlying image has actually changed.
+
+Three pinning modes:
+
+**1. Track master (default).** Omit `runner_image_tag`; it defaults to `"master"`. Each `terraform plan` resolves `:master` to the current digest — new merges to master automatically redeploy Cloud Run on the next apply.
+
+``` hcl
+module "github-runner" {
+  source = "github.com/Commander-Finance/gcp-hosted-github-runner"
+  # runner_image_tag defaults to "master"
+  # ...
+}
+```
+
+**2. Pin a release.** Pick a release from the [releases page](https://github.com/Commander-Finance/gcp-hosted-github-runner/releases) and set both the module ref and the image tag to match:
+
+``` hcl
+module "github-runner" {
+  source           = "github.com/Commander-Finance/gcp-hosted-github-runner?ref=26.04.14.152345"
+  runner_image_tag = "26.04.14.152345"
+  # ...
+}
+```
+
+**3. Pin a specific commit (debug).** Use the immutable per-commit tag:
+
+``` hcl
+runner_image_tag = "sha-<full-commit-sha>"
+```
+
+If you need to force a Cloud Run revision without changing the image (e.g., after rotating the PAT secret), set `force_cloud_run_deployment = true` on the next apply and unset it afterward.
 
 #### 2. Configure GitHub webhook
 
