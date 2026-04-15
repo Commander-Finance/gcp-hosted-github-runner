@@ -106,7 +106,7 @@ This PAT is needed to automatically create a [Enterprise](https://docs.github.co
 
 That's it 👍
 
-As soon as you start a GitHub workflow whose job's `runs-on` labels fully satisfy at least one of the label groups configured via [`github_runner_label_groups`](./variables.tf) (default `[["self-hosted"]]`), a VM instance with the specified `machine_type` starts. The name of the VM instance starts with the `github_runner_prefix`, followed by a random string to make the name unique; the same name is the runner's name in the GitHub runner group or repository. The spawned runner registers with the **job's** full `runs-on` labels — the groups are a webhook filter, not the registered label set. After the workflow job completes, the VM instance is deleted.
+As soon as you start a GitHub workflow whose job's `runs-on` labels fully satisfy all non-magic labels of at least one label group configured via [`github_runner_label_groups`](./variables.tf) (default `[["self-hosted"]]`), a VM instance with the specified `machine_type` starts. The name of the VM instance starts with the `github_runner_prefix`, followed by a random string to make the name unique; the same name is the runner's name in the GitHub runner group or repository. The spawned runner registers with the **job's** full `runs-on` labels — the groups are a webhook filter, not the registered label set. After the workflow job completes, the VM instance is deleted.
 
 > [!NOTE]
 > Two label-disjoint groups (e.g. `[["spock"], ["spock-prime"]]`) let one autoscaler serve two pools without GitHub's scheduler cross-assigning runners. See [Multiple label-disjoint pools](#multiple-label-disjoint-pools) below.
@@ -119,7 +119,7 @@ This are the most common variables you may want to change:
 
 `max_concurrency`: Select a maximum number of parallel workflow jobs to be expected (add 10% overhead).
 
-`github_runner_label_groups`: One or more label groups the autoscaler matches against incoming workflow jobs (OR-of-ANDs — a job matches if it carries ALL labels of ANY one group). Examples: `[["self-hosted"]]` (default single-pool), `[["self-hosted", "linux"]]` (single pool, two required labels), `[["spock"], ["spock-prime"]]` (two disjoint pools served by one autoscaler).
+`github_runner_label_groups`: One or more label groups the autoscaler matches against incoming workflow jobs (OR-of-ANDs — a job matches if it carries ALL non-magic labels of ANY one group; `gce-machine-*` labels are ignored for group matching). Examples: `[["self-hosted"]]` (default single-pool), `[["self-hosted", "linux"]]` (single pool, two required labels), `[["spock"], ["spock-prime"]]` (two disjoint pools served by one autoscaler).
 
 `machine_type`: The VM instance machine type where the GitHub runner will run on by default (can be individually overwritten per workflow job, see [Magic Labels](#magic-labels))
 
