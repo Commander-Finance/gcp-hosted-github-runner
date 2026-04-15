@@ -135,7 +135,7 @@ This are the most common variables you may want to change:
 * Provides docker-daemon and docker-buildx by default. Additional packages can be installed with `github_runner_packages`.
 * Only works with images that are based on debian (rely on apt package manager). Runs image `ubuntu-minimal-2204-lts` by default. Change with `machine_image`.
 
-#### Multiple label-disjoint pools
+### Multiple label-disjoint pools
 
 A single autoscaler can serve multiple workflow-job populations by configuring `github_runner_label_groups` with more than one group. The autoscaler accepts a job if it matches **any** group; the spawned runner registers with the **job's** `runs-on` labels (not the group's). For pool isolation, make the groups disjoint — otherwise GitHub's scheduler may route a job into the wrong pool.
 
@@ -148,7 +148,7 @@ github_runner_label_groups = [
 
 Per-pool defaults (disk size, image, preemptibility, runner group, max concurrency) are **not** supported — the instance template is shared across all groups. Only `machine_type` diverges, via the per-job `gce-machine-*` magic label below.
 
-#### Magic Labels
+### Magic Labels
 
 Each workflow job can select a different machine type than the configured default `machine_type`. Use the special label `gce-machine-<type>`, e.g. `gce-machine-c2d-standard-16`. Make sure the configured `disk_type` is supported by the machine.
 
