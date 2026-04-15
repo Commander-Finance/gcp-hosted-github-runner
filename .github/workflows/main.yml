@@ -38,7 +38,7 @@ jobs:
         id: meta
         run: |
           IMAGE=ghcr.io/commander-finance/github-runner-autoscaler
-          VERSION=$(date -u '+%y.%m.%d.%H%M')
+          VERSION=$(date -u '+%y.%m.%d.%H%M%S')
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           TAGS="${IMAGE}:sha-${GITHUB_SHA}"
           if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/master" ]; then

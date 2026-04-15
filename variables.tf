@@ -152,7 +152,7 @@ variable "force_cloud_run_deployment" {
 
 variable "runner_image_tag" {
   type        = string
-  description = "Docker image tag for the autoscaler, resolved against the Artifact Registry mirror of ghcr.io/commander-finance/github-runner-autoscaler. Defaults to \"master\" (floats with the latest master build - the digest-based data source ensures Cloud Run redeploys only when the underlying image digest actually changes). Pin a specific release by setting this to a date-version tag (e.g. \"26.04.141523\") that matches the git ref you've pinned the module to. Use \"sha-<full-commit-sha>\" for debug pins to a specific commit."
+  description = "Docker image tag for the autoscaler, resolved against the Artifact Registry mirror of ghcr.io/commander-finance/github-runner-autoscaler. Defaults to \"master\" (floats with the latest master build - the digest-based data source ensures Cloud Run redeploys only when the underlying image digest actually changes). Pin a specific release by setting this to a date-version tag (e.g. \"26.04.14.152345\") that matches the git ref you've pinned the module to. Use \"sha-<full-commit-sha>\" for debug pins to a specific commit."
   default     = "master"
 }
 

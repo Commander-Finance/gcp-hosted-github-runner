@@ -49,7 +49,7 @@ $ terraform init -upgrade && terraform apply
 
 #### Pinning the runner image
 
-Every push to `master` builds a new autoscaler image, publishes it to `ghcr.io/commander-finance/github-runner-autoscaler`, and cuts a matching GitHub release tagged with a UTC timestamp version `YY.MM.DD.HHmm` (e.g. `26.04.141523`). The Terraform module resolves the selected image tag to an Artifact Registry digest at plan time and pins Cloud Run to `image@sha256:<digest>`, so `terraform apply` rolls a new Cloud Run revision only when the underlying image has actually changed.
+Every push to `master` builds a new autoscaler image, publishes it to `ghcr.io/commander-finance/github-runner-autoscaler`, and cuts a matching GitHub release tagged with a UTC timestamp version `YY.MM.DD.HHMMSS` (e.g. `26.04.14.152345`). The Terraform module resolves the selected image tag to an Artifact Registry digest at plan time and pins Cloud Run to `image@sha256:<digest>`, so `terraform apply` rolls a new Cloud Run revision only when the underlying image has actually changed.
 
 Three pinning modes:
 
@@ -67,8 +67,8 @@ module "github-runner" {
 
 ``` hcl
 module "github-runner" {
-  source           = "github.com/Commander-Finance/gcp-hosted-github-runner?ref=26.04.141523"
-  runner_image_tag = "26.04.141523"
+  source           = "github.com/Commander-Finance/gcp-hosted-github-runner?ref=26.04.14.152345"
+  runner_image_tag = "26.04.14.152345"
   # ...
 }
 ```
