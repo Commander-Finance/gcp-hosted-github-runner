@@ -106,7 +106,10 @@ This PAT is needed to automatically create a [Enterprise](https://docs.github.co
 
 That's it 👍
 
-As soon as you start a GitHub workflow, which contains a job with `runs-on: self-hosted` (or any other label you provided to the Terraform [module variable](./variables.tf) `github_runner_labels`), a VM instance (with the specified `machine_type`) starts. The name of the VM instance starts with the `github_runner_prefix`, which is followed by a random string to make the name unique. The name of the VM instance is also the name of the runner in the GitHub runner group or repository. After the workflow job completed, the VM instance will be deleted again.
+As soon as you start a GitHub workflow whose job's `runs-on` labels fully satisfy all non-magic labels of at least one label group configured via [`github_runner_label_groups`](./variables.tf) (default `[["self-hosted"]]`), a VM instance with the specified `machine_type` starts. The name of the VM instance starts with the `github_runner_prefix`, followed by a random string to make the name unique; the same name is the runner's name in the GitHub runner group or repository. The spawned runner registers with the **job's** full `runs-on` labels — the groups are a webhook filter, not the registered label set. After the workflow job completes, the VM instance is deleted.
+
+> [!NOTE]
+> Two label-disjoint groups (e.g. `[["spock"], ["spock-prime"]]`) let one autoscaler serve two pools without GitHub's scheduler cross-assigning runners. See [Multiple label-disjoint pools](#multiple-label-disjoint-pools) below.
 
 ## Advanced Configuration
 
@@ -116,7 +119,7 @@ This are the most common variables you may want to change:
 
 `max_concurrency`: Select a maximum number of parallel workflow jobs to be expected (add 10% overhead).
 
-`github_runner_labels`: One or multiple labels the runner will be tagged with
+`github_runner_label_groups`: One or more label groups the autoscaler matches against incoming workflow jobs (OR-of-ANDs — a job matches if it carries ALL non-magic labels of ANY one group; `gce-machine-*` labels are ignored for group matching). Examples: `[["self-hosted"]]` (default single-pool), `[["self-hosted", "linux"]]` (single pool, two required labels), `[["spock"], ["spock-prime"]]` (two disjoint pools served by one autoscaler).
 
 `machine_type`: The VM instance machine type where the GitHub runner will run on by default (can be individually overwritten per workflow job, see [Magic Labels](#magic-labels))
 
@@ -132,7 +135,20 @@ This are the most common variables you may want to change:
 * Provides docker-daemon and docker-buildx by default. Additional packages can be installed with `github_runner_packages`.
 * Only works with images that are based on debian (rely on apt package manager). Runs image `ubuntu-minimal-2204-lts` by default. Change with `machine_image`.
 
-#### Magic Labels
+### Multiple label-disjoint pools
+
+A single autoscaler can serve multiple workflow-job populations by configuring `github_runner_label_groups` with more than one group. The autoscaler accepts a job if it matches **any** group; the spawned runner registers with the **job's** `runs-on` labels (not the group's). For pool isolation, make the groups disjoint — otherwise GitHub's scheduler may route a job into the wrong pool.
+
+```hcl
+github_runner_label_groups = [
+  ["spock"],         # default-sized VMs for runs-on: spock
+  ["spock-prime"],   # custom-sized VMs for runs-on: [spock-prime, gce-machine-<type>]
+]
+```
+
+Per-pool defaults (disk size, image, preemptibility, runner group, max concurrency) are **not** supported — the instance template is shared across all groups. Only `machine_type` diverges, via the per-job `gce-machine-*` magic label below.
+
+### Magic Labels
 
 Each workflow job can select a different machine type than the configured default `machine_type`. Use the special label `gce-machine-<type>`, e.g. `gce-machine-c2d-standard-16`. Make sure the configured `disk_type` is supported by the machine.
 
@@ -226,4 +242,7 @@ You exceeded your projects vCPU limit for the machine type in the region or for 
 
 #### Nothing happens at all
 
-The `github_runner_labels` don't match **all** the labels of the workflow job. Add the missing labels to your workflow job.
+The job's `runs-on` labels don't fully satisfy the non-magic labels of any group in `github_runner_label_groups`. Either add the missing labels to your workflow job's `runs-on`, or add a new group to the module configuration. The autoscaler logs the parsed groups at startup and the rejection reason on every miss — check Cloud Run logs for the exact mismatch.
+
+> [!TIP]
+> When bumping the module `source` ref, also bump `runner_image_tag` so the Terraform-side encoding (`;`/`,` for label groups) and the autoscaler image's parser advance together. The Cloud Run startup log renders the parsed groups in `[a, b], [c, d]` form — eyeball that after a version bump to confirm the parser saw what Terraform sent.

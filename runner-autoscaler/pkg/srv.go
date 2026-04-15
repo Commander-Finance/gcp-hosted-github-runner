@@ -146,8 +146,8 @@ func (j Job) HasLegacyMagicLabel() bool {
 	return false
 }
 
-// returns true if all labels were found (excluding magic labels). false otherwise. Returns also all labels that were missing
-func (j Job) HasAllLabels(labels []string) (bool, []string) {
+// hasAllLabels returns the non-magic labels from `labels` not present on the job.
+func (j Job) hasAllLabels(labels []string) []string {
 
 	missingLabels := []string{}
 	for _, label := range labels {
@@ -157,7 +157,88 @@ func (j Job) HasAllLabels(labels []string) (bool, []string) {
 			}
 		}
 	}
-	return len(missingLabels) <= 0, missingLabels
+	return missingLabels
+}
+
+// ParseLabelGroups decodes the RUNNER_LABELS env value into the OR-of-ANDs
+// shape: groups separated by ';', labels within a group by ','. Whitespace is
+// trimmed per label; empty labels and empty groups are dropped.
+func ParseLabelGroups(raw string) [][]string {
+
+	groups := [][]string{}
+	for _, rawGroup := range strings.Split(raw, ";") {
+		group := []string{}
+		for _, label := range strings.Split(rawGroup, ",") {
+			if trimmed := strings.TrimSpace(label); trimmed != "" {
+				group = append(group, trimmed)
+			}
+		}
+		if len(group) > 0 {
+			groups = append(groups, group)
+		}
+	}
+	return groups
+}
+
+// FormatLabelGroups renders groups as `[a, b], [c, d]`, or `(none)` if empty.
+func FormatLabelGroups(groups [][]string) string {
+
+	if len(groups) == 0 {
+		return "(none)"
+	}
+	rendered := make([]string, len(groups))
+	for i, group := range groups {
+		rendered[i] = "[" + strings.Join(group, ", ") + "]"
+	}
+	return strings.Join(rendered, ", ")
+}
+
+// gatingLabels returns the non-magic labels from group — the subset that
+// actually participates in matching. Magic labels (e.g. gce-machine-*) are
+// per-job overrides, not gating labels, so they're excluded from both the
+// match check and the human-readable miss reason.
+func gatingLabels(group []string) []string {
+
+	filtered := make([]string, 0, len(group))
+	for _, label := range group {
+		if !IsMagicLabel(label) {
+			filtered = append(filtered, label)
+		}
+	}
+	return filtered
+}
+
+// HasAnyLabelGroup reports whether the job satisfies at least one label group
+// (OR-of-ANDs). Magic labels in a group are ignored for matching, and groups
+// containing only magic labels are filtered out entirely. On a miss, the
+// second return is a human-readable reason suitable for log output.
+func (j Job) HasAnyLabelGroup(groups [][]string) (bool, string) {
+
+	if len(groups) == 0 {
+		return false, "no label groups configured — rejecting all jobs"
+	}
+	matchable := make([][]string, 0, len(groups))
+	for _, group := range groups {
+		if gating := gatingLabels(group); len(gating) > 0 {
+			matchable = append(matchable, gating)
+		}
+	}
+	if len(matchable) == 0 {
+		return false, "no label groups contain gating labels — gce-machine-* are per-job overrides, not gating labels"
+	}
+	if len(matchable) == 1 {
+		missing := j.hasAllLabels(matchable[0])
+		if len(missing) == 0 {
+			return true, ""
+		}
+		return false, fmt.Sprintf("missing the label(s) %q", strings.Join(missing, ", "))
+	}
+	for _, group := range matchable {
+		if len(j.hasAllLabels(group)) == 0 {
+			return true, ""
+		}
+	}
+	return false, "none of the label groups matched (required one of: " + FormatLabelGroups(matchable) + ")"
 }
 
 type Action string
@@ -679,7 +760,7 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 						// Skip the create-vm callback: a runner we spawn for this job can
 						// never match its `runs-on` (see matchLegacyMagicLabel).
 						log.Warnf("Job %d uses deprecated magic-label syntax (@machine:<type>). Use \"gce-machine-<type>\" (e.g. \"gce-machine-c2d-standard-16\") instead. See README \u2192 Magic Labels. Skipping VM creation; the job will time out.", payload.Job.Id)
-					} else if ok, missingLabels := payload.Job.HasAllLabels(s.conf.RunnerLabels); ok {
+					} else if ok, reason := payload.Job.HasAnyLabelGroup(s.conf.RunnerLabelGroups); ok {
 						createUrl := createCallbackUrl(ctx, s.conf.RouteCreateVm, s.conf.SourceQueryParam, src.Name)
 						// delay the create vm callback so we have a chance to delete it if the workflow job is changing its state to 'waiting'
 						if err := s.CreateCallbackTaskWithToken(ctx, createUrl, src.Secret, payload.Job, time.Duration(s.conf.CreateVmDelay)*time.Second); err != nil {
@@ -688,17 +769,17 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 							return
 						}
 					} else {
-						log.Warnf("Webhook requested to start a runner that is missing the label(s) \"%s\" - ignoring", strings.Join(missingLabels, ", "))
+						log.Warnf("Webhook requested to start a runner: %s - ignoring", reason)
 					}
 				} else if payload.Action == WAITING {
 					// the waiting action happens if a deployment environment is configured in the workflow that requires a review. We have to cancel the cloud task callback
-					if ok, missingLabels := payload.Job.HasAllLabels(s.conf.RunnerLabels); ok {
+					if ok, reason := payload.Job.HasAnyLabelGroup(s.conf.RunnerLabelGroups); ok {
 						if err := s.DeleteCallbackTask(ctx, payload.Job); err != nil {
 							// best effort - this is not considered an error
 							log.Warnf("Can not delete create-vm cloud task callback: %s", err.Error())
 						}
 					} else {
-						log.Warnf("Webhook signals 'wait' but is missing the label(s) \"%s\" - ignoring", strings.Join(missingLabels, ", "))
+						log.Warnf("Webhook signals 'wait': %s - ignoring", reason)
 					}
 				} else if payload.Action == COMPLETED {
 					runnerGroupId := s.conf.RunnerGroupId
@@ -706,7 +787,7 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 						runnerGroupId = 1
 					}
 					if payload.Job.RunnerGroupId == runnerGroupId {
-						if ok, missingLabels := payload.Job.HasAllLabels(s.conf.RunnerLabels); ok {
+						if ok, reason := payload.Job.HasAnyLabelGroup(s.conf.RunnerLabelGroups); ok {
 
 							// if the user immediately cancels a workflow we have the chance to delete the callback if not older than 10 seconds - best effort, ignore all errors
 							s.DeleteCallbackTask(ctx, payload.Job)
@@ -718,7 +799,7 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 								return
 							}
 						} else {
-							log.Warnf("Webhook signaled to delete a runner that is missing the label(s) \"%s\" - ignoring", strings.Join(missingLabels, ", "))
+							log.Warnf("Webhook signaled to delete a runner: %s - ignoring", reason)
 						}
 					} else {
 						log.Warnf("Webhook signaled to delete a runner that does not belong to the expected runner group (expected \"%d\" got \"%d\") - ignoring", runnerGroupId, payload.Job.RunnerGroupId)
@@ -754,7 +835,7 @@ type AutoscalerConfig struct {
 	SecretVersion     string
 	RunnerPrefix      string
 	RunnerGroupId     int64
-	RunnerLabels      []string
+	RunnerLabelGroups [][]string
 	RegisteredSources map[string]Source
 	SourceQueryParam  string
 	CreateVmDelay     int64

@@ -110,13 +110,28 @@ variable "github_runner_group_id" {
   default     = 1
 }
 
-variable "github_runner_labels" {
-  type        = list(string)
-  description = "One or multiple labels the runner will be tagged with."
-  default     = ["self-hosted"]
+variable "github_runner_label_groups" {
+  type        = list(list(string))
+  description = <<-EOT
+    One or more label groups the autoscaler matches against incoming workflow jobs.
+    A job matches if it carries ALL labels of ANY one group (OR-of-ANDs). The spawned
+    runner registers with the job's full `runs-on` labels — the groups are a filter,
+    not the registered label set. GitHub's scheduler still requires the runner's
+    labels to be a superset of the job's `runs-on`, so for pool isolation make the
+    groups label-disjoint.
+
+    Examples:
+      [["self-hosted"]]                # default single-pool
+      [["self-hosted", "linux"]]       # single pool, two required labels
+      [["spock"], ["spock-prime"]]     # two disjoint pools via the same autoscaler
+  EOT
+  default     = [["self-hosted"]]
   validation {
-    condition     = length(var.github_runner_labels) > 0
-    error_message = "The variable github_runner_labels must contain at least one value!"
+    condition = length(var.github_runner_label_groups) > 0 && alltrue([
+      for g in var.github_runner_label_groups :
+      length(g) > 0 && alltrue([for label in g : trimspace(label) != ""])
+    ])
+    error_message = "github_runner_label_groups must contain at least one non-empty group, and every label must be non-blank after trimming whitespace."
   }
 }
 

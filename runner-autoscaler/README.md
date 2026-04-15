@@ -13,14 +13,14 @@ Following conditions of the workflow job webhook event have to be fulfilled, so 
 
 * The (enterprise, organization, repository) webhook source was configured and the webhook signature is valid (see GITHUB_ENTERPRISE, GITHUB_ORG, GITHUB_REPOS).
 * The webhook `action` value equals `queued`.
-* **All** labels of the workflow job match the configured RUNNER_LABELS.
+* The workflow job's labels fully satisfy at least one of the label groups configured in RUNNER_LABELS (OR-of-ANDs).
 
 Following conditions of the workflow job webhook event have to be fulfilled, so an existing VM instance will be **deleted**:
 
 * The (enterprise, organization, repository) webhook source was configured and the webhook signature is valid (see GITHUB_ENTERPRISE, GITHUB_ORG, GITHUB_REPOS).
 * The webhook `action` value equals `completed`.
 * The webhook `workflow_job.runner_group_id` value equals the configured RUNNER_GROUP_ID.
-* **All** labels of the workflow job match the configured RUNNER_LABELS.
+* The workflow job's labels fully satisfy at least one of the label groups configured in RUNNER_LABELS.
 
 ### Configuration
 
@@ -40,7 +40,7 @@ The scaler is configured via the following environment variables:
 | SECRET_VERSION          | ""                                     | The relative resource name of the secret version which contains the PAT or PAT classic.                                                                                                                                                             |
 | RUNNER_PREFIX           | "runner"                               | Prefix for the the name of a new VM instance. A random string (10 random lower case characters) will be added to make the name unique: "<prefix>-<random_string>".                                                                                  |
 | RUNNER_GROUP_ID         | "1"                                    | The GitHub runner group ID where the VM instance is expected to join as a self hosted runner.                                                                                                                                                       |
-| RUNNER_LABELS           | "self-hosted" *(comma separated list)* | Only workflow jobs whose labels match **all** the configured labels will be taken into account. If only one configured label is **not** found in the workflow job it will be ignored.                                                               |
+| RUNNER_LABELS           | "self-hosted"                          | One or more label groups, OR-of-ANDs. Groups are separated by `;`, labels within a group by `,`. Whitespace is trimmed per label; magic labels (`gce-machine-*`) are skipped per group. A workflow job is accepted if its labels fully satisfy at least one group. Examples: `"spock"` (one group, one label), `"spock,linux"` (one group, two required labels), `"spock;spock-prime"` (two single-label groups), `"spock,linux;spock-prime,linux"` (two two-label groups). If parsing yields zero groups every webhook is rejected and a warning is logged. |
 | GITHUB_ENTERPRISE       | ""                                     | The name of the GitHub Enterprise and a webhook secret (base64 encoded) separated by ";".                                                                                                                                                           |
 | GITHUB_ORG              | ""                                     | The name of the GitHub Organization and a webhook secret (base64 encoded) separated by ";".                                                                                                                                                         |
 | GITHUB_REPOS            | "" *(comma separated list)*            | The GitHub repo path (USER/REPO_NAME) and a webhook secret (base64 encoded) separated by ";". Multiple repo path;secret pairs can be provided by separating them by ",". E.g. <USER>/<REPO_NAME>;<BASE64_SECRET>,<USER>/<REPO_NAME>;<BASE64_SECRET> |
