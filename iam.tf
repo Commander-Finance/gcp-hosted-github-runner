@@ -60,6 +60,12 @@ resource "google_project_iam_custom_role" "read_secret_version" {
   permissions = ["secretmanager.versions.access"]
 }
 
+resource "google_project_iam_custom_role" "use_image" {
+  role_id     = "UseImage"
+  title       = "Use a Compute Engine image"
+  permissions = ["compute.images.useReadOnly"]
+}
+
 // ---- autoscaler-sa roles member ----
 resource "google_project_iam_member" "manage_vm_instances_member" {
 
@@ -136,6 +142,16 @@ resource "google_project_iam_member" "read_secret_version_member" {
     title       = "Read secret ${google_secret_manager_secret.github_pat_token.secret_id}"
     // The project number is needed - project id doesn't work
     expression  = "resource.name == 'projects/${local.projectNumber}/secrets/${google_secret_manager_secret.github_pat_token.secret_id}/versions/latest'"
+  }
+}
+
+resource "google_project_iam_member" "use_image_member" {
+  project = local.projectId
+  member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
+  role    = google_project_iam_custom_role.use_image.id
+  condition {
+    title      = "Use images in project ${local.projectId}"
+    expression = "resource.name.startsWith('projects/${local.projectId}/global/images/')"
   }
 }
 // -----------------------------
