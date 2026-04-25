@@ -27,6 +27,7 @@ resource "google_compute_firewall" "icmp_ingress" {
 }
 
 resource "google_compute_firewall" "ssh_ingress" {
+  count   = var.enable_ssh ? 1 : 0
   name    = "ssh-ingress"
   description = "Allows ingress on port 22"
   network = google_compute_network.vpc_network.name
