@@ -23,7 +23,7 @@ resource "google_compute_firewall" "icmp_ingress" {
   }
 
   source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["http-egress"]
+  target_tags   = ["icmp-ingress"]
 }
 
 resource "google_compute_firewall" "ssh_ingress" {

@@ -7,7 +7,7 @@ resource "google_compute_instance_template" "runner_instance" {
   name         = "ephemeral-github-runner"
   region       = local.region
   machine_type = var.machine_type
-  tags         = var.enable_ssh ? ["http-egress", "ssh-ingress"] : ["http-egress"]
+  tags         = var.enable_ssh ? ["http-egress", "icmp-ingress", "ssh-ingress"] : ["http-egress", "icmp-ingress"]
   depends_on   = [google_project_service.compute_api]
 
   scheduling {
@@ -38,7 +38,7 @@ resource "google_compute_instance_template" "runner_instance" {
   network_interface {
     network    = google_compute_network.vpc_network.name
     subnetwork = google_compute_subnetwork.subnetwork.name
-    nic_type   = "GVNIC"
+    nic_type   = var.runner_nic_type
 
     dynamic "access_config" {
       for_each = var.use_cloud_nat ? [] : [0]

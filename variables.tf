@@ -22,6 +22,17 @@ variable "machine_image" {
   default     = "ubuntu-os-cloud/ubuntu-minimal-2204-lts"
 }
 
+variable "runner_nic_type" {
+  type        = string
+  description = "NIC driver for runner VMs. GVNIC is the recommended driver on Tau T2D and most modern machine families and gives better tail latency under bursty workloads. Fall back to VIRTIO_NET if pairing with a machine_type or machine_image that does not support gVNIC."
+  default     = "GVNIC"
+
+  validation {
+    condition     = contains(["GVNIC", "VIRTIO_NET"], var.runner_nic_type)
+    error_message = "runner_nic_type must be either \"GVNIC\" or \"VIRTIO_NET\"."
+  }
+}
+
 variable "machine_preemtible" {
   type        = bool
   description = "The VM instance will be an preemtible spot instance that costs much less but may be stopped by gcp at any time (leading to a failed workflow job)."
