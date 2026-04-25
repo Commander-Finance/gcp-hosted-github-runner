@@ -38,6 +38,7 @@ resource "google_compute_instance_template" "runner_instance" {
   network_interface {
     network    = google_compute_network.vpc_network.name
     subnetwork = google_compute_subnetwork.subnetwork.name
+    nic_type   = "GVNIC"
 
     dynamic "access_config" {
       for_each = var.use_cloud_nat ? [] : [0]
