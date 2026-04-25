@@ -78,6 +78,31 @@ EOT
 
 
 locals {
+  # Harden the kernel against security-sensitive ICMP behaviors. The VPC firewall
+  # allows all ICMP ingress so that off-path "fragmentation needed" (Type 3 Code 4)
+  # replies reach the runner and Path MTU Discovery keeps working; this sysctl
+  # block drops the dangerous bits (redirects, broadcast amplification, source
+  # routing, bogus error responses) at the kernel level instead.
+  icmp_hardening_subscript = <<EOT
+cat >/etc/sysctl.d/99-runner-icmp-hardening.conf <<'SYSCTL' || shutdown now
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.secure_redirects=0
+net.ipv4.conf.default.secure_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_source_route=0
+net.ipv6.conf.default.accept_source_route=0
+SYSCTL
+sysctl --load=/etc/sysctl.d/99-runner-icmp-hardening.conf >/dev/null || shutdown now
+EOT
+
   # Define the setup and install subscript that should run if we are using a default base image, such as the default ubuntu-os-cloud/ubuntu-minimal-2204-lts
   setup_and_install_subscript = <<EOT
 apt-get update && apt-get -y install docker.io docker-buildx curl sed jq ${local.github_runner_package_install}
@@ -108,6 +133,7 @@ resource "google_compute_project_metadata_item" "startup_scripts_register_jit_ru
 agent_name=$(hostname)
 echo "Setup of agent '$agent_name' started"
 
+${local.icmp_hardening_subscript}
 ${var.run_setup_on_runner_machines ? local.setup_and_install_subscript : ""}
 
 if [ ! -d /home/agent ]; then
