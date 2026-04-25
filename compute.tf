@@ -84,7 +84,7 @@ locals {
   # block drops the dangerous bits (redirects, broadcast amplification, source
   # routing, bogus error responses) at the kernel level instead.
   icmp_hardening_subscript = <<EOT
-cat >/etc/sysctl.d/99-runner-icmp-hardening.conf <<'SYSCTL'
+cat >/etc/sysctl.d/99-runner-icmp-hardening.conf <<'SYSCTL' || shutdown now
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
 net.ipv4.conf.all.secure_redirects=0
@@ -100,7 +100,7 @@ net.ipv6.conf.default.accept_redirects=0
 net.ipv6.conf.all.accept_source_route=0
 net.ipv6.conf.default.accept_source_route=0
 SYSCTL
-sysctl --system >/dev/null
+sysctl --load=/etc/sysctl.d/99-runner-icmp-hardening.conf >/dev/null || shutdown now
 EOT
 
   # Define the setup and install subscript that should run if we are using a default base image, such as the default ubuntu-os-cloud/ubuntu-minimal-2204-lts
