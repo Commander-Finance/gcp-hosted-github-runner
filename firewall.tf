@@ -12,6 +12,20 @@ resource "google_compute_firewall" "http_egress" {
   target_tags = ["http-egress"]
 }
 
+resource "google_compute_firewall" "icmp_ingress" {
+  name        = "icmp-ingress"
+  description = "Allow ICMP so off-path 'fragmentation needed' (Type 3 Code 4) replies reach the runner, keeping Path MTU Discovery working on STANDARD-tier egress"
+  network     = google_compute_network.vpc_network.name
+  direction   = "INGRESS"
+
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["icmp-ingress"]
+}
+
 resource "google_compute_firewall" "ssh_ingress" {
   name    = "ssh-ingress"
   description = "Allows ingress on port 22"
