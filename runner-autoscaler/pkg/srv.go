@@ -645,40 +645,51 @@ func (s *Autoscaler) InstanceExists(ctx context.Context, instanceName string) (b
 	return false, nil
 }
 
-// instanceTemplateOption pairs a source instance template with the provisioning
-// model it represents, for logging/metrics.
-type instanceTemplateOption struct {
+// creationAttempt is a single (template, zone, provisioning model) tuple to try.
+type creationAttempt struct {
 	template          string
+	zone              string
 	provisioningModel string // "spot" or "standard"
 }
 
-// creationTemplates returns the ordered list of templates to try. The primary
-// template is tried first; if it is SPOT (FallbackInstanceTemplate is set) the
-// on-demand (STANDARD) template is appended as a capacity fallback.
-func (s *Autoscaler) creationTemplates() []instanceTemplateOption {
+// creationPlan returns the ordered list of creation attempts. The primary template
+// is tried across EVERY configured zone first; only when the primary is SPOT
+// (FallbackInstanceTemplate is set) is the on-demand (STANDARD) template appended,
+// again across every zone. This guarantees SPOT is attempted everywhere it is
+// feasible before any on-demand fallback. Pure (no I/O) so the ordering is testable.
+func (s *Autoscaler) creationPlan(instanceName string) []creationAttempt {
 
+	type tmpl struct{ template, model string }
 	primaryModel := "standard"
 	if s.conf.FallbackInstanceTemplate != "" {
 		// A fallback template only exists when the primary is preemptible/SPOT.
 		primaryModel = "spot"
 	}
-	options := []instanceTemplateOption{{template: s.conf.InstanceTemplate, provisioningModel: primaryModel}}
+	templates := []tmpl{{s.conf.InstanceTemplate, primaryModel}}
 	if s.conf.FallbackInstanceTemplate != "" {
-		options = append(options, instanceTemplateOption{template: s.conf.FallbackInstanceTemplate, provisioningModel: "standard"})
+		templates = append(templates, tmpl{s.conf.FallbackInstanceTemplate, "standard"})
 	}
-	return options
+
+	zones := s.OrderedZones(instanceName)
+	plan := make([]creationAttempt, 0, len(templates)*len(zones))
+	for _, t := range templates {
+		for _, zone := range zones {
+			plan = append(plan, creationAttempt{template: t.template, zone: zone, provisioningModel: t.model})
+		}
+	}
+	return plan
 }
 
-// tryInsertInstance attempts a single Insert+Wait in one zone from one template.
-func (s *Autoscaler) tryInsertInstance(ctx context.Context, client *InstanceClient, template string, instanceName string, zone string, machineType *string, metadata []*computepb.Items) error {
+// tryInsertInstance attempts a single Insert+Wait for one creation attempt.
+func (s *Autoscaler) tryInsertInstance(ctx context.Context, client *InstanceClient, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error {
 
 	var machine *string = nil
 	if machineType != nil {
-		machine = proto.String(fmt.Sprintf("zones/%s/machineTypes/%s", zone, *machineType))
+		machine = proto.String(fmt.Sprintf("zones/%s/machineTypes/%s", attempt.zone, *machineType))
 	}
 	res, err := client.Insert(ctx, &computepb.InsertInstanceRequest{
 		Project: s.conf.ProjectId,
-		Zone:    zone,
+		Zone:    attempt.zone,
 		InstanceResource: &computepb.Instance{
 			Name:        proto.String(instanceName),
 			MachineType: machine,
@@ -686,7 +697,7 @@ func (s *Autoscaler) tryInsertInstance(ctx context.Context, client *InstanceClie
 				Items: metadata,
 			},
 		},
-		SourceInstanceTemplate: proto.String(template),
+		SourceInstanceTemplate: proto.String(attempt.template),
 	})
 	if err != nil {
 		return err
@@ -699,9 +710,10 @@ func (s *Autoscaler) tryInsertInstance(ctx context.Context, client *InstanceClie
 // Creation is hardened against capacity stockouts: we try every configured zone
 // (capacity errors fall through to the next zone) and, if the primary template is
 // SPOT and every zone is exhausted, we retry the whole sweep with the on-demand
-// (STANDARD) template. A duplicate Insert (same deterministic name) is treated as
-// idempotent success. The provisioning model that actually succeeded is logged so a
-// log-based metric can track the spot-vs-standard split.
+// (STANDARD) template (see creationPlan for the ordering guarantee). A duplicate
+// Insert (same deterministic name) is treated as idempotent success. The
+// provisioning model that actually succeeded is logged so a log-based metric can
+// track the spot-vs-standard split.
 func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceName string, machineType *string, metadata ...*computepb.Items) error {
 
 	if s.conf.Simulate {
@@ -711,44 +723,51 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 		return nil
 	}
 
-	computeClient := newComputeClient(ctx)
-	defer computeClient.Close()
+	plan := s.creationPlan(instanceName)
+	if len(plan) == 0 {
+		// No attempt would run (no zones configured) - surface it instead of
+		// silently reporting success.
+		return fmt.Errorf("no zones configured - could not create instance %s", instanceName)
+	}
 
-	zones := s.OrderedZones(instanceName)
-	var lastErr error
-	for _, option := range s.creationTemplates() {
-		for _, zone := range zones {
-			log.Debugf("About to create instance %s (%s) from %s template", instanceName, zone, option.provisioningModel)
-			err := s.tryInsertInstance(ctx, computeClient, option.template, instanceName, zone, machineType, metadata)
-			if err == nil {
-				log.WithFields(log.Fields{
-					"instance":           instanceName,
-					"zone":               zone,
-					"provisioning_model": option.provisioningModel,
-				}).Infof("Created instance %s (%s) as %s", instanceName, zone, option.provisioningModel)
-				return nil
-			}
-			if IsAlreadyExists(err) {
-				// A previous (possibly cancelled) attempt already created this VM.
-				log.Infof("Instance %s already exists - treating create as idempotent success", instanceName)
-				return nil
-			}
-			if IsCapacityError(err) {
-				log.Warnf("Capacity error creating instance %s (%s, %s): %s - trying next zone/model", instanceName, zone, option.provisioningModel, err.Error())
-				lastErr = err
-				continue
-			}
-			// Non-retryable error (bad template, permission, invalid machine type, ...).
-			log.Errorf("Could not create instance %s (%s) from %s template: %s", instanceName, zone, option.provisioningModel, err.Error())
-			return err
+	// tryInsert is a seam: tests inject a fake; in production we build one compute
+	// client and reuse it across every attempt.
+	tryInsert := s.tryInsertFn
+	if tryInsert == nil {
+		client := newComputeClient(ctx)
+		defer client.Close()
+		tryInsert = func(ctx context.Context, attempt creationAttempt, name string, mt *string, md []*computepb.Items) error {
+			return s.tryInsertInstance(ctx, client, attempt, name, mt, md)
 		}
 	}
 
-	if lastErr == nil {
-		// No attempt ran at all (no zones configured) - surface it instead of
-		// silently reporting success.
-		lastErr = fmt.Errorf("no zones configured - could not create instance %s", instanceName)
+	var lastErr error
+	for _, attempt := range plan {
+		log.Debugf("About to create instance %s (%s) from %s template", instanceName, attempt.zone, attempt.provisioningModel)
+		err := tryInsert(ctx, attempt, instanceName, machineType, metadata)
+		if err == nil {
+			log.WithFields(log.Fields{
+				"instance":           instanceName,
+				"zone":               attempt.zone,
+				"provisioning_model": attempt.provisioningModel,
+			}).Infof("Created instance %s (%s) as %s", instanceName, attempt.zone, attempt.provisioningModel)
+			return nil
+		}
+		if IsAlreadyExists(err) {
+			// A previous (possibly cancelled) attempt already created this VM.
+			log.Infof("Instance %s already exists - treating create as idempotent success", instanceName)
+			return nil
+		}
+		if IsCapacityError(err) {
+			log.Warnf("Capacity error creating instance %s (%s, %s): %s - trying next zone/model", instanceName, attempt.zone, attempt.provisioningModel, err.Error())
+			lastErr = err
+			continue
+		}
+		// Non-retryable error (bad template, permission, invalid machine type, ...).
+		log.Errorf("Could not create instance %s (%s) from %s template: %s", instanceName, attempt.zone, attempt.provisioningModel, err.Error())
+		return err
 	}
+
 	log.Errorf("Exhausted all zones/provisioning models creating instance %s: %v", instanceName, lastErr)
 	return lastErr
 }
@@ -1169,6 +1188,11 @@ type Autoscaler struct {
 
 	sweepMu   sync.Mutex
 	lastSweep time.Time
+
+	// tryInsertFn is a test seam for intercepting individual VM-creation attempts.
+	// nil in production, where CreateInstanceFromTemplate builds a real compute
+	// client and calls tryInsertInstance.
+	tryInsertFn func(ctx context.Context, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error
 }
 
 func NewAutoscaler(config AutoscalerConfig) *Autoscaler {
