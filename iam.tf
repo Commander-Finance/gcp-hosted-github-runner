@@ -30,6 +30,12 @@ resource "google_project_iam_custom_role" "manage_vm_instances" {
   permissions = ["compute.instances.get", "compute.instances.start", "compute.instances.stop", "compute.instances.delete", "compute.instances.create", "compute.instances.setMetadata", "compute.instances.setTags", "compute.instances.setServiceAccount"]
 }
 
+resource "google_project_iam_custom_role" "list_vm_instances" {
+  role_id     = "ListVmInstances"
+  title       = "List VM instances"
+  permissions = ["compute.instances.list"]
+}
+
 resource "google_project_iam_custom_role" "create_delete_cloud_task" {
   role_id     = "CreateDeleteCloudTask"
   title       = "Create/Delete a Cloud Task"
@@ -80,6 +86,18 @@ resource "google_project_iam_member" "manage_vm_instances_member" {
   }
 }
 
+// compute.instances.list is required by the autoscaler's orphan sweep, which
+// reclaims stopped runner VMs (a runner that shut itself down without ever picking
+// up a job produces no completed-webhook and would otherwise linger). list is a
+// collection-level permission that IAM conditions cannot narrow by instance name,
+// so this grants read-only listing of instances project-wide. It is read-only, and
+// the autoscaler SA runs in Cloud Run and is never reachable from a job workload.
+resource "google_project_iam_member" "list_vm_instances_member" {
+  project = local.projectId
+  member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
+  role    = google_project_iam_custom_role.list_vm_instances.id
+}
+
 resource "google_project_iam_member" "create_delete_cloud_task_member" {
   project = local.projectId
   member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
@@ -106,8 +124,10 @@ resource "google_project_iam_member" "create_vm_from_instance_template_member" {
   member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
   role    = google_project_iam_custom_role.create_vm_from_instance_template.id
   condition {
-    title       = "Create VM instance from instance template ${google_compute_instance_template.runner_instance.name}"
-    expression  = "resource.name == '${google_compute_instance_template.runner_instance.id}'"
+    title = "Create VM instance from runner instance template(s)"
+    // startsWith covers both the primary template and the "-ondemand" fallback
+    // template (whose id is the primary id + "-ondemand").
+    expression = "resource.name.startsWith('${google_compute_instance_template.runner_instance.id}')"
   }
 }
 

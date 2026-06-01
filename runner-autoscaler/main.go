@@ -64,21 +64,22 @@ func main() {
 	}
 
 	config := pkg.AutoscalerConfig{
-		RouteWebhook:      getEnvDefault("ROUTE_WEBHOOK", "/webhook"),
-		RouteDeleteVm:     getEnvDefault("ROUTE_DELETE_VM", "/delete_vm"),
-		RouteCreateVm:     getEnvDefault("ROUTE_CREATE_VM", "/create_vm"),
-		ProjectId:         mustGetEnv("PROJECT_ID"),
-		Zones:             strings.Split(mustGetEnv("ZONES"), ","),
-		TaskQueue:         mustGetEnv("TASK_QUEUE"),
-		TaskTimeout:       getEnvDefaultInt64("TASK_DISPATCH_TIMEOUT", 180),
-		InstanceTemplate:  mustGetEnv("INSTANCE_TEMPLATE"),
-		SecretVersion:     mustGetEnv("SECRET_VERSION"),
-		RunnerPrefix:      getEnvDefault("RUNNER_PREFIX", "runner"),
-		RunnerGroupId:     getEnvDefaultInt64("RUNNER_GROUP_ID", 1),
-		RegisteredSources: map[string]pkg.Source{},
-		SourceQueryParam:  getEnvDefault("SOURCE_QUERY_PARAM_NAME", "src"),
-		CreateVmDelay:     getEnvDefaultInt64("CREATE_VM_DELAY", 10),
-		Simulate:          getEnvDefaultInt64("SIMULATE", 0) == 1,
+		RouteWebhook:             getEnvDefault("ROUTE_WEBHOOK", "/webhook"),
+		RouteDeleteVm:            getEnvDefault("ROUTE_DELETE_VM", "/delete_vm"),
+		RouteCreateVm:            getEnvDefault("ROUTE_CREATE_VM", "/create_vm"),
+		ProjectId:                mustGetEnv("PROJECT_ID"),
+		Zones:                    strings.Split(mustGetEnv("ZONES"), ","),
+		TaskQueue:                mustGetEnv("TASK_QUEUE"),
+		TaskTimeout:              getEnvDefaultInt64("TASK_DISPATCH_TIMEOUT", 180),
+		InstanceTemplate:         mustGetEnv("INSTANCE_TEMPLATE"),
+		FallbackInstanceTemplate: getEnvDefault("INSTANCE_TEMPLATE_FALLBACK", ""),
+		SecretVersion:            mustGetEnv("SECRET_VERSION"),
+		RunnerPrefix:             getEnvDefault("RUNNER_PREFIX", "runner"),
+		RunnerGroupId:            getEnvDefaultInt64("RUNNER_GROUP_ID", 1),
+		RegisteredSources:        map[string]pkg.Source{},
+		SourceQueryParam:         getEnvDefault("SOURCE_QUERY_PARAM_NAME", "src"),
+		CreateVmDelay:            getEnvDefaultInt64("CREATE_VM_DELAY", 10),
+		Simulate:                 getEnvDefaultInt64("SIMULATE", 0) == 1,
 	}
 
 	if enterpriseEnv := strings.Split(getEnvDefault("GITHUB_ENTERPRISE", ""), ";"); len(enterpriseEnv) == 2 {

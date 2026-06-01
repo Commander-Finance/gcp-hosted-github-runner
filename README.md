@@ -206,7 +206,11 @@ Overall, only the compute instance accounts for the "majority" of the costs.
 
 > [!NOTE]
 > There are webhook related error cases that can lead to duplicate VMs or missing VMs. This happens, for example, if GitHub webhooks are received twice or if webhooks are missing or the received webhooks are in the wrong order. Such errors occur rarely but cannot be completely avoided.
-> To avoid unnecessary costs, any superfluous VM that does not pick a workflow job within one minute will stop (but not delete) itself.
+> Several mechanisms harden the system against these and against transient failures:
+> * **Idempotent VM creation**: the VM name is derived from the workflow job id, so a retried `create-vm` callback reuses the same name and never spawns a duplicate.
+> * **Capacity fallback**: VM creation tries every configured zone, and — when the primary template is a SPOT instance — falls back to an on-demand (STANDARD) VM if SPOT capacity is exhausted everywhere, so a stockout no longer hangs the job. The SPOT-vs-standard split is exposed as a Cloud Monitoring log-based metric (`github_runner/vm_created`).
+> * **Two-phase startup wait**: a runner shuts its VM down quickly only if it never comes online (`runner_register_timeout`, default 120s); once online it waits much longer for GitHub to dispatch the job (`runner_job_dispatch_timeout`, default 600s) instead of the old hard 180s window that abandoned jobs that were still queued.
+> * **Orphan sweep**: a runner that stops without ever running a job (so no `completed` webhook arrives) is reclaimed by an opportunistic sweep that runs from the autoscaler's callbacks.
 
 ## Troubleshooting
 
@@ -226,7 +230,7 @@ Error applying IAM policy for cloudrun service "v1/projects/my-gcp-project-id/lo
 
 #### The VM instance stops shortly after it was created without processing a workflow task
 
-The VM will stop (but not delete) itself if the registration at the GitHub runner group fails. This can be caused by:
+The VM will stop itself if it does not come online within `runner_register_timeout` (default 120s), which usually means registration at the GitHub runner group failed. This can be caused by:
 * A typo in the GitHub Enterprise, Organization, Repository name. Check the Terraform variables `github_enterprise`, `github_organization`, `github_repositories` for typos.
 * A not existing GitHub runner group within the Enterprise/Organization. Check the Terraform variable `github_runner_group` for typos.
 * The GitHub runner version is [deprecated](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners#controlling-runner-software-updates-on-self-hosted-runners). The GitHub runner won't accept any Workflow job. Check the Terraform variable `github_runner_download_url` and update to latest GitHub runner version or leave empty to always use the latest version.
