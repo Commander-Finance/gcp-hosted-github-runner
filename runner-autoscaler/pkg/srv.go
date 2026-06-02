@@ -1289,6 +1289,21 @@ type AutoscalerConfig struct {
 	Simulate                 bool
 }
 
+// Validate checks startup invariants that, if violated, would leave the
+// autoscaler running in a silently broken state. Call it during config load and
+// fail fast on error.
+func (c AutoscalerConfig) Validate() error {
+
+	// A non-empty prefix is load-bearing: InstanceName builds "<prefix>-<jobId>"
+	// (an empty prefix yields "-<jobId>", an invalid GCE instance name that the
+	// create API rejects) and IsOwnedRunnerName uses it to recognise the VMs we
+	// own. An empty prefix breaks both create and delete, so refuse to start.
+	if c.RunnerPrefix == "" {
+		return fmt.Errorf("RunnerPrefix must not be empty")
+	}
+	return nil
+}
+
 type Autoscaler struct {
 	engine *gin.Engine
 	conf   AutoscalerConfig

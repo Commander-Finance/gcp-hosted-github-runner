@@ -272,3 +272,13 @@ func TestCallbackTaskNameDeleteTargetsCreateTask(t *testing.T) {
 	queue := "projects/p/locations/r/queues/q"
 	assert.Equal(t, queue+"/tasks/create-42-0", CallbackTaskName(queue, TaskKindCreate, 42, 0))
 }
+
+func TestAutoscalerConfigValidateRejectsEmptyRunnerPrefix(t *testing.T) {
+
+	// An empty RunnerPrefix is a misconfiguration: InstanceName would produce
+	// "-<jobId>" (an invalid GCP instance name) and the delete guard would match
+	// nothing it created. Validate must fail fast at startup rather than let the
+	// autoscaler run in a broken state.
+	require.Error(t, AutoscalerConfig{RunnerPrefix: ""}.Validate())
+	require.NoError(t, AutoscalerConfig{RunnerPrefix: "runner"}.Validate())
+}
