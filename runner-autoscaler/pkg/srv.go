@@ -388,23 +388,14 @@ func InstanceName(prefix string, jobId int64) string {
 	return fmt.Sprintf("%s-%d", prefix, jobId)
 }
 
-// IsValidRunnerName reports whether name matches the shape we create
-// (InstanceName): "<prefix>-<digits>". The delete-vm callback uses the
-// webhook-supplied runner_name as the Compute instance name; validating it here
-// stops a (signed) caller from naming an arbitrary instance - including another
-// runner - for deletion.
-func IsValidRunnerName(prefix string, name string) bool {
+// IsExpectedRunnerName reports whether name is exactly the deterministic instance
+// name we create for jobId (see InstanceName). The delete-vm callback uses the
+// webhook-supplied runner_name as the Compute instance name; requiring the exact
+// per-job name (not merely the "<prefix>-<digits>" shape) stops a callback from
+// naming a *different* runner for deletion.
+func IsExpectedRunnerName(prefix string, jobId int64, name string) bool {
 
-	suffix, ok := strings.CutPrefix(name, prefix+"-")
-	if !ok || suffix == "" {
-		return false
-	}
-	for _, r := range suffix {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
+	return name == InstanceName(prefix, jobId)
 }
 
 // CallbackTaskName builds the Cloud Tasks task resource name for a callback,
@@ -987,13 +978,23 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 
 	var sendAndRetry func(int) error
 	sendAndRetry = func(retryCount int) error {
-		req.Task.Name = CallbackTaskName(s.conf.TaskQueue, kind, job.Id, retryCount)
+		name := CallbackTaskName(s.conf.TaskQueue, kind, job.Id, retryCount)
+		req.Task.Name = name
 		if _, err := client.CreateTask(ctx, req); err != nil {
-			if IsAlreadyExists(err) && retryCount < maxTaskRetryCount {
-				return sendAndRetry(retryCount + 1)
-			} else {
-				return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %v", job.Id, err)
+			if IsAlreadyExists(err) {
+				// Cloud Tasks returns ALREADY_EXISTS both for a still-active task and
+				// for a recently deleted/executed (tombstoned) name. Only bump to a
+				// fresh suffix for the tombstone case: if the task is still active the
+				// callback is already queued, and minting another would duplicate the
+				// VM. GetTask distinguishes the two (active -> found, tombstoned -> 404).
+				if _, getErr := client.GetTask(ctx, &taskspb.GetTaskRequest{Name: name}); getErr == nil {
+					log.Infof("Cloud task callback for job Id %d already queued (%s) - not duplicating", job.Id, name)
+					return nil
+				} else if IsNotFound(getErr) && retryCount < maxTaskRetryCount {
+					return sendAndRetry(retryCount + 1)
+				}
 			}
+			return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %v", job.Id, err)
 		} else {
 			log.Infof("Created cloud task callback for workflow job Id %d with url \"%s\" and payload \"%s\"", job.Id, url, data)
 			return nil
@@ -1119,12 +1120,12 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 	if data, _, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
 		json.Unmarshal(data, &job)
-		if !IsValidRunnerName(s.conf.RunnerPrefix, job.RunnerName) {
+		if !IsExpectedRunnerName(s.conf.RunnerPrefix, job.Id, job.RunnerName) {
 			// Either empty (the job was never picked up, e.g. cancelled while queued)
-			// or a name that doesn't match a runner we manage. Don't issue a delete for
-			// an empty/attacker-influenced name (which could target another runner);
+			// or a name that isn't the runner we created for this job. Don't issue a
+			// delete for an empty/mismatched name (which could target another runner);
 			// acknowledge so the task isn't retried, and let the sweep handle cleanup.
-			log.Infof("Delete-vm callback runner name %q is not a managed runner - skipping delete", job.RunnerName)
+			log.Infof("Delete-vm callback runner name %q is not the expected runner for job %d - skipping delete", job.RunnerName, job.Id)
 			ctx.Status(http.StatusOK)
 			go s.maybeSweepOrphans()
 			return

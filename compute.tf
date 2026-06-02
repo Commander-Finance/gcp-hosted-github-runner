@@ -173,7 +173,14 @@ usermod -aG docker agent
 newgrp docker
 RUNNER_DOWNLOAD_URL='${var.github_runner_download_url}'
 if [ -z "$${RUNNER_DOWNLOAD_URL}" ]; then
-  RUNNER_VERSION=$(curl -s "https://github.com/actions/runner/tags/" | grep -Eo "$Version v[0-9]+.[0-9]+.[0-9]+" | sort -r | head -n1 | tr -d ' ' | tr -d 'v')
+  # Runner-version discovery is itself a network hop: retry it and require a
+  # non-empty result, otherwise a transient failure yields an empty version and
+  # the retried download below would just hammer an invalid release URL.
+  fetch_runner_version() {
+    RUNNER_VERSION=$(curl -fsS "https://github.com/actions/runner/tags/" | grep -Eo "$Version v[0-9]+.[0-9]+.[0-9]+" | sort -r | head -n1 | tr -d ' ' | tr -d 'v')
+    [ -n "$RUNNER_VERSION" ]
+  }
+  retry ${var.runner_setup_retries} 5 fetch_runner_version || shutdown now
   echo "Downloading latest runner v$${RUNNER_VERSION}"
   RUNNER_DOWNLOAD_URL="https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-x64-$${RUNNER_VERSION}.tar.gz"
 fi

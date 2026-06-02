@@ -73,8 +73,16 @@ variable "runner_job_dispatch_timeout" {
   default     = 600 // 10 min
 
   validation {
-    condition     = var.runner_job_dispatch_timeout < var.machine_timeout
-    error_message = "runner_job_dispatch_timeout must be smaller than machine_timeout."
+    # Validate the whole two-phase budget: the VM waits register_timeout AND THEN
+    # dispatch_timeout, so their sum must fit inside machine_timeout (the
+    # max_run_duration backstop) - otherwise a healthy runner could be killed
+    # mid-queue, the very failure this hardening removes.
+    condition = (
+      var.runner_register_timeout > 0 &&
+      var.runner_job_dispatch_timeout > 0 &&
+      var.runner_register_timeout + var.runner_job_dispatch_timeout < var.machine_timeout
+    )
+    error_message = "runner_register_timeout and runner_job_dispatch_timeout must be positive and their sum smaller than machine_timeout."
   }
 }
 

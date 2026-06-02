@@ -81,8 +81,8 @@ resource "google_project_iam_member" "manage_vm_instances_member" {
   member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
   role    = google_project_iam_custom_role.manage_vm_instances.id
   condition {
-    title       = "VM instance administration with a fix prefix ${var.github_runner_prefix} in zone ${local.zones[count.index]}"
-    expression  = "resource.name.startsWith('projects/${local.projectId}/zones/${local.zones[count.index]}/instances/${var.github_runner_prefix}-')"
+    title      = "VM instance administration with a fix prefix ${var.github_runner_prefix} in zone ${local.zones[count.index]}"
+    expression = "resource.name.startsWith('projects/${local.projectId}/zones/${local.zones[count.index]}/instances/${var.github_runner_prefix}-')"
   }
 }
 
@@ -127,11 +127,14 @@ resource "google_project_iam_member" "create_vm_from_instance_template_member" {
   role    = google_project_iam_custom_role.create_vm_from_instance_template.id
   condition {
     title = "Create VM instance from runner instance template(s)"
-    // The two templates are named by design so the fallback's id is the primary's
-    // id + "-ondemand"; startsWith(primary.id) therefore authorizes both. Using a
-    // prefix (rather than two explicit ids) also avoids indexing the count'd
-    // ondemand resource, which is absent when machine_preemtible = false.
-    expression = "resource.name.startsWith('${google_compute_instance_template.runner_instance.id}')"
+    // Match the exact template id(s) rather than a prefix, so no future template
+    // sharing the "ephemeral-github-runner" prefix is inadvertently authorized.
+    // The ondemand fallback exists only when machine_preemtible is set, and its
+    // id is referenced only in that branch so the count'd resource is never
+    // indexed when absent.
+    expression = (var.machine_preemtible ?
+      "resource.name == '${google_compute_instance_template.runner_instance.id}' || resource.name == '${google_compute_instance_template.runner_instance_ondemand[0].id}'" :
+    "resource.name == '${google_compute_instance_template.runner_instance.id}'")
   }
 }
 
@@ -163,9 +166,9 @@ resource "google_project_iam_member" "read_secret_version_member" {
   member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
   role    = google_project_iam_custom_role.read_secret_version.id
   condition {
-    title       = "Read secret ${google_secret_manager_secret.github_pat_token.secret_id}"
+    title = "Read secret ${google_secret_manager_secret.github_pat_token.secret_id}"
     // The project number is needed - project id doesn't work
-    expression  = "resource.name == 'projects/${local.projectNumber}/secrets/${google_secret_manager_secret.github_pat_token.secret_id}/versions/latest'"
+    expression = "resource.name == 'projects/${local.projectNumber}/secrets/${google_secret_manager_secret.github_pat_token.secret_id}/versions/latest'"
   }
 }
 

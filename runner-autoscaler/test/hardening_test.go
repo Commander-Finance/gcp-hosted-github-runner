@@ -14,6 +14,7 @@ import (
 
 	"github.com/Tereius/gcp-hosted-github-runner/pkg"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // simScaler runs in Simulate mode so delete/sweep make no real GCP calls - used by
@@ -118,27 +119,28 @@ func TestEmptyRunnerNameDeleteReturnsOk(t *testing.T) {
 	req, _ := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("http://127.0.0.1:%d/delete?%s=%s", simPort, SOURCE_QUERY_PARAM_NAME, url.QueryEscape(TEST_REPO_KEY)), bytes.NewReader(jobData))
 	req.Header.Add("x-hub-signature-256", "sha256="+pkg.CalcSigHex([]byte(PUBLIC_SECRET), jobData))
 	resp, err := http.DefaultClient.Do(req)
-	assert.Nil(t, err)
-	assert.NotNil(t, resp)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	require.NoError(t, err)
+	require.NotNil(t, resp)
 	assert.Equal(t, 200, resp.StatusCode)
 }
 
-func TestIsValidRunnerName(t *testing.T) {
+func TestIsExpectedRunnerName(t *testing.T) {
 
-	assert.True(t, pkg.IsValidRunnerName("runner", "runner-42"))
-	assert.True(t, pkg.IsValidRunnerName("runner", "runner-9007199254740991"))
-	assert.True(t, pkg.IsValidRunnerName("gh-runner", "gh-runner-1"))
+	// The exact name we create for the job round-trips.
+	assert.True(t, pkg.IsExpectedRunnerName("runner", 42, "runner-42"))
+	assert.True(t, pkg.IsExpectedRunnerName("runner", 12345, pkg.InstanceName("runner", 12345)))
+	assert.True(t, pkg.IsExpectedRunnerName("gh-runner", 1, "gh-runner-1"))
 
-	// Empty, missing prefix, non-numeric suffix, extra segments, and a bare prefix
-	// must all be rejected so the delete-vm callback can't target an arbitrary name.
-	assert.False(t, pkg.IsValidRunnerName("runner", ""))
-	assert.False(t, pkg.IsValidRunnerName("runner", "runner-"))
-	assert.False(t, pkg.IsValidRunnerName("runner", "runner-abc"))
-	assert.False(t, pkg.IsValidRunnerName("runner", "runner-1-2"))
-	assert.False(t, pkg.IsValidRunnerName("runner", "other-1"))
-	assert.False(t, pkg.IsValidRunnerName("runner", "runner"))
-	// The name we actually create round-trips.
-	assert.True(t, pkg.IsValidRunnerName("runner", pkg.InstanceName("runner", 12345)))
+	// A different numeric suffix is another job's runner and must be rejected, as
+	// must empty / non-numeric / wrong-prefix / bare-prefix names.
+	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, "runner-43"))
+	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, ""))
+	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, "runner-abc"))
+	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, "other-42"))
+	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, "runner"))
 }
 
 func TestUnknownSourceReturnsUnauthorized(t *testing.T) {
@@ -152,7 +154,11 @@ func TestUnknownSourceReturnsUnauthorized(t *testing.T) {
 	// A syntactically valid (71-char) but wrong signature.
 	req.Header.Add("x-hub-signature-256", "sha256="+strings.Repeat("0", 64))
 	resp, err := http.DefaultClient.Do(req)
-	assert.Nil(t, err)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	require.NoError(t, err)
+	require.NotNil(t, resp)
 	assert.Equal(t, 401, resp.StatusCode)
 }
 
@@ -163,7 +169,11 @@ func TestBadSignatureReturnsUnauthorized(t *testing.T) {
 	req, _ := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("http://127.0.0.1:%d/webhook?%s=%s", PORT, SOURCE_QUERY_PARAM_NAME, url.QueryEscape(TEST_REPO_KEY)), strings.NewReader("Hello, World!"))
 	req.Header.Add("x-hub-signature-256", "sha256="+strings.Repeat("0", 64))
 	resp, err := http.DefaultClient.Do(req)
-	assert.Nil(t, err)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	require.NoError(t, err)
+	require.NotNil(t, resp)
 	assert.Equal(t, 401, resp.StatusCode)
 }
 
