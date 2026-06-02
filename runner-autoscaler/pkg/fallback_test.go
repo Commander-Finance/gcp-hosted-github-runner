@@ -38,12 +38,33 @@ func TestCreationPlanSpotFirstThenStandard(t *testing.T) {
 		assert.Equal(t, "standard", plan[i].provisioningModel, "attempt %d", i)
 		assert.Equal(t, "ondemand", plan[i].template, "attempt %d", i)
 	}
-	// SPOT covers every configured zone.
+	// Both the SPOT block and the STANDARD block cover every configured zone.
 	spotZones := map[string]bool{}
+	standardZones := map[string]bool{}
 	for i := 0; i < 3; i++ {
 		spotZones[plan[i].zone] = true
+		standardZones[plan[i+3].zone] = true
 	}
-	assert.Equal(t, map[string]bool{"z1": true, "z2": true, "z3": true}, spotZones)
+	all := map[string]bool{"z1": true, "z2": true, "z3": true}
+	assert.Equal(t, all, spotZones)
+	assert.Equal(t, all, standardZones)
+}
+
+func TestCreationPlanEmptyWhenNoZones(t *testing.T) {
+
+	s := &Autoscaler{conf: AutoscalerConfig{InstanceTemplate: "primary", FallbackInstanceTemplate: "ondemand"}}
+	assert.Empty(t, s.creationPlan("runner-7"))
+}
+
+func TestIsStoppedPredicate(t *testing.T) {
+
+	for _, st := range []State{STOPPING, TERMINATED, SUSPENDING, SUSPENDED} {
+		assert.True(t, st.isStopped(), "%s should be reclaimable", st)
+	}
+	// Never reclaim a VM that may be running (or about to run) a job.
+	for _, st := range []State{PROVISIONING, STAGING, RUNNING, REPAIRING, Unknown} {
+		assert.False(t, st.isStopped(), "%s must NOT be reclaimable", st)
+	}
 }
 
 func TestCreationPlanStandardOnlyWhenNotPreemptible(t *testing.T) {
@@ -114,4 +135,123 @@ func TestCreateInstanceAbortsOnNonCapacityErrorWithoutFallback(t *testing.T) {
 	// on-demand fallback.
 	assert.Len(t, attempts, 1)
 	assert.Equal(t, "spot", attempts[0].provisioningModel)
+}
+
+func TestCreateInstanceReturnsCapacityErrorWhenAllExhausted(t *testing.T) {
+
+	s := spotFallbackScaler([]string{"z1", "z2", "z3"})
+	var attempts []creationAttempt
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+		attempts = append(attempts, a)
+		return fmt.Errorf("ZONE_RESOURCE_POOL_EXHAUSTED")
+	}
+
+	err := s.CreateInstanceFromTemplate(context.Background(), "runner-7", nil)
+	require.Error(t, err)
+	// Every SPOT zone and every STANDARD zone was tried (3 + 3) before giving up.
+	assert.Len(t, attempts, 6)
+}
+
+func TestCreateInstanceTreatsAlreadyExistsAsSuccess(t *testing.T) {
+
+	s := spotFallbackScaler([]string{"z1", "z2", "z3"})
+	var attempts []creationAttempt
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+		attempts = append(attempts, a)
+		return fmt.Errorf("The resource 'runner-7' already exists")
+	}
+
+	// A retried create that finds the VM already present is idempotent success - it
+	// must NOT keep trying other zones/models.
+	require.NoError(t, s.CreateInstanceFromTemplate(context.Background(), "runner-7", nil))
+	assert.Len(t, attempts, 1)
+}
+
+func TestCreateInstanceFailsWithNoZones(t *testing.T) {
+
+	s := &Autoscaler{conf: AutoscalerConfig{InstanceTemplate: "primary"}}
+	called := false
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+		called = true
+		return nil
+	}
+
+	err := s.CreateInstanceFromTemplate(context.Background(), "runner-7", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no zones configured")
+	assert.False(t, called, "no creation attempt should run when there are no zones")
+}
+
+// DeleteInstance zone-iteration behaviour, exercised through the deleteInZoneFn seam.
+
+func deleteSeamScaler(zones []string, fn func(zone string, call int) (bool, error)) *Autoscaler {
+	s := &Autoscaler{conf: AutoscalerConfig{Zones: zones}}
+	call := 0
+	s.deleteInZoneFn = func(ctx context.Context, name string, zone string) (bool, error) {
+		call++
+		return fn(zone, call)
+	}
+	return s
+}
+
+func TestDeleteInstanceStopsAtFirstSuccess(t *testing.T) {
+
+	calls := 0
+	s := deleteSeamScaler([]string{"z1", "z2", "z3"}, func(zone string, call int) (bool, error) {
+		calls = call
+		return true, nil // found+deleted in the very first zone
+	})
+	require.NoError(t, s.DeleteInstance(context.Background(), "runner-7"))
+	assert.Equal(t, 1, calls, "should stop at the first zone where the VM is found")
+}
+
+func TestDeleteInstanceContinuesPastNotFoundZones(t *testing.T) {
+
+	calls := 0
+	s := deleteSeamScaler([]string{"z1", "z2", "z3"}, func(zone string, call int) (bool, error) {
+		calls = call
+		if call < 3 {
+			return false, nil // not in this zone
+		}
+		return true, nil // found in the third zone
+	})
+	require.NoError(t, s.DeleteInstance(context.Background(), "runner-7"))
+	assert.Equal(t, 3, calls)
+}
+
+func TestDeleteInstanceWaitFailureIsNotSwallowed(t *testing.T) {
+
+	calls := 0
+	s := deleteSeamScaler([]string{"z1", "z2", "z3"}, func(zone string, call int) (bool, error) {
+		calls = call
+		return true, fmt.Errorf("operation failed") // was here, deletion failed
+	})
+	// The instance was found, so a deletion failure must surface (not be treated as
+	// a false success that acks the task and leaks the VM).
+	require.Error(t, s.DeleteInstance(context.Background(), "runner-7"))
+	assert.Equal(t, 1, calls, "must not fall through to other zones once the VM is found")
+}
+
+func TestDeleteInstanceAllNotFoundIsIdempotent(t *testing.T) {
+
+	s := deleteSeamScaler([]string{"z1", "z2", "z3"}, func(zone string, call int) (bool, error) {
+		return false, nil // not in any zone
+	})
+	assert.NoError(t, s.DeleteInstance(context.Background(), "runner-7"))
+}
+
+func TestDeleteInstanceReturnsErrorWhenNoZoneSucceeds(t *testing.T) {
+
+	s := deleteSeamScaler([]string{"z1", "z2", "z3"}, func(zone string, call int) (bool, error) {
+		return false, fmt.Errorf("transient API error") // unknown error, not 404
+	})
+	require.Error(t, s.DeleteInstance(context.Background(), "runner-7"))
+}
+
+func TestCallbackTaskNameDeleteTargetsCreateTask(t *testing.T) {
+
+	// DeleteCallbackTask cancels the *create* callback; this pins the exact name it
+	// builds so the create/delete namespacing can't silently drift.
+	queue := "projects/p/locations/r/queues/q"
+	assert.Equal(t, queue+"/tasks/create-42-0", CallbackTaskName(queue, TaskKindCreate, 42, 0))
 }

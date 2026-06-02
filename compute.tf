@@ -70,10 +70,10 @@ resource "google_compute_instance_template" "runner_instance_ondemand" {
     preemptible         = false
     automatic_restart   = false
     on_host_maintenance = "TERMINATE"
-    // Valid together with provisioning_model=STANDARD because max_run_duration is set
-    // (instanceTerminationAction requires SPOT or a limited-run instance). Verify at
-    // apply time; if rejected, drop this line so the VM STOPs at timeout and the
-    // orphan sweep reclaims it.
+    // Valid with provisioning_model=STANDARD because max_run_duration is set
+    // (instance_termination_action requires SPOT or a limited-run instance, and a
+    // VM with max_run_duration qualifies). DELETE keeps the ephemeral-runner
+    // semantics consistent with the SPOT template.
     instance_termination_action = "DELETE"
     provisioning_model          = "STANDARD"
 

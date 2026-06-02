@@ -125,8 +125,10 @@ resource "google_project_iam_member" "create_vm_from_instance_template_member" {
   role    = google_project_iam_custom_role.create_vm_from_instance_template.id
   condition {
     title = "Create VM instance from runner instance template(s)"
-    // startsWith covers both the primary template and the "-ondemand" fallback
-    // template (whose id is the primary id + "-ondemand").
+    // The two templates are named by design so the fallback's id is the primary's
+    // id + "-ondemand"; startsWith(primary.id) therefore authorizes both. Using a
+    // prefix (rather than two explicit ids) also avoids indexing the count'd
+    // ondemand resource, which is absent when machine_preemtible = false.
     expression = "resource.name.startsWith('${google_compute_instance_template.runner_instance.id}')"
   }
 }

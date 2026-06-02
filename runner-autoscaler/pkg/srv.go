@@ -64,6 +64,11 @@ const sweepInterval = 5 * time.Minute
 // Maximum number of orphans deleted per sweep, to bound callback latency.
 const maxSweepDeletes = 25
 
+// Highest retry suffix a create/delete callback task name may carry (suffixes
+// 0..maxTaskRetryCount). CreateCallbackTaskWithToken bumps the suffix on
+// AlreadyExists; DeleteCallbackTask must cancel every candidate.
+const maxTaskRetryCount = 2
+
 const RUNNER_REGISTER_TOKEN_ORG_ENDPOINT string = "https://api.github.com/orgs/%s/actions/runners/registration-token"
 
 const RUNNER_ENTERPRISE_JIT_CONFIG_ENDPOINT string = "https://api.github.com/enterprises/%s/actions/runners/generate-jitconfig"
@@ -285,16 +290,13 @@ const (
 	Unknown   State = "unknown"
 )
 
-/*
+// isStopped reports whether a VM in this state is stopped (and therefore safe for
+// the orphan sweep to reclaim) - never a RUNNING/PROVISIONING VM that may be
+// executing a job.
 func (s State) isStopped() bool {
 
 	return s == STOPPING || s == SUSPENDING || s == SUSPENDED || s == TERMINATED
 }
-
-func (s State) isRunning() bool {
-
-	return s == PROVISIONING || s == STAGING || s == RUNNING || s == REPAIRING
-}*/
 
 type InstanceClient struct {
 	*compute.InstancesClient
@@ -350,8 +352,9 @@ func CalcSigHex(secret []byte, data []byte) string {
 	return hex.EncodeToString(sig.Sum(nil))
 }
 
-// depending on an arbitrary input string a zone is selected
-// the same input string leads to the same zone
+// PickRandomZone returns the deterministic hash-picked zone for the seed (the first
+// zone OrderedZones would try). Panics if no zones are configured; all production
+// paths use OrderedZones, which is empty-safe.
 func (s *Autoscaler) PickRandomZone(seed string) string {
 
 	return s.OrderedZones(seed)[0]
@@ -564,6 +567,31 @@ func (s *Autoscaler) StopInstance(ctx context.Context, instanceName string) erro
 }
 */
 
+// realDeleteInZone deletes the instance in one specific zone using the given
+// client. It returns whether the instance was found in this zone (the delete was
+// accepted) and any error. A 404 means "not in this zone" (found=false, err=nil);
+// a delete that is accepted but whose wait fails returns found=true with the error,
+// so callers know the instance WAS here and must not fall through to a false
+// success (which would leak the VM).
+func (s *Autoscaler) realDeleteInZone(ctx context.Context, client *InstanceClient, instanceName string, zone string) (bool, error) {
+
+	res, err := client.Delete(ctx, &computepb.DeleteInstanceRequest{
+		Project:  s.conf.ProjectId,
+		Zone:     zone,
+		Instance: instanceName,
+	})
+	if err != nil {
+		if IsNotFound(err) {
+			return false, nil // not in this zone
+		}
+		return false, err // unknown - let the caller try other zones
+	}
+	if err := res.Wait(ctx); err != nil {
+		return true, err // was here, but deletion/confirmation failed
+	}
+	return true, nil
+}
+
 // blocking until the instance is deleted or the deletion fails.
 //
 // The instance may live in any configured zone (VM creation falls back across
@@ -580,35 +608,34 @@ func (s *Autoscaler) DeleteInstance(ctx context.Context, instanceName string) er
 		return nil
 	}
 
-	client := newComputeClient(ctx)
-	defer client.Close()
+	deleteInZone := s.deleteInZoneFn
+	if deleteInZone == nil {
+		client := newComputeClient(ctx)
+		defer client.Close()
+		deleteInZone = func(ctx context.Context, name string, zone string) (bool, error) {
+			return s.realDeleteInZone(ctx, client, name, zone)
+		}
+	}
 
 	var lastErr error
 	for _, zone := range s.OrderedZones(instanceName) {
 		log.Debugf("About to delete instance %s (%s)", instanceName, zone)
-		res, err := client.Delete(ctx, &computepb.DeleteInstanceRequest{
-			Project:  s.conf.ProjectId,
-			Zone:     zone,
-			Instance: instanceName,
-		})
+		found, err := deleteInZone(ctx, instanceName, zone)
 		if err != nil {
-			if IsNotFound(err) {
-				continue // not in this zone - try the next one
-			}
 			log.Errorf("Could not delete instance %s (%s): %s", instanceName, zone, err.Error())
+			if found {
+				// The instance was in this zone but deletion failed - authoritative,
+				// surface the error instead of acking the task and leaking the VM.
+				return err
+			}
 			lastErr = err
 			continue
 		}
-		// The delete was accepted, so the instance existed in this zone (and only
-		// this zone). The wait result is therefore authoritative - we must not treat
-		// a wait failure as "not in this zone" and fall through to a false success,
-		// which would ack the task and leak the VM.
-		if err := res.Wait(ctx); err != nil {
-			log.Errorf("Failed to wait for instance %s (%s) to be deleted: %s", instanceName, zone, err.Error())
-			return err
+		if found {
+			log.Infof("Deleted instance %s (%s)", instanceName, zone)
+			return nil
 		}
-		log.Infof("Deleted instance %s (%s)", instanceName, zone)
-		return nil
+		// not in this zone - try the next one
 	}
 
 	if lastErr != nil {
@@ -683,7 +710,7 @@ func (s *Autoscaler) creationPlan(instanceName string) []creationAttempt {
 // tryInsertInstance attempts a single Insert+Wait for one creation attempt.
 func (s *Autoscaler) tryInsertInstance(ctx context.Context, client *InstanceClient, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error {
 
-	var machine *string = nil
+	var machine *string
 	if machineType != nil {
 		machine = proto.String(fmt.Sprintf("zones/%s/machineTypes/%s", attempt.zone, *machineType))
 	}
@@ -806,10 +833,11 @@ func (s *Autoscaler) sweepOrphans(ctx context.Context) {
 			// Only reclaim instances that are stopped - never a RUNNING/PROVISIONING
 			// VM that may be executing (or about to execute) a job. max_run_duration
 			// remains the backstop for runaway RUNNING VMs.
-			if status == string(STOPPING) || status == string(TERMINATED) || status == string(SUSPENDING) || status == string(SUSPENDED) {
+			if State(status).isStopped() {
 				name := instance.GetName()
 				log.Infof("Orphan sweep: reclaiming stopped runner VM %s (%s, status %s)", name, zone, status)
-				if err := s.DeleteInstance(ctx, name); err != nil {
+				// Delete in the zone we just listed it from, reusing this client.
+				if _, err := s.realDeleteInZone(ctx, client, name, zone); err != nil {
 					log.Warnf("Orphan sweep: failed to delete %s: %s", name, err.Error())
 				} else {
 					deleted++
@@ -939,7 +967,7 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 	sendAndRetry = func(retryCount int) error {
 		req.Task.Name = CallbackTaskName(s.conf.TaskQueue, kind, job.Id, retryCount)
 		if _, err := client.CreateTask(ctx, req); err != nil {
-			if retry, _ := regexp.MatchString("code = AlreadyExists", err.Error()); retry && retryCount < 2 {
+			if IsAlreadyExists(err) && retryCount < maxTaskRetryCount {
 				return sendAndRetry(retryCount + 1)
 			} else {
 				return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %v", job.Id, err)
@@ -954,18 +982,32 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 }
 
 // DeleteCallbackTask cancels the pending create-vm callback for a job (used when a
-// job transitions to 'waiting' or is cancelled before the VM is created).
+// job transitions to 'waiting' or is cancelled before the VM is created). The live
+// create task may carry any retry suffix (0..maxTaskRetryCount) because
+// CreateCallbackTaskWithToken bumps the suffix on AlreadyExists, so we attempt to
+// delete every candidate. Best-effort: a not-found candidate is not an error.
 func (s *Autoscaler) DeleteCallbackTask(ctx context.Context, job Job) error {
 
 	client := newTaskClient(ctx)
 	defer client.Close()
-	err := client.DeleteTask(ctx, &taskspb.DeleteTaskRequest{
-		Name: CallbackTaskName(s.conf.TaskQueue, TaskKindCreate, job.Id, 0),
-	})
-	if err != nil {
-		return fmt.Errorf("cloudtasks.DeleteTask failed for job Id %d: %v", job.Id, err)
-	} else {
+
+	var lastErr error
+	deletedAny := false
+	for retryCount := 0; retryCount <= maxTaskRetryCount; retryCount++ {
+		err := client.DeleteTask(ctx, &taskspb.DeleteTaskRequest{
+			Name: CallbackTaskName(s.conf.TaskQueue, TaskKindCreate, job.Id, retryCount),
+		})
+		if err == nil {
+			deletedAny = true
+		} else if !IsNotFound(err) {
+			lastErr = err
+		}
+	}
+	if deletedAny {
 		log.Infof("Deleted cloud task callback for workflow job Id %d", job.Id)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("cloudtasks.DeleteTask failed for job Id %d: %v", job.Id, lastErr)
 	}
 	return nil
 }
@@ -1062,7 +1104,7 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 			// hour.
 			log.Info("Delete-vm callback has empty runner name - no VM to delete")
 			ctx.Status(http.StatusOK)
-			s.maybeSweepOrphans()
+			go s.maybeSweepOrphans()
 			return
 		}
 		opCtx, cancel := s.opContext()
@@ -1072,7 +1114,10 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 		} else {
 			ctx.Status(http.StatusOK)
 		}
-		s.maybeSweepOrphans()
+		// Run the orphan sweep detached so it can't hold the callback open past the
+		// Cloud Tasks dispatch deadline (which would trigger a retry). It uses its own
+		// background context and is throttled + mutex-guarded.
+		go s.maybeSweepOrphans()
 	}
 }
 
@@ -1189,10 +1234,11 @@ type Autoscaler struct {
 	sweepMu   sync.Mutex
 	lastSweep time.Time
 
-	// tryInsertFn is a test seam for intercepting individual VM-creation attempts.
-	// nil in production, where CreateInstanceFromTemplate builds a real compute
-	// client and calls tryInsertInstance.
-	tryInsertFn func(ctx context.Context, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error
+	// tryInsertFn / deleteInZoneFn are test seams for intercepting individual
+	// VM-creation / per-zone-delete attempts. nil in production, where the real
+	// compute-client-backed implementations are used.
+	tryInsertFn    func(ctx context.Context, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error
+	deleteInZoneFn func(ctx context.Context, instanceName string, zone string) (bool, error)
 }
 
 func NewAutoscaler(config AutoscalerConfig) *Autoscaler {
