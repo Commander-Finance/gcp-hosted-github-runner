@@ -127,20 +127,21 @@ func TestEmptyRunnerNameDeleteReturnsOk(t *testing.T) {
 	assert.Equal(t, 200, resp.StatusCode)
 }
 
-func TestIsExpectedRunnerName(t *testing.T) {
+func TestIsOwnedRunnerName(t *testing.T) {
 
-	// The exact name we create for the job round-trips.
-	assert.True(t, pkg.IsExpectedRunnerName("runner", 42, "runner-42"))
-	assert.True(t, pkg.IsExpectedRunnerName("runner", 12345, pkg.InstanceName("runner", 12345)))
-	assert.True(t, pkg.IsExpectedRunnerName("gh-runner", 1, "gh-runner-1"))
+	// Any "<prefix>-..." name is a valid delete target, including one carrying a
+	// *different* job's id (cross-assignment) - see IsOwnedRunnerName for why.
+	assert.True(t, pkg.IsOwnedRunnerName("runner", "runner-42"))
+	assert.True(t, pkg.IsOwnedRunnerName("runner", pkg.InstanceName("runner", 12345)))
+	assert.True(t, pkg.IsOwnedRunnerName("runner", "runner-43")) // cross-assigned - now deletable
+	assert.True(t, pkg.IsOwnedRunnerName("runner", "runner-abc")) // prefix match does not require a numeric suffix
+	assert.True(t, pkg.IsOwnedRunnerName("gh-runner", "gh-runner-1"))
 
-	// A different numeric suffix is another job's runner and must be rejected, as
-	// must empty / non-numeric / wrong-prefix / bare-prefix names.
-	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, "runner-43"))
-	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, ""))
-	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, "runner-abc"))
-	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, "other-42"))
-	assert.False(t, pkg.IsExpectedRunnerName("runner", 42, "runner"))
+	// Reject empty (job cancelled while queued, never assigned a runner), foreign
+	// names, and a bare prefix with no "<prefix>-" separator.
+	assert.False(t, pkg.IsOwnedRunnerName("runner", ""))
+	assert.False(t, pkg.IsOwnedRunnerName("runner", "other-42"))
+	assert.False(t, pkg.IsOwnedRunnerName("runner", "runner"))
 }
 
 func TestUnknownSourceReturnsUnauthorized(t *testing.T) {
