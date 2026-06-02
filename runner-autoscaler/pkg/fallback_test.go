@@ -67,6 +67,23 @@ func TestIsStoppedPredicate(t *testing.T) {
 	}
 }
 
+func TestDecideCreate(t *testing.T) {
+
+	// No existing VM -> create.
+	assert.Equal(t, createProceed, decideCreate(false, Unknown))
+
+	// A live VM (running or coming up) is left alone so we never duplicate or
+	// disturb a runner that may still take the job.
+	for _, st := range []State{PROVISIONING, STAGING, RUNNING, REPAIRING} {
+		assert.Equal(t, createSkip, decideCreate(true, st), "state %s should be left alone", st)
+	}
+
+	// A stopped leftover must be replaced, otherwise the queued job is stranded.
+	for _, st := range []State{STOPPING, SUSPENDING, SUSPENDED, TERMINATED} {
+		assert.Equal(t, createReplace, decideCreate(true, st), "state %s should be replaced", st)
+	}
+}
+
 func TestCreationPlanStandardOnlyWhenNotPreemptible(t *testing.T) {
 
 	// No fallback template => the primary is already on-demand; SPOT must never appear.

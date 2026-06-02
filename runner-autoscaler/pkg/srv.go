@@ -660,29 +660,53 @@ func (s *Autoscaler) DeleteInstance(ctx context.Context, instanceName string) er
 	return nil
 }
 
-// InstanceExists reports whether an instance with the given name exists in any
-// configured zone. Used to make create-vm idempotent: if the VM already exists we
-// skip re-generating a JIT config (which would register a duplicate offline runner)
-// and skip re-creating it.
-func (s *Autoscaler) InstanceExists(ctx context.Context, instanceName string) (bool, error) {
+// instanceState returns whether an instance with the given name exists in any
+// configured zone and, if so, its current state. Used by create-vm to decide
+// whether an existing same-named VM is a live runner (idempotent skip) or a
+// stopped leftover that must be replaced (see decideCreate).
+func (s *Autoscaler) instanceState(ctx context.Context, instanceName string) (bool, State, error) {
 
 	if s.conf.Simulate {
-		return false, nil
+		return false, Unknown, nil
 	}
 	client := newComputeClient(ctx)
 	defer client.Close()
 	for _, zone := range s.OrderedZones(instanceName) {
-		if _, err := client.Get(ctx, &computepb.GetInstanceRequest{
+		if inst, err := client.Get(ctx, &computepb.GetInstanceRequest{
 			Project:  s.conf.ProjectId,
 			Zone:     zone,
 			Instance: instanceName,
 		}); err == nil {
-			return true, nil
+			return true, State(inst.GetStatus()), nil
 		} else if !IsNotFound(err) {
-			return false, err
+			return false, Unknown, err
 		}
 	}
-	return false, nil
+	return false, Unknown, nil
+}
+
+type createDecision int
+
+const (
+	createProceed createDecision = iota // no existing VM - create it
+	createSkip                          // a live VM already exists - idempotent success
+	createReplace                       // a stopped leftover exists - delete it, then create
+)
+
+// decideCreate decides what create-vm should do given whether a same-named instance
+// exists and its state. A stopped/terminated leftover (e.g. a runner that shut
+// itself down without ever taking a job) must be replaced rather than treated as
+// success, otherwise the queued job is stranded. A live VM (running or coming up)
+// is left alone so we never duplicate or disturb a runner that may take the job.
+func decideCreate(found bool, state State) createDecision {
+
+	if !found {
+		return createProceed
+	}
+	if state.isStopped() {
+		return createReplace
+	}
+	return createSkip
 }
 
 // creationAttempt is a single (template, zone, provisioning model) tuple to try.
@@ -1051,16 +1075,26 @@ rm runner_startup.sh
 // abort an in-flight create (and cause a duplicate VM on retry).
 func (s *Autoscaler) createVmWithJitConfig(ginCtx *gin.Context, opCtx context.Context, url string, runnerGroupId int64, settings VmSettings, labels []string) {
 
-	// Idempotency: if the VM for this job already exists (a previous attempt for the
-	// same deterministic name succeeded), don't regenerate a JIT config (which would
-	// register a duplicate offline runner in GitHub) or re-create it.
-	if exists, err := s.InstanceExists(opCtx, settings.Name); err != nil {
+	// Idempotency: inspect any existing VM with this job's deterministic name. A live
+	// runner means this callback already did its job (don't regenerate a JIT config /
+	// duplicate it); a stopped leftover (e.g. a runner that shut down without taking
+	// the job) must be deleted and recreated so the queued job isn't stranded.
+	found, state, err := s.instanceState(opCtx, settings.Name)
+	if err != nil {
 		ginCtx.AbortWithError(http.StatusInternalServerError, err)
 		return
-	} else if exists {
-		log.Infof("Instance %s already exists - create-vm callback is idempotent, nothing to do", settings.Name)
+	}
+	switch decideCreate(found, state) {
+	case createSkip:
+		log.Infof("Instance %s already exists and is %s - create-vm callback is idempotent, nothing to do", settings.Name, state)
 		ginCtx.Status(http.StatusOK)
 		return
+	case createReplace:
+		log.Infof("Instance %s exists but is stopped (%s) - deleting and recreating so the job isn't stranded", settings.Name, state)
+		if err := s.DeleteInstance(opCtx, settings.Name); err != nil {
+			ginCtx.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
 	}
 
 	if jitConfig, err := s.GenerateRunnerJitConfig(opCtx, url, settings.Name, runnerGroupId, labels); err != nil {
