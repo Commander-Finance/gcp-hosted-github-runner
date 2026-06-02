@@ -128,6 +128,10 @@ func main() {
 		log.Warn("RUNNER_LABELS parsed to zero label groups - every webhook will be rejected until configuration is fixed")
 	}
 
+	if err := config.Validate(); err != nil {
+		log.Fatalf("Invalid configuration: %s", err.Error())
+	}
+
 	if config.Simulate {
 		log.Warn("Simulation mode is active - no VMs will be created/deleted")
 	}

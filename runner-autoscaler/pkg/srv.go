@@ -388,14 +388,19 @@ func InstanceName(prefix string, jobId int64) string {
 	return fmt.Sprintf("%s-%d", prefix, jobId)
 }
 
-// IsExpectedRunnerName reports whether name is exactly the deterministic instance
-// name we create for jobId (see InstanceName). The delete-vm callback uses the
-// webhook-supplied runner_name as the Compute instance name; requiring the exact
-// per-job name (not merely the "<prefix>-<digits>" shape) stops a callback from
-// naming a *different* runner for deletion.
-func IsExpectedRunnerName(prefix string, jobId int64, name string) bool {
+// IsOwnedRunnerName reports whether name has the "<prefix>-..." shape that
+// InstanceName produces, i.e. it looks like a runner VM this autoscaler created.
+// The delete-vm callback uses it to guard deletion of the webhook-supplied
+// runner_name. A prefix match (rather than the exact per-job name) is required
+// because GitHub dispatches by label, not job id, so a VM created for one job
+// routinely runs another and reports a different job's id in its name; matching
+// only the exact per-job name would skip the delete and leak those VMs. It is
+// safe because single-use JIT runners have already exited by the completed
+// webhook, so deleting by name cannot kill an active job. Empty (never-assigned)
+// and foreign names are rejected.
+func IsOwnedRunnerName(prefix string, name string) bool {
 
-	return name == InstanceName(prefix, jobId)
+	return name != "" && strings.HasPrefix(name, prefix+"-")
 }
 
 // CallbackTaskName builds the Cloud Tasks task resource name for a callback,
@@ -1154,12 +1159,12 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 	if data, _, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
 		json.Unmarshal(data, &job)
-		if !IsExpectedRunnerName(s.conf.RunnerPrefix, job.Id, job.RunnerName) {
+		if !IsOwnedRunnerName(s.conf.RunnerPrefix, job.RunnerName) {
 			// Either empty (the job was never picked up, e.g. cancelled while queued)
-			// or a name that isn't the runner we created for this job. Don't issue a
-			// delete for an empty/mismatched name (which could target another runner);
+			// or a name that isn't one of our runners. Don't issue a delete for an
+			// empty/foreign name (which could target an unrelated instance);
 			// acknowledge so the task isn't retried, and let the sweep handle cleanup.
-			log.Infof("Delete-vm callback runner name %q is not the expected runner for job %d - skipping delete", job.RunnerName, job.Id)
+			log.Infof("Delete-vm callback runner name %q is empty or not one of our runners (job %d) - skipping delete", job.RunnerName, job.Id)
 			ctx.Status(http.StatusOK)
 			go s.maybeSweepOrphans()
 			return
@@ -1282,6 +1287,21 @@ type AutoscalerConfig struct {
 	SourceQueryParam         string
 	CreateVmDelay            int64
 	Simulate                 bool
+}
+
+// Validate checks startup invariants that, if violated, would leave the
+// autoscaler running in a silently broken state. Call it during config load and
+// fail fast on error.
+func (c AutoscalerConfig) Validate() error {
+
+	// A non-empty prefix is load-bearing: InstanceName builds "<prefix>-<jobId>"
+	// (an empty prefix yields "-<jobId>", an invalid GCE instance name that the
+	// create API rejects) and IsOwnedRunnerName uses it to recognise the VMs we
+	// own. An empty prefix breaks both create and delete, so refuse to start.
+	if c.RunnerPrefix == "" {
+		return fmt.Errorf("RunnerPrefix must not be empty")
+	}
+	return nil
 }
 
 type Autoscaler struct {
