@@ -64,6 +64,12 @@ resource "google_cloud_run_v2_service" "autoscaler" {
         value = google_compute_instance_template.runner_instance.id
       }
       env {
+        # On-demand (STANDARD) fallback template, only present when the primary is
+        # SPOT. Empty otherwise (the autoscaler then skips the fallback pass).
+        name  = "INSTANCE_TEMPLATE_FALLBACK"
+        value = var.machine_preemtible ? google_compute_instance_template.runner_instance_ondemand[0].id : ""
+      }
+      env {
         name  = "SECRET_VERSION"
         value = "${google_secret_manager_secret.github_pat_token.id}/versions/latest"
       }

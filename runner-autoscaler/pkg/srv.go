@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	cloudtasks "cloud.google.com/go/cloudtasks/apiv2"
@@ -27,6 +28,7 @@ import (
 	"github.com/googleapis/gax-go/v2/apierror"
 	log "github.com/sirupsen/logrus"
 	ginlogrus "github.com/toorop/gin-logrus"
+	"google.golang.org/api/iterator"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -45,6 +47,27 @@ const RUNNER_JIT_CONFIG_ATTR string = "jit_config"
 
 const RUNNER_SCRIPT_REGISTER_RUNNER_ATTR string = "startup_script_register_runner"         // has to match the global custom metadata in compute.tf
 const RUNNER_SCRIPT_REGISTER_JIT_RUNNER_ATTR string = "startup_script_register_jit_runner" // has to match the global custom metadata in compute.tf
+
+// Cloud Task callback kinds. The task name embeds the kind so the create-vm and
+// delete-vm callbacks for the same job never collide on the same task name (a
+// collision can make enqueueing the delete callback fail with AlreadyExists
+// against the tombstoned create task, leaking the VM until machine_timeout).
+const TaskKindCreate string = "create"
+const TaskKindDelete string = "delete"
+
+// How often the opportunistic orphan sweep is allowed to run. The sweep reclaims
+// stopped/terminated runner VMs (e.g. a runner that shut itself down without ever
+// picking up a job, which produces no completed-webhook). It piggybacks on the
+// create-vm/delete-vm callbacks and is throttled to keep the hot path cheap.
+const sweepInterval = 5 * time.Minute
+
+// Maximum number of orphans deleted per sweep, to bound callback latency.
+const maxSweepDeletes = 25
+
+// Highest retry suffix a create/delete callback task name may carry (suffixes
+// 0..maxTaskRetryCount). CreateCallbackTaskWithToken bumps the suffix on
+// AlreadyExists; DeleteCallbackTask must cancel every candidate.
+const maxTaskRetryCount = 2
 
 const RUNNER_REGISTER_TOKEN_ORG_ENDPOINT string = "https://api.github.com/orgs/%s/actions/runners/registration-token"
 
@@ -267,16 +290,13 @@ const (
 	Unknown   State = "unknown"
 )
 
-/*
+// isStopped reports whether a VM in this state is stopped (and therefore safe for
+// the orphan sweep to reclaim) - never a RUNNING/PROVISIONING VM that may be
+// executing a job.
 func (s State) isStopped() bool {
 
 	return s == STOPPING || s == SUSPENDING || s == SUSPENDED || s == TERMINATED
 }
-
-func (s State) isRunning() bool {
-
-	return s == PROVISIONING || s == STAGING || s == RUNNING || s == REPAIRING
-}*/
 
 type InstanceClient struct {
 	*compute.InstancesClient
@@ -332,13 +352,122 @@ func CalcSigHex(secret []byte, data []byte) string {
 	return hex.EncodeToString(sig.Sum(nil))
 }
 
-// depending on an arbitrary input string a zone is selected
-// the same input string leads to the same zone
+// PickRandomZone returns the deterministic hash-picked zone for the seed (the first
+// zone OrderedZones would try). Panics if no zones are configured; all production
+// paths use OrderedZones, which is empty-safe.
 func (s *Autoscaler) PickRandomZone(seed string) string {
 
+	return s.OrderedZones(seed)[0]
+}
+
+// OrderedZones returns every configured zone exactly once, rotated so the first
+// element is the deterministic hash-picked zone for the seed. Used to try VM
+// creation across zones (capacity fallback) and to locate a VM for deletion
+// without assuming which zone it actually landed in.
+func (s *Autoscaler) OrderedZones(seed string) []string {
+
+	n := len(s.conf.Zones)
+	if n == 0 {
+		return []string{}
+	}
 	hash := sha256.Sum256([]byte(seed))
-	index := binary.BigEndian.Uint64(hash[:8]) % uint64(len(s.conf.Zones))
-	return s.conf.Zones[index]
+	start := int(binary.BigEndian.Uint64(hash[:8]) % uint64(n))
+	ordered := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		ordered = append(ordered, s.conf.Zones[(start+i)%n])
+	}
+	return ordered
+}
+
+// InstanceName builds the deterministic runner/instance name for a job. Deriving
+// it from the (globally unique) job id makes create-vm callback retries idempotent:
+// a retry targets the same instance name, so a duplicate Insert is detected as
+// AlreadyExists instead of spawning a second VM.
+func InstanceName(prefix string, jobId int64) string {
+
+	return fmt.Sprintf("%s-%d", prefix, jobId)
+}
+
+// IsExpectedRunnerName reports whether name is exactly the deterministic instance
+// name we create for jobId (see InstanceName). The delete-vm callback uses the
+// webhook-supplied runner_name as the Compute instance name; requiring the exact
+// per-job name (not merely the "<prefix>-<digits>" shape) stops a callback from
+// naming a *different* runner for deletion.
+func IsExpectedRunnerName(prefix string, jobId int64, name string) bool {
+
+	return name == InstanceName(prefix, jobId)
+}
+
+// CallbackTaskName builds the Cloud Tasks task resource name for a callback,
+// namespaced by kind so create and delete callbacks for the same job never collide.
+func CallbackTaskName(queue string, kind string, jobId int64, retryCount int) string {
+
+	return fmt.Sprintf("%s/tasks/%s-%d-%d", queue, kind, jobId, retryCount)
+}
+
+// IsCapacityError reports whether err is a (retryable) capacity/quota error, i.e.
+// the request can be retried in another zone or with on-demand provisioning.
+func IsCapacityError(err error) bool {
+
+	if err == nil {
+		return false
+	}
+	msg := strings.ToUpper(err.Error())
+	for _, needle := range []string{
+		// covers ZONE_RESOURCE_POOL_EXHAUSTED, RESOURCE_POOL_EXHAUSTED,
+		// RESOURCE_EXHAUSTED and the gRPC "ResourceExhausted" form
+		"EXHAUSTED",
+		"QUOTA_EXCEEDED",
+		"QUOTA EXCEEDED",
+		"DOES NOT HAVE ENOUGH RESOURCES",
+		"STOCKOUT",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAlreadyExists reports whether err indicates the resource already exists (HTTP
+// 409 / gRPC AlreadyExists), which create-vm treats as idempotent success.
+func IsAlreadyExists(err error) bool {
+
+	if err == nil {
+		return false
+	}
+	if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPCode() == 409 {
+		return true
+	}
+	msg := strings.ToUpper(err.Error())
+	return strings.Contains(msg, "ALREADYEXISTS") || strings.Contains(msg, "ALREADY EXISTS")
+}
+
+// IsNotFound reports whether err indicates the resource was not found (HTTP 404),
+// which delete treats as already-gone.
+func IsNotFound(err error) bool {
+
+	if err == nil {
+		return false
+	}
+	if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPCode() == 404 {
+		return true
+	}
+	msg := strings.ToUpper(err.Error())
+	return strings.Contains(msg, "NOTFOUND") || strings.Contains(msg, "NOT FOUND")
+}
+
+// opContext returns a context for long-running GCP operations (VM create/delete)
+// that is decoupled from the inbound HTTP request context. This prevents a Cloud
+// Run request-deadline or client cancellation from aborting an in-flight Insert
+// (which previously caused a retry to spawn a duplicate VM).
+func (s *Autoscaler) opContext() (context.Context, context.CancelFunc) {
+
+	timeout := s.conf.TaskTimeout
+	if timeout <= 0 {
+		timeout = 180
+	}
+	return context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 }
 
 // returns http body, "src" query, error
@@ -351,16 +480,19 @@ func (s *Autoscaler) verifySignature(ctx *gin.Context) ([]byte, Source, error) {
 		} else {
 			if src, ok := ctx.GetQuery(s.conf.SourceQueryParam); ok {
 				if source, ok := s.conf.RegisteredSources[src]; ok {
-					if calcSignature := CalcSigHex([]byte(source.Secret), body); calcSignature == signature[7:] {
+					calcSignature := CalcSigHex([]byte(source.Secret), body)
+					if hmac.Equal([]byte(calcSignature), []byte(signature[7:])) {
 						return body, source, nil
 					} else {
 						log.Warnf("%s signature did not match", ctx.RemoteIP())
 						return nil, Source{}, ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
 					}
 				} else {
-					log.Infof("Source with name '%s' not registered - ignoring", src)
-					ctx.Status(http.StatusOK) // not considered an error
-					return nil, Source{}, fmt.Errorf("unknown webhook source")
+					// Return the same 401 as a bad signature so an unauthenticated
+					// caller cannot distinguish "unknown source" from "wrong signature"
+					// and enumerate which org/repo names are registered.
+					log.Warnf("%s used an unregistered source", ctx.RemoteIP())
+					return nil, Source{}, ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
 				}
 			} else {
 				log.Errorf("Missing %s query parameter", s.conf.SourceQueryParam)
@@ -448,88 +580,326 @@ func (s *Autoscaler) StopInstance(ctx context.Context, instanceName string) erro
 }
 */
 
-// blocking until the instance is deleted or the deletion fails
+// realDeleteInZone deletes the instance in one specific zone using the given
+// client. It returns whether the instance was found in this zone (the delete was
+// accepted) and any error. A 404 means "not in this zone" (found=false, err=nil);
+// a delete that is accepted but whose wait fails returns found=true with the error,
+// so callers know the instance WAS here and must not fall through to a false
+// success (which would leak the VM).
+func (s *Autoscaler) realDeleteInZone(ctx context.Context, client *InstanceClient, instanceName string, zone string) (bool, error) {
+
+	res, err := client.Delete(ctx, &computepb.DeleteInstanceRequest{
+		Project:  s.conf.ProjectId,
+		Zone:     zone,
+		Instance: instanceName,
+	})
+	if err != nil {
+		if IsNotFound(err) {
+			return false, nil // not in this zone
+		}
+		return false, err // unknown - let the caller try other zones
+	}
+	if err := res.Wait(ctx); err != nil {
+		return true, err // was here, but deletion/confirmation failed
+	}
+	return true, nil
+}
+
+// blocking until the instance is deleted or the deletion fails.
+//
+// The instance may live in any configured zone (VM creation falls back across
+// zones on capacity errors), so we don't assume the hash-picked zone. We try the
+// zones in order, treating a 404 as "not in this zone" and moving on; a successful
+// delete in any zone wins. If the instance is found in no zone we treat it as
+// already gone (idempotent).
 func (s *Autoscaler) DeleteInstance(ctx context.Context, instanceName string) error {
 
 	if s.conf.Simulate {
 		log.Debugf("(SIMULATE) About to delete instance %s", instanceName)
 		time.Sleep(30 * time.Second)
 		log.Infof("(SIMULATE) Deleted instance %s", instanceName)
-	} else {
+		return nil
+	}
 
-		zone := s.PickRandomZone(instanceName)
-
-		log.Debugf("About to delete instance %s (%s)", instanceName, zone)
+	deleteInZone := s.deleteInZoneFn
+	if deleteInZone == nil {
 		client := newComputeClient(ctx)
 		defer client.Close()
-		if res, err := client.Delete(ctx, &computepb.DeleteInstanceRequest{
-			Project:  s.conf.ProjectId,
-			Zone:     zone,
-			Instance: instanceName,
-		}); err != nil {
-			if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPCode() == 404 {
-				// We ignore this error because the instance may no longer exist, as it may have been terminated prematurely
-				log.Infof("Instance %s (%s) already gone", instanceName, zone)
-			} else {
-				log.Errorf("Could not delete instance %s (%s): %s", instanceName, zone, err.Error())
-				return err
-			}
-		} else {
-			if err := res.Wait(ctx); err != nil {
-				log.Errorf("Failed to wait for instance %s (%s) to be deleted: %s", instanceName, zone, err.Error())
-				return err
-			} else {
-				log.Infof("Deleted instance %s (%s)", instanceName, zone)
-			}
+		deleteInZone = func(ctx context.Context, name string, zone string) (bool, error) {
+			return s.realDeleteInZone(ctx, client, name, zone)
 		}
 	}
+
+	var lastErr error
+	for _, zone := range s.OrderedZones(instanceName) {
+		log.Debugf("About to delete instance %s (%s)", instanceName, zone)
+		found, err := deleteInZone(ctx, instanceName, zone)
+		if err != nil {
+			log.Errorf("Could not delete instance %s (%s): %s", instanceName, zone, err.Error())
+			if found {
+				// The instance was in this zone but deletion failed - authoritative,
+				// surface the error instead of acking the task and leaking the VM.
+				return err
+			}
+			lastErr = err
+			continue
+		}
+		if found {
+			log.Infof("Deleted instance %s (%s)", instanceName, zone)
+			return nil
+		}
+		// not in this zone - try the next one
+	}
+
+	if lastErr != nil {
+		return lastErr
+	}
+	// We ignore the "not found in any zone" case because the instance may no longer
+	// exist, as it may have been terminated prematurely.
+	log.Infof("Instance %s already gone (not found in any configured zone)", instanceName)
 	return nil
 }
 
-// blocking until instance started or failed to start
+// instanceState returns whether an instance with the given name exists in any
+// configured zone and, if so, its current state. Used by create-vm to decide
+// whether an existing same-named VM is a live runner (idempotent skip) or a
+// stopped leftover that must be replaced (see decideCreate).
+func (s *Autoscaler) instanceState(ctx context.Context, instanceName string) (bool, State, error) {
+
+	if s.conf.Simulate {
+		return false, Unknown, nil
+	}
+	client := newComputeClient(ctx)
+	defer client.Close()
+	for _, zone := range s.OrderedZones(instanceName) {
+		if inst, err := client.Get(ctx, &computepb.GetInstanceRequest{
+			Project:  s.conf.ProjectId,
+			Zone:     zone,
+			Instance: instanceName,
+		}); err == nil {
+			return true, State(inst.GetStatus()), nil
+		} else if !IsNotFound(err) {
+			return false, Unknown, err
+		}
+	}
+	return false, Unknown, nil
+}
+
+type createDecision int
+
+const (
+	createProceed createDecision = iota // no existing VM - create it
+	createSkip                          // a live VM already exists - idempotent success
+	createReplace                       // a stopped leftover exists - delete it, then create
+)
+
+// decideCreate decides what create-vm should do given whether a same-named instance
+// exists and its state. A stopped/terminated leftover (e.g. a runner that shut
+// itself down without ever taking a job) must be replaced rather than treated as
+// success, otherwise the queued job is stranded. A live VM (running or coming up)
+// is left alone so we never duplicate or disturb a runner that may take the job.
+func decideCreate(found bool, state State) createDecision {
+
+	if !found {
+		return createProceed
+	}
+	if state.isStopped() {
+		return createReplace
+	}
+	return createSkip
+}
+
+// creationAttempt is a single (template, zone, provisioning model) tuple to try.
+type creationAttempt struct {
+	template          string
+	zone              string
+	provisioningModel string // "spot" or "standard"
+}
+
+// creationPlan returns the ordered list of creation attempts. The primary template
+// is tried across EVERY configured zone first; only when the primary is SPOT
+// (FallbackInstanceTemplate is set) is the on-demand (STANDARD) template appended,
+// again across every zone. This guarantees SPOT is attempted everywhere it is
+// feasible before any on-demand fallback. Pure (no I/O) so the ordering is testable.
+func (s *Autoscaler) creationPlan(instanceName string) []creationAttempt {
+
+	type tmpl struct{ template, model string }
+	primaryModel := "standard"
+	if s.conf.FallbackInstanceTemplate != "" {
+		// A fallback template only exists when the primary is preemptible/SPOT.
+		primaryModel = "spot"
+	}
+	templates := []tmpl{{s.conf.InstanceTemplate, primaryModel}}
+	if s.conf.FallbackInstanceTemplate != "" {
+		templates = append(templates, tmpl{s.conf.FallbackInstanceTemplate, "standard"})
+	}
+
+	zones := s.OrderedZones(instanceName)
+	plan := make([]creationAttempt, 0, len(templates)*len(zones))
+	for _, t := range templates {
+		for _, zone := range zones {
+			plan = append(plan, creationAttempt{template: t.template, zone: zone, provisioningModel: t.model})
+		}
+	}
+	return plan
+}
+
+// tryInsertInstance attempts a single Insert+Wait for one creation attempt.
+func (s *Autoscaler) tryInsertInstance(ctx context.Context, client *InstanceClient, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error {
+
+	var machine *string
+	if machineType != nil {
+		machine = proto.String(fmt.Sprintf("zones/%s/machineTypes/%s", attempt.zone, *machineType))
+	}
+	res, err := client.Insert(ctx, &computepb.InsertInstanceRequest{
+		Project: s.conf.ProjectId,
+		Zone:    attempt.zone,
+		InstanceResource: &computepb.Instance{
+			Name:        proto.String(instanceName),
+			MachineType: machine,
+			Metadata: &computepb.Metadata{
+				Items: metadata,
+			},
+		},
+		SourceInstanceTemplate: proto.String(attempt.template),
+	})
+	if err != nil {
+		return err
+	}
+	return res.Wait(ctx)
+}
+
+// blocking until instance started or failed to start.
+//
+// Creation is hardened against capacity stockouts: we try every configured zone
+// (capacity errors fall through to the next zone) and, if the primary template is
+// SPOT and every zone is exhausted, we retry the whole sweep with the on-demand
+// (STANDARD) template (see creationPlan for the ordering guarantee). A duplicate
+// Insert (same deterministic name) is treated as idempotent success. The
+// provisioning model that actually succeeded is logged so a log-based metric can
+// track the spot-vs-standard split.
 func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceName string, machineType *string, metadata ...*computepb.Items) error {
 
 	if s.conf.Simulate {
 		log.Debugf("(SIMULATE) About to create instance %s from template", instanceName)
 		time.Sleep(1 * time.Minute)
 		log.Infof("(SIMULATE) Created instance from template: %s", instanceName)
-	} else {
+		return nil
+	}
 
-		zone := s.PickRandomZone(instanceName)
+	plan := s.creationPlan(instanceName)
+	if len(plan) == 0 {
+		// No attempt would run (no zones configured) - surface it instead of
+		// silently reporting success.
+		return fmt.Errorf("no zones configured - could not create instance %s", instanceName)
+	}
 
-		log.Debugf("About to create instance %s (%s) from template", instanceName, zone)
-		computeClient := newComputeClient(ctx)
-		defer computeClient.Close()
-
-		var machine *string = nil
-		if machineType != nil {
-			machine = proto.String(fmt.Sprintf("zones/%s/machineTypes/%s", zone, *machineType))
+	// tryInsert is a seam: tests inject a fake; in production we build one compute
+	// client and reuse it across every attempt.
+	tryInsert := s.tryInsertFn
+	if tryInsert == nil {
+		client := newComputeClient(ctx)
+		defer client.Close()
+		tryInsert = func(ctx context.Context, attempt creationAttempt, name string, mt *string, md []*computepb.Items) error {
+			return s.tryInsertInstance(ctx, client, attempt, name, mt, md)
 		}
+	}
 
-		if res, err := computeClient.Insert(ctx, &computepb.InsertInstanceRequest{
+	var lastErr error
+	for _, attempt := range plan {
+		log.Debugf("About to create instance %s (%s) from %s template", instanceName, attempt.zone, attempt.provisioningModel)
+		err := tryInsert(ctx, attempt, instanceName, machineType, metadata)
+		if err == nil {
+			log.WithFields(log.Fields{
+				"instance":           instanceName,
+				"zone":               attempt.zone,
+				"provisioning_model": attempt.provisioningModel,
+			}).Infof("Created instance %s (%s) as %s", instanceName, attempt.zone, attempt.provisioningModel)
+			return nil
+		}
+		if IsAlreadyExists(err) {
+			// A previous (possibly cancelled) attempt already created this VM.
+			log.Infof("Instance %s already exists - treating create as idempotent success", instanceName)
+			return nil
+		}
+		if IsCapacityError(err) {
+			log.Warnf("Capacity error creating instance %s (%s, %s): %s - trying next zone/model", instanceName, attempt.zone, attempt.provisioningModel, err.Error())
+			lastErr = err
+			continue
+		}
+		// Non-retryable error (bad template, permission, invalid machine type, ...).
+		log.Errorf("Could not create instance %s (%s) from %s template: %s", instanceName, attempt.zone, attempt.provisioningModel, err.Error())
+		return err
+	}
+
+	log.Errorf("Exhausted all zones/provisioning models creating instance %s: %v", instanceName, lastErr)
+	return lastErr
+}
+
+// sweepOrphans deletes runner VMs that are stopped/terminated (e.g. a runner that
+// shut itself down without ever picking up a job, which produces no completed
+// webhook and would otherwise linger). Best-effort: errors are logged, not returned.
+func (s *Autoscaler) sweepOrphans(ctx context.Context) {
+
+	if s.conf.Simulate {
+		return
+	}
+	client := newComputeClient(ctx)
+	defer client.Close()
+
+	deleted := 0
+	for _, zone := range s.conf.Zones {
+		it := client.List(ctx, &computepb.ListInstancesRequest{
 			Project: s.conf.ProjectId,
 			Zone:    zone,
-			InstanceResource: &computepb.Instance{
-				Name:        proto.String(instanceName),
-				MachineType: machine,
-				Metadata: &computepb.Metadata{
-					Items: metadata,
-				},
-			},
-			SourceInstanceTemplate: &s.conf.InstanceTemplate,
-		}); err != nil {
-			log.Errorf("Could not create instance %s (%s) from template %s: %s", instanceName, zone, s.conf.InstanceTemplate, err.Error())
-			return err
-		} else {
-			if err := res.Wait(ctx); err != nil {
-				log.Errorf("Failed to wait for instance %s (%s) to be created from template: %s", instanceName, zone, err.Error())
-				return err
-			} else {
-				log.Infof("Created instance %s (%s) from template", instanceName, zone)
+			Filter:  proto.String(fmt.Sprintf("name eq ^%s-.*", s.conf.RunnerPrefix)),
+		})
+		for {
+			if deleted >= maxSweepDeletes {
+				return
+			}
+			instance, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				log.Warnf("Orphan sweep: could not list instances in %s: %s", zone, err.Error())
+				break
+			}
+			status := instance.GetStatus()
+			// Only reclaim instances that are stopped - never a RUNNING/PROVISIONING
+			// VM that may be executing (or about to execute) a job. max_run_duration
+			// remains the backstop for runaway RUNNING VMs.
+			if State(status).isStopped() {
+				name := instance.GetName()
+				log.Infof("Orphan sweep: reclaiming stopped runner VM %s (%s, status %s)", name, zone, status)
+				// Delete in the zone we just listed it from, reusing this client.
+				if _, err := s.realDeleteInZone(ctx, client, name, zone); err != nil {
+					log.Warnf("Orphan sweep: failed to delete %s: %s", name, err.Error())
+				} else {
+					deleted++
+				}
 			}
 		}
 	}
-	return nil
+}
+
+// maybeSweepOrphans runs sweepOrphans at most once per sweepInterval. It is called
+// opportunistically from the create/delete callbacks so cleanup happens without any
+// always-on scheduler, while keeping the hot path cheap.
+func (s *Autoscaler) maybeSweepOrphans() {
+
+	s.sweepMu.Lock()
+	if !s.lastSweep.IsZero() && time.Since(s.lastSweep) < sweepInterval {
+		s.sweepMu.Unlock()
+		return
+	}
+	s.lastSweep = time.Now()
+	s.sweepMu.Unlock()
+
+	ctx, cancel := s.opContext()
+	defer cancel()
+	s.sweepOrphans(ctx)
 }
 
 func (s *Autoscaler) readPat(ctx context.Context) (string, error) {
@@ -600,7 +970,7 @@ func (s *Autoscaler) GenerateRunnerJitConfig(ctx context.Context, url string, ru
 	}
 }
 
-func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, url string, secret string, job Job, delay time.Duration) error {
+func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind string, url string, secret string, job Job, delay time.Duration) error {
 
 	data, _ := json.Marshal(job)
 	now := timestamppb.Now()
@@ -632,13 +1002,23 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, url string
 
 	var sendAndRetry func(int) error
 	sendAndRetry = func(retryCount int) error {
-		req.Task.Name = fmt.Sprintf("%s/tasks/%d-%d", s.conf.TaskQueue, job.Id, retryCount)
+		name := CallbackTaskName(s.conf.TaskQueue, kind, job.Id, retryCount)
+		req.Task.Name = name
 		if _, err := client.CreateTask(ctx, req); err != nil {
-			if retry, _ := regexp.MatchString("code = AlreadyExists", err.Error()); retry && retryCount < 2 {
-				return sendAndRetry(retryCount + 1)
-			} else {
-				return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %v", job.Id, err)
+			if IsAlreadyExists(err) {
+				// Cloud Tasks returns ALREADY_EXISTS both for a still-active task and
+				// for a recently deleted/executed (tombstoned) name. Only bump to a
+				// fresh suffix for the tombstone case: if the task is still active the
+				// callback is already queued, and minting another would duplicate the
+				// VM. GetTask distinguishes the two (active -> found, tombstoned -> 404).
+				if _, getErr := client.GetTask(ctx, &taskspb.GetTaskRequest{Name: name}); getErr == nil {
+					log.Infof("Cloud task callback for job Id %d already queued (%s) - not duplicating", job.Id, name)
+					return nil
+				} else if IsNotFound(getErr) && retryCount < maxTaskRetryCount {
+					return sendAndRetry(retryCount + 1)
+				}
 			}
+			return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %v", job.Id, err)
 		} else {
 			log.Infof("Created cloud task callback for workflow job Id %d with url \"%s\" and payload \"%s\"", job.Id, url, data)
 			return nil
@@ -648,17 +1028,33 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, url string
 	return sendAndRetry(0)
 }
 
+// DeleteCallbackTask cancels the pending create-vm callback for a job (used when a
+// job transitions to 'waiting' or is cancelled before the VM is created). The live
+// create task may carry any retry suffix (0..maxTaskRetryCount) because
+// CreateCallbackTaskWithToken bumps the suffix on AlreadyExists, so we attempt to
+// delete every candidate. Best-effort: a not-found candidate is not an error.
 func (s *Autoscaler) DeleteCallbackTask(ctx context.Context, job Job) error {
 
 	client := newTaskClient(ctx)
 	defer client.Close()
-	err := client.DeleteTask(ctx, &taskspb.DeleteTaskRequest{
-		Name: fmt.Sprintf("%s/tasks/%d-0", s.conf.TaskQueue, job.Id),
-	})
-	if err != nil {
-		return fmt.Errorf("cloudtasks.DeleteTask failed for job Id %d: %v", job.Id, err)
-	} else {
+
+	var lastErr error
+	deletedAny := false
+	for retryCount := 0; retryCount <= maxTaskRetryCount; retryCount++ {
+		err := client.DeleteTask(ctx, &taskspb.DeleteTaskRequest{
+			Name: CallbackTaskName(s.conf.TaskQueue, TaskKindCreate, job.Id, retryCount),
+		})
+		if err == nil {
+			deletedAny = true
+		} else if !IsNotFound(err) {
+			lastErr = err
+		}
+	}
+	if deletedAny {
 		log.Infof("Deleted cloud task callback for workflow job Id %d", job.Id)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("cloudtasks.DeleteTask failed for job Id %d: %v", job.Id, lastErr)
 	}
 	return nil
 }
@@ -673,22 +1069,48 @@ chmod +x ./runner_startup.sh
 rm runner_startup.sh
 `
 
-func (s *Autoscaler) createVmWithJitConfig(ctx *gin.Context, url string, runnerGroupId int64, settings VmSettings, labels []string) {
+// createVmWithJitConfig generates a JIT runner config and creates the VM. ginCtx is
+// used only to write the HTTP response; all GCP operations run on opCtx, which is
+// decoupled from the request so a Cloud Run request-deadline cancellation can't
+// abort an in-flight create (and cause a duplicate VM on retry).
+func (s *Autoscaler) createVmWithJitConfig(ginCtx *gin.Context, opCtx context.Context, url string, runnerGroupId int64, settings VmSettings, labels []string) {
 
-	if jitConfig, err := s.GenerateRunnerJitConfig(ctx, url, settings.Name, runnerGroupId, labels); err != nil {
-		ctx.AbortWithError(http.StatusInternalServerError, err)
+	// Idempotency: inspect any existing VM with this job's deterministic name. A live
+	// runner means this callback already did its job (don't regenerate a JIT config /
+	// duplicate it); a stopped leftover (e.g. a runner that shut down without taking
+	// the job) must be deleted and recreated so the queued job isn't stranded.
+	found, state, err := s.instanceState(opCtx, settings.Name)
+	if err != nil {
+		ginCtx.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	switch decideCreate(found, state) {
+	case createSkip:
+		log.Infof("Instance %s already exists and is %s - create-vm callback is idempotent, nothing to do", settings.Name, state)
+		ginCtx.Status(http.StatusOK)
+		return
+	case createReplace:
+		log.Infof("Instance %s exists but is stopped (%s) - deleting and recreating so the job isn't stranded", settings.Name, state)
+		if err := s.DeleteInstance(opCtx, settings.Name); err != nil {
+			ginCtx.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
+	}
+
+	if jitConfig, err := s.GenerateRunnerJitConfig(opCtx, url, settings.Name, runnerGroupId, labels); err != nil {
+		ginCtx.AbortWithError(http.StatusInternalServerError, err)
 	} else {
 		jit_config_attr := fmt.Sprintf("%s_%s", RUNNER_JIT_CONFIG_ATTR, RandStringRunes(16))
-		if err := s.CreateInstanceFromTemplate(ctx, settings.Name, settings.MachineType, &computepb.Items{
+		if err := s.CreateInstanceFromTemplate(opCtx, settings.Name, settings.MachineType, &computepb.Items{
 			Key:   proto.String(jit_config_attr),
 			Value: proto.String(jitConfig),
 		}, &computepb.Items{
 			Key:   proto.String("startup-script"),
 			Value: proto.String(fmt.Sprintf(runner_script_wrapper, jit_config_attr, RUNNER_SCRIPT_REGISTER_JIT_RUNNER_ATTR)),
 		}); err != nil {
-			ctx.AbortWithError(http.StatusInternalServerError, err)
+			ginCtx.AbortWithError(http.StatusInternalServerError, err)
 		} else {
-			ctx.Status(http.StatusOK)
+			ginCtx.Status(http.StatusOK)
 		}
 	}
 }
@@ -699,30 +1121,30 @@ func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 	if data, src, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
 		json.Unmarshal(data, &job)
+		opCtx, cancel := s.opContext()
+		defer cancel()
+		// Deterministic name derived from the job id makes create-vm retries idempotent.
+		settings := VmSettings{
+			Name:        InstanceName(s.conf.RunnerPrefix, job.Id),
+			MachineType: job.GetMagicLabelValue(MagicLabelMachine),
+		}
 		switch src.SourceType {
 		case TypeEnterprise:
 			log.Infof("Using jit config for runner registration for enterprise: %s", src.Name)
-			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_ENTERPRISE_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, VmSettings{
-				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
-				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, job.Labels)
+			s.createVmWithJitConfig(ctx, opCtx, fmt.Sprintf(RUNNER_ENTERPRISE_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, settings, job.Labels)
 		case TypeOrganization:
 			log.Infof("Using jit config for runner registration for organization: %s", src.Name)
-			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_ORG_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, VmSettings{
-				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
-				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, job.Labels)
+			s.createVmWithJitConfig(ctx, opCtx, fmt.Sprintf(RUNNER_ORG_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, settings, job.Labels)
 		case TypeRepository:
 			log.Infof("Using jit config for runner registration for repository: %s", src.Name)
 			// for repositories there is an implicit runner group with id 1
-			s.createVmWithJitConfig(ctx, fmt.Sprintf(RUNNER_REPO_JIT_CONFIG_ENDPOINT, src.Name), 1, VmSettings{
-				Name:        fmt.Sprintf("%s-%s", s.conf.RunnerPrefix, RandStringRunes(10)),
-				MachineType: job.GetMagicLabelValue(MagicLabelMachine),
-			}, job.Labels)
+			s.createVmWithJitConfig(ctx, opCtx, fmt.Sprintf(RUNNER_REPO_JIT_CONFIG_ENDPOINT, src.Name), 1, settings, job.Labels)
 		default:
 			log.Errorf("Missing source type for %s", src.Name)
 			ctx.Status(http.StatusBadRequest)
 		}
+		// The orphan sweep runs from the delete-vm callback instead (completed jobs
+		// are the common case), to keep this create hot path free of extra latency.
 	}
 }
 
@@ -732,11 +1154,27 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 	if data, _, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
 		json.Unmarshal(data, &job)
-		if err := s.DeleteInstance(ctx, job.RunnerName); err != nil {
+		if !IsExpectedRunnerName(s.conf.RunnerPrefix, job.Id, job.RunnerName) {
+			// Either empty (the job was never picked up, e.g. cancelled while queued)
+			// or a name that isn't the runner we created for this job. Don't issue a
+			// delete for an empty/mismatched name (which could target another runner);
+			// acknowledge so the task isn't retried, and let the sweep handle cleanup.
+			log.Infof("Delete-vm callback runner name %q is not the expected runner for job %d - skipping delete", job.RunnerName, job.Id)
+			ctx.Status(http.StatusOK)
+			go s.maybeSweepOrphans()
+			return
+		}
+		opCtx, cancel := s.opContext()
+		defer cancel()
+		if err := s.DeleteInstance(opCtx, job.RunnerName); err != nil {
 			ctx.AbortWithError(http.StatusInternalServerError, err)
 		} else {
 			ctx.Status(http.StatusOK)
 		}
+		// Run the orphan sweep detached so it can't hold the callback open past the
+		// Cloud Tasks dispatch deadline (which would trigger a retry). It uses its own
+		// background context and is throttled + mutex-guarded.
+		go s.maybeSweepOrphans()
 	}
 }
 
@@ -763,7 +1201,7 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 					} else if ok, reason := payload.Job.HasAnyLabelGroup(s.conf.RunnerLabelGroups); ok {
 						createUrl := createCallbackUrl(ctx, s.conf.RouteCreateVm, s.conf.SourceQueryParam, src.Name)
 						// delay the create vm callback so we have a chance to delete it if the workflow job is changing its state to 'waiting'
-						if err := s.CreateCallbackTaskWithToken(ctx, createUrl, src.Secret, payload.Job, time.Duration(s.conf.CreateVmDelay)*time.Second); err != nil {
+						if err := s.CreateCallbackTaskWithToken(ctx, TaskKindCreate, createUrl, src.Secret, payload.Job, time.Duration(s.conf.CreateVmDelay)*time.Second); err != nil {
 							log.Errorf("Can not enqueue create-vm cloud task callback: %s", err.Error())
 							ctx.AbortWithError(http.StatusInternalServerError, err)
 							return
@@ -793,7 +1231,7 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 							s.DeleteCallbackTask(ctx, payload.Job)
 
 							deleteUrl := createCallbackUrl(ctx, s.conf.RouteDeleteVm, s.conf.SourceQueryParam, src.Name)
-							if err := s.CreateCallbackTaskWithToken(ctx, deleteUrl, src.Secret, payload.Job, 1*time.Second); err != nil {
+							if err := s.CreateCallbackTaskWithToken(ctx, TaskKindDelete, deleteUrl, src.Secret, payload.Job, 1*time.Second); err != nil {
 								log.Errorf("Can not enqueue delete-vm cloud task callback: %s", err.Error())
 								ctx.AbortWithError(http.StatusInternalServerError, err)
 								return
@@ -824,27 +1262,40 @@ func (p Pair) IsIValid() bool {
 }
 
 type AutoscalerConfig struct {
-	RouteWebhook      string
-	RouteCreateVm     string
-	RouteDeleteVm     string
-	ProjectId         string
-	Zones             []string
-	TaskQueue         string
-	TaskTimeout       int64
-	InstanceTemplate  string
-	SecretVersion     string
-	RunnerPrefix      string
-	RunnerGroupId     int64
-	RunnerLabelGroups [][]string
-	RegisteredSources map[string]Source
-	SourceQueryParam  string
-	CreateVmDelay     int64
-	Simulate          bool
+	RouteWebhook     string
+	RouteCreateVm    string
+	RouteDeleteVm    string
+	ProjectId        string
+	Zones            []string
+	TaskQueue        string
+	TaskTimeout      int64
+	InstanceTemplate string
+	// FallbackInstanceTemplate is the on-demand (STANDARD) template tried when the
+	// primary (SPOT) template is capacity-exhausted in every zone. Empty when the
+	// primary is already on-demand (no fallback needed).
+	FallbackInstanceTemplate string
+	SecretVersion            string
+	RunnerPrefix             string
+	RunnerGroupId            int64
+	RunnerLabelGroups        [][]string
+	RegisteredSources        map[string]Source
+	SourceQueryParam         string
+	CreateVmDelay            int64
+	Simulate                 bool
 }
 
 type Autoscaler struct {
 	engine *gin.Engine
 	conf   AutoscalerConfig
+
+	sweepMu   sync.Mutex
+	lastSweep time.Time
+
+	// tryInsertFn / deleteInZoneFn are test seams for intercepting individual
+	// VM-creation / per-zone-delete attempts. nil in production, where the real
+	// compute-client-backed implementations are used.
+	tryInsertFn    func(ctx context.Context, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error
+	deleteInZoneFn func(ctx context.Context, instanceName string, zone string) (bool, error)
 }
 
 func NewAutoscaler(config AutoscalerConfig) *Autoscaler {

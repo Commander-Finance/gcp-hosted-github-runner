@@ -61,6 +61,49 @@ variable "machine_timeout" {
   default     = 14400 // 4 h
 }
 
+variable "runner_register_timeout" {
+  type        = number
+  description = "How long (seconds) the VM startup script waits for the runner to come online/register before assuming registration failed and shutting the VM down. Kept short because a runner that never registers will never run a job."
+  default     = 120
+}
+
+variable "runner_job_dispatch_timeout" {
+  type        = number
+  description = "How long (seconds) an online, idle runner waits for GitHub to dispatch its job before giving up and shutting the VM down. Set generously: the previous hard 180s window killed healthy runners while their job was still queued, hanging the job. Must be smaller than machine_timeout."
+  default     = 600 // 10 min
+
+  validation {
+    # Validate the whole two-phase budget: the VM waits register_timeout AND THEN
+    # dispatch_timeout, so their sum must fit inside machine_timeout (the
+    # max_run_duration backstop) - otherwise a healthy runner could be killed
+    # mid-queue, the very failure this hardening removes.
+    condition = (
+      var.runner_register_timeout > 0 &&
+      var.runner_job_dispatch_timeout > 0 &&
+      var.runner_register_timeout + var.runner_job_dispatch_timeout < var.machine_timeout
+    )
+    error_message = "runner_register_timeout and runner_job_dispatch_timeout must be positive and their sum smaller than machine_timeout."
+  }
+}
+
+variable "runner_setup_retries" {
+  type        = number
+  description = "Number of attempts for transient VM setup steps (package install, runner download, dependency install) before the startup script gives up. Retrying absorbs transient apt/curl/network failures that would otherwise abandon the job."
+  default     = 3
+}
+
+variable "runner_online_log_pattern" {
+  type        = string
+  description = "journald log substring that indicates the runner has registered and is listening for jobs. Tune if a future runner version changes its wording."
+  default     = "Listening for Jobs"
+}
+
+variable "runner_job_log_pattern" {
+  type        = string
+  description = "journald log substring that indicates the runner has accepted a workflow job."
+  default     = "Running job:"
+}
+
 variable "machine_zones" {
   type        = list(string)
   description = "One or multiple Google Cloud zones where the VM instances will be created in. The zone is selected at random for each instance."
@@ -89,6 +132,12 @@ variable "subnet_ip_cidr_range" {
   type        = string
   description = "CIDR range to assign to subnet VM instances launch in."
   default     = "10.0.1.0/24"
+}
+
+variable "alert_notification_channels" {
+  type        = list(string)
+  description = "Cloud Monitoring notification channel IDs to attach to the autoscaler alert policies (e.g. created via google_monitoring_notification_channel). Empty means the alert policies are still created but only visible in the console."
+  default     = []
 }
 
 variable "enable_debug" {
@@ -156,6 +205,22 @@ variable "github_runner_download_url" {
   type        = string
   description = "A download link pointing to the gitlab runner package (WARNING: deprecated runner versions won't process jobs). If this variable is empty (by default), the latest runner release will be downloaded."
   default     = ""
+}
+
+variable "runner_service_account_scopes" {
+  type        = list(string)
+  description = <<-EOT
+    OAuth scopes for the runner VM's service account token (readable from the
+    metadata server by the untrusted CI workload). Defaults to a least-privilege
+    set rather than "cloud-platform": the github-runner-sa has no IAM bindings by
+    default, so the token is inert, but narrow scopes prevent a future IAM grant
+    from being silently exposed at full breadth to job code. Widen deliberately
+    (e.g. add an Artifact Registry scope) only alongside a matching IAM grant.
+  EOT
+  default = [
+    "https://www.googleapis.com/auth/logging.write",
+    "https://www.googleapis.com/auth/monitoring.write",
+  ]
 }
 
 variable "github_runner_uid" {

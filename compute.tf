@@ -32,7 +32,67 @@ resource "google_compute_instance_template" "runner_instance" {
 
   service_account {
     email  = google_service_account.github_runner_sa.email
-    scopes = ["cloud-platform"]
+    scopes = var.runner_service_account_scopes
+  }
+
+  network_interface {
+    network    = google_compute_network.vpc_network.name
+    subnetwork = google_compute_subnetwork.subnetwork.name
+    nic_type   = var.runner_nic_type
+
+    dynamic "access_config" {
+      for_each = var.use_cloud_nat ? [] : [0]
+      content {
+        network_tier = "STANDARD"
+      }
+    }
+  }
+}
+
+// On-demand (STANDARD) counterpart of the runner template, created only when the
+// primary template is preemptible/SPOT. The autoscaler falls back to this template
+// when SPOT capacity is exhausted in every zone, so a stockout no longer hangs the
+// job. Kept as a separate Terraform-managed template (rather than overriding
+// scheduling at Insert time) because max_run_duration must be preserved and the
+// compute Go SDK in use cannot set it. Identical to runner_instance except for the
+// scheduling block.
+resource "google_compute_instance_template" "runner_instance_ondemand" {
+
+  count = var.machine_preemtible ? 1 : 0
+
+  name         = "ephemeral-github-runner-ondemand"
+  region       = local.region
+  machine_type = var.machine_type
+  tags         = var.enable_ssh ? ["http-egress", "icmp-ingress", "ssh-ingress"] : ["http-egress", "icmp-ingress"]
+  depends_on   = [google_project_service.compute_api]
+
+  scheduling {
+    preemptible         = false
+    automatic_restart   = false
+    on_host_maintenance = "TERMINATE"
+    // Valid with provisioning_model=STANDARD because max_run_duration is set
+    // (instance_termination_action requires SPOT or a limited-run instance, and a
+    // VM with max_run_duration qualifies). DELETE keeps the ephemeral-runner
+    // semantics consistent with the SPOT template.
+    instance_termination_action = "DELETE"
+    provisioning_model          = "STANDARD"
+
+    max_run_duration {
+      seconds = var.machine_timeout
+    }
+  }
+
+  disk {
+    auto_delete  = true
+    boot         = true
+    source_image = var.machine_image
+    disk_type    = var.disk_type
+    disk_size_gb = var.disk_size_gb
+  }
+
+  service_account {
+    email  = google_service_account.github_runner_sa.email
+    scopes = var.runner_service_account_scopes
   }
 
   network_interface {
@@ -103,19 +163,28 @@ SYSCTL
 sysctl --load=/etc/sysctl.d/99-runner-icmp-hardening.conf >/dev/null || shutdown now
 EOT
 
-  # Define the setup and install subscript that should run if we are using a default base image, such as the default ubuntu-os-cloud/ubuntu-minimal-2204-lts
+  # Define the setup and install subscript that should run if we are using a default base image, such as the default ubuntu-os-cloud/ubuntu-minimal-2204-lts.
+  # Transient network steps (apt, runner download) are wrapped in retry() (defined in
+  # the parent startup script) so a single apt/curl hiccup doesn't abandon the job.
   setup_and_install_subscript = <<EOT
-apt-get update && apt-get -y install docker.io docker-buildx curl sed jq ${local.github_runner_package_install}
+retry ${var.runner_setup_retries} 5 bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y install docker.io docker-buildx curl sed jq ${local.github_runner_package_install}' || shutdown now
 useradd -d /home/agent -u ${var.github_runner_uid} agent
 usermod -aG docker agent
 newgrp docker
 RUNNER_DOWNLOAD_URL='${var.github_runner_download_url}'
 if [ -z "$${RUNNER_DOWNLOAD_URL}" ]; then
-  RUNNER_VERSION=$(curl -s "https://github.com/actions/runner/tags/" | grep -Eo "$Version v[0-9]+.[0-9]+.[0-9]+" | sort -r | head -n1 | tr -d ' ' | tr -d 'v')
+  # Runner-version discovery is itself a network hop: retry it and require a
+  # non-empty result, otherwise a transient failure yields an empty version and
+  # the retried download below would just hammer an invalid release URL.
+  fetch_runner_version() {
+    RUNNER_VERSION=$(curl -fsS "https://github.com/actions/runner/tags/" | grep -Eo "$Version v[0-9]+.[0-9]+.[0-9]+" | sort -r | head -n1 | tr -d ' ' | tr -d 'v')
+    [ -n "$RUNNER_VERSION" ]
+  }
+  retry ${var.runner_setup_retries} 5 fetch_runner_version || shutdown now
   echo "Downloading latest runner v$${RUNNER_VERSION}"
   RUNNER_DOWNLOAD_URL="https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-x64-$${RUNNER_VERSION}.tar.gz"
 fi
-curl -s -o /tmp/agent.tar.gz -L $${RUNNER_DOWNLOAD_URL}
+retry ${var.runner_setup_retries} 5 curl -fsS -o /tmp/agent.tar.gz -L "$${RUNNER_DOWNLOAD_URL}" || shutdown now
 mkdir -p /home/agent
 chown -R agent:agent /home/agent
 pushd /home/agent
@@ -133,6 +202,26 @@ resource "google_compute_project_metadata_item" "startup_scripts_register_jit_ru
 agent_name=$(hostname)
 echo "Setup of agent '$agent_name' started"
 
+# retry <attempts> <initial_delay_seconds> <command...>
+# Retries a command with escalating backoff to absorb transient apt/curl/network
+# failures during setup instead of abandoning the job on the first hiccup.
+retry() {
+  local attempts=$1; shift
+  local delay=$1; shift
+  local n=1
+  until "$@"; do
+    if [ $n -ge $attempts ]; then
+      echo "Command failed after $n attempt(s): $*"
+      return 1
+    fi
+    echo "Attempt $n/$attempts failed: $* - retrying in $${delay}s"
+    sleep $delay
+    delay=$((delay * 3))
+    n=$((n + 1))
+  done
+  return 0
+}
+
 ${local.icmp_hardening_subscript}
 ${var.run_setup_on_runner_machines ? local.setup_and_install_subscript : ""}
 
@@ -149,32 +238,55 @@ echo -n $encoded_jit_config | base64 -d | jq '.".credentials_rsaparams"' -r | ba
 sed -i 's/{{SvcNameVar}}/actions.runner.service/g' bin/systemd.svc.sh.template
 sed -i 's/{{SvcDescription}}/GitHub Actions Runner/g' bin/systemd.svc.sh.template
 cp bin/systemd.svc.sh.template ./svc.sh && chmod +x ./svc.sh
-./bin/installdependencies.sh || shutdown now
+retry ${var.runner_setup_retries} 5 ./bin/installdependencies.sh || shutdown now
 ./svc.sh install agent || shutdown now
 ./svc.sh start || shutdown now
 
-echo "Setup finished - waiting for Workflow Job"
-max_wait=180
+echo "Setup finished - waiting for the runner to come online"
+register_timeout=${var.runner_register_timeout}
+dispatch_timeout=${var.runner_job_dispatch_timeout}
+online_pattern='${var.runner_online_log_pattern}'
+job_pattern='${var.runner_job_log_pattern}'
+
+runner_log() { journalctl -u actions.runner.service --no-pager; }
+
+# Phase 1: wait (briefly) for the runner to register / come online. A runner that
+# never comes online will never run a job, so we give up quickly here.
 elapsed=0
-interval=1
-while [ $elapsed -lt $max_wait ]; do
-  if journalctl -u actions.runner.service --no-pager | grep -q "Running job:"; then
+online=0
+while [ $elapsed -lt $register_timeout ]; do
+  if runner_log | grep -q "$job_pattern"; then
     echo "Accepted Workflow Job - processing"
     exit 0
   fi
-  remaining=$((max_wait - elapsed))
-  if [ $interval -gt $remaining ]; then
-    interval=$remaining
+  if runner_log | grep -q "$online_pattern"; then
+    echo "Runner is online - waiting for a job to be dispatched"
+    online=1
+    break
   fi
-  sleep $interval
-  elapsed=$((elapsed + interval))
-  interval=$((interval * 2))
+  sleep 5
+  elapsed=$((elapsed + 5))
 done
-if journalctl -u actions.runner.service --no-pager | grep -q "Running job:"; then
-  echo "Accepted Workflow Job - processing"
-  exit 0
+
+if [ $online -eq 0 ]; then
+  echo "Runner did not come online within $${register_timeout}s - shutting down"
+  shutdown now
 fi
-echo "No job accepted after $${elapsed}s, shutting down"
+
+# Phase 2: the runner is online and healthy; wait (generously) for GitHub to
+# dispatch the job. The previous hard 180s window shut down healthy runners while
+# their job was still queued, hanging the job.
+elapsed=0
+while [ $elapsed -lt $dispatch_timeout ]; do
+  if runner_log | grep -q "$job_pattern"; then
+    echo "Accepted Workflow Job - processing"
+    exit 0
+  fi
+  sleep 5
+  elapsed=$((elapsed + 5))
+done
+
+echo "No job dispatched within $${dispatch_timeout}s - shutting down"
 shutdown now
 EOT
 }

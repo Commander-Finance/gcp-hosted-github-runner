@@ -30,6 +30,12 @@ resource "google_project_iam_custom_role" "manage_vm_instances" {
   permissions = ["compute.instances.get", "compute.instances.start", "compute.instances.stop", "compute.instances.delete", "compute.instances.create", "compute.instances.setMetadata", "compute.instances.setTags", "compute.instances.setServiceAccount"]
 }
 
+resource "google_project_iam_custom_role" "list_vm_instances" {
+  role_id     = "ListVmInstances"
+  title       = "List VM instances"
+  permissions = ["compute.instances.list"]
+}
+
 resource "google_project_iam_custom_role" "create_delete_cloud_task" {
   role_id     = "CreateDeleteCloudTask"
   title       = "Create/Delete a Cloud Task"
@@ -75,9 +81,21 @@ resource "google_project_iam_member" "manage_vm_instances_member" {
   member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
   role    = google_project_iam_custom_role.manage_vm_instances.id
   condition {
-    title       = "VM instance administration with a fix prefix ${var.github_runner_prefix} in zone ${local.zones[count.index]}"
-    expression  = "resource.name.startsWith('projects/${local.projectId}/zones/${local.zones[count.index]}/instances/${var.github_runner_prefix}-')"
+    title      = "VM instance administration with a fix prefix ${var.github_runner_prefix} in zone ${local.zones[count.index]}"
+    expression = "resource.name.startsWith('projects/${local.projectId}/zones/${local.zones[count.index]}/instances/${var.github_runner_prefix}-')"
   }
+}
+
+// compute.instances.list is required by the autoscaler's orphan sweep, which
+// reclaims stopped runner VMs (a runner that shut itself down without ever picking
+// up a job produces no completed-webhook and would otherwise linger). list is a
+// collection-level permission that IAM conditions cannot narrow by instance name,
+// so this grants read-only listing of instances project-wide. It is read-only, and
+// the autoscaler SA runs in Cloud Run and is never reachable from a job workload.
+resource "google_project_iam_member" "list_vm_instances_member" {
+  project = local.projectId
+  member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
+  role    = google_project_iam_custom_role.list_vm_instances.id
 }
 
 resource "google_project_iam_member" "create_delete_cloud_task_member" {
@@ -93,12 +111,14 @@ resource "google_project_iam_member" "create_delete_cloud_task_member" {
   #}
 }
 
-resource "google_project_iam_member" "service_account_user_member" {
-  project = local.projectId
-  member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
-  role    = "roles/iam.serviceAccountUser"
-
-  # TODO limit to github_runner_sa
+# Scoped to the github_runner_sa resource only (not project-wide): the autoscaler
+# only ever attaches github_runner_sa to the runner VMs it creates, so it never
+# needs actAs on any other service account. This closes the confused-deputy vector
+# where a compromised autoscaler could launch a VM impersonating an arbitrary SA.
+resource "google_service_account_iam_member" "autoscaler_acts_as_runner_sa" {
+  service_account_id = google_service_account.github_runner_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.autoscaler_sa.email}"
 }
 
 resource "google_project_iam_member" "create_vm_from_instance_template_member" {
@@ -106,8 +126,15 @@ resource "google_project_iam_member" "create_vm_from_instance_template_member" {
   member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
   role    = google_project_iam_custom_role.create_vm_from_instance_template.id
   condition {
-    title       = "Create VM instance from instance template ${google_compute_instance_template.runner_instance.name}"
-    expression  = "resource.name == '${google_compute_instance_template.runner_instance.id}'"
+    title = "Create VM instance from runner instance template(s)"
+    // Match the exact template id(s) rather than a prefix, so no future template
+    // sharing the "ephemeral-github-runner" prefix is inadvertently authorized.
+    // The ondemand fallback exists only when machine_preemtible is set, and its
+    // id is referenced only in that branch so the count'd resource is never
+    // indexed when absent.
+    expression = (var.machine_preemtible ?
+      "resource.name == '${google_compute_instance_template.runner_instance.id}' || resource.name == '${google_compute_instance_template.runner_instance_ondemand[0].id}'" :
+    "resource.name == '${google_compute_instance_template.runner_instance.id}'")
   }
 }
 
@@ -139,9 +166,9 @@ resource "google_project_iam_member" "read_secret_version_member" {
   member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
   role    = google_project_iam_custom_role.read_secret_version.id
   condition {
-    title       = "Read secret ${google_secret_manager_secret.github_pat_token.secret_id}"
+    title = "Read secret ${google_secret_manager_secret.github_pat_token.secret_id}"
     // The project number is needed - project id doesn't work
-    expression  = "resource.name == 'projects/${local.projectNumber}/secrets/${google_secret_manager_secret.github_pat_token.secret_id}/versions/latest'"
+    expression = "resource.name == 'projects/${local.projectNumber}/secrets/${google_secret_manager_secret.github_pat_token.secret_id}/versions/latest'"
   }
 }
 
