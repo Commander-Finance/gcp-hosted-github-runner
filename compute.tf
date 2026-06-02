@@ -32,7 +32,7 @@ resource "google_compute_instance_template" "runner_instance" {
 
   service_account {
     email  = google_service_account.github_runner_sa.email
-    scopes = ["cloud-platform"]
+    scopes = var.runner_service_account_scopes
   }
 
   network_interface {
@@ -92,7 +92,7 @@ resource "google_compute_instance_template" "runner_instance_ondemand" {
 
   service_account {
     email  = google_service_account.github_runner_sa.email
-    scopes = ["cloud-platform"]
+    scopes = var.runner_service_account_scopes
   }
 
   network_interface {

@@ -199,6 +199,22 @@ variable "github_runner_download_url" {
   default     = ""
 }
 
+variable "runner_service_account_scopes" {
+  type        = list(string)
+  description = <<-EOT
+    OAuth scopes for the runner VM's service account token (readable from the
+    metadata server by the untrusted CI workload). Defaults to a least-privilege
+    set rather than "cloud-platform": the github-runner-sa has no IAM bindings by
+    default, so the token is inert, but narrow scopes prevent a future IAM grant
+    from being silently exposed at full breadth to job code. Widen deliberately
+    (e.g. add an Artifact Registry scope) only alongside a matching IAM grant.
+  EOT
+  default = [
+    "https://www.googleapis.com/auth/logging.write",
+    "https://www.googleapis.com/auth/monitoring.write",
+  ]
+}
+
 variable "github_runner_uid" {
   type        = number
   description = "The uid the runner will be run with."

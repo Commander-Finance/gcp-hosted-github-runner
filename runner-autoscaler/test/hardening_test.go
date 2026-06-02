@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -120,6 +121,50 @@ func TestEmptyRunnerNameDeleteReturnsOk(t *testing.T) {
 	assert.Nil(t, err)
 	assert.NotNil(t, resp)
 	assert.Equal(t, 200, resp.StatusCode)
+}
+
+func TestIsValidRunnerName(t *testing.T) {
+
+	assert.True(t, pkg.IsValidRunnerName("runner", "runner-42"))
+	assert.True(t, pkg.IsValidRunnerName("runner", "runner-9007199254740991"))
+	assert.True(t, pkg.IsValidRunnerName("gh-runner", "gh-runner-1"))
+
+	// Empty, missing prefix, non-numeric suffix, extra segments, and a bare prefix
+	// must all be rejected so the delete-vm callback can't target an arbitrary name.
+	assert.False(t, pkg.IsValidRunnerName("runner", ""))
+	assert.False(t, pkg.IsValidRunnerName("runner", "runner-"))
+	assert.False(t, pkg.IsValidRunnerName("runner", "runner-abc"))
+	assert.False(t, pkg.IsValidRunnerName("runner", "runner-1-2"))
+	assert.False(t, pkg.IsValidRunnerName("runner", "other-1"))
+	assert.False(t, pkg.IsValidRunnerName("runner", "runner"))
+	// The name we actually create round-trips.
+	assert.True(t, pkg.IsValidRunnerName("runner", pkg.InstanceName("runner", 12345)))
+}
+
+func TestUnknownSourceReturnsUnauthorized(t *testing.T) {
+
+	// A request to an unregistered source must look identical (401) to a bad
+	// signature, so the registered org/repo names can't be enumerated.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	body := strings.NewReader("Hello, World!")
+	req, _ := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("http://127.0.0.1:%d/webhook?%s=%s", PORT, SOURCE_QUERY_PARAM_NAME, url.QueryEscape("repository-not-registered")), body)
+	// A syntactically valid (71-char) but wrong signature.
+	req.Header.Add("x-hub-signature-256", "sha256="+strings.Repeat("0", 64))
+	resp, err := http.DefaultClient.Do(req)
+	assert.Nil(t, err)
+	assert.Equal(t, 401, resp.StatusCode)
+}
+
+func TestBadSignatureReturnsUnauthorized(t *testing.T) {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("http://127.0.0.1:%d/webhook?%s=%s", PORT, SOURCE_QUERY_PARAM_NAME, url.QueryEscape(TEST_REPO_KEY)), strings.NewReader("Hello, World!"))
+	req.Header.Add("x-hub-signature-256", "sha256="+strings.Repeat("0", 64))
+	resp, err := http.DefaultClient.Do(req)
+	assert.Nil(t, err)
+	assert.Equal(t, 401, resp.StatusCode)
 }
 
 func TestOrderedZones(t *testing.T) {

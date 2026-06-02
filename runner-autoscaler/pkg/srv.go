@@ -388,6 +388,25 @@ func InstanceName(prefix string, jobId int64) string {
 	return fmt.Sprintf("%s-%d", prefix, jobId)
 }
 
+// IsValidRunnerName reports whether name matches the shape we create
+// (InstanceName): "<prefix>-<digits>". The delete-vm callback uses the
+// webhook-supplied runner_name as the Compute instance name; validating it here
+// stops a (signed) caller from naming an arbitrary instance - including another
+// runner - for deletion.
+func IsValidRunnerName(prefix string, name string) bool {
+
+	suffix, ok := strings.CutPrefix(name, prefix+"-")
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // CallbackTaskName builds the Cloud Tasks task resource name for a callback,
 // namespaced by kind so create and delete callbacks for the same job never collide.
 func CallbackTaskName(queue string, kind string, jobId int64, retryCount int) string {
@@ -470,16 +489,19 @@ func (s *Autoscaler) verifySignature(ctx *gin.Context) ([]byte, Source, error) {
 		} else {
 			if src, ok := ctx.GetQuery(s.conf.SourceQueryParam); ok {
 				if source, ok := s.conf.RegisteredSources[src]; ok {
-					if calcSignature := CalcSigHex([]byte(source.Secret), body); calcSignature == signature[7:] {
+					calcSignature := CalcSigHex([]byte(source.Secret), body)
+					if hmac.Equal([]byte(calcSignature), []byte(signature[7:])) {
 						return body, source, nil
 					} else {
 						log.Warnf("%s signature did not match", ctx.RemoteIP())
 						return nil, Source{}, ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
 					}
 				} else {
-					log.Infof("Source with name '%s' not registered - ignoring", src)
-					ctx.Status(http.StatusOK) // not considered an error
-					return nil, Source{}, fmt.Errorf("unknown webhook source")
+					// Return the same 401 as a bad signature so an unauthenticated
+					// caller cannot distinguish "unknown source" from "wrong signature"
+					// and enumerate which org/repo names are registered.
+					log.Warnf("%s used an unregistered source", ctx.RemoteIP())
+					return nil, Source{}, ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
 				}
 			} else {
 				log.Errorf("Missing %s query parameter", s.conf.SourceQueryParam)
@@ -1097,12 +1119,12 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 	if data, _, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
 		json.Unmarshal(data, &job)
-		if job.RunnerName == "" {
-			// A job that completed without ever being picked up (e.g. cancelled while
-			// queued) has no runner name and thus no VM to delete. Returning early
-			// avoids a guaranteed-failing delete that the task queue would retry for an
-			// hour.
-			log.Info("Delete-vm callback has empty runner name - no VM to delete")
+		if !IsValidRunnerName(s.conf.RunnerPrefix, job.RunnerName) {
+			// Either empty (the job was never picked up, e.g. cancelled while queued)
+			// or a name that doesn't match a runner we manage. Don't issue a delete for
+			// an empty/attacker-influenced name (which could target another runner);
+			// acknowledge so the task isn't retried, and let the sweep handle cleanup.
+			log.Infof("Delete-vm callback runner name %q is not a managed runner - skipping delete", job.RunnerName)
 			ctx.Status(http.StatusOK)
 			go s.maybeSweepOrphans()
 			return

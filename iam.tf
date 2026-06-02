@@ -111,12 +111,14 @@ resource "google_project_iam_member" "create_delete_cloud_task_member" {
   #}
 }
 
-resource "google_project_iam_member" "service_account_user_member" {
-  project = local.projectId
-  member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
-  role    = "roles/iam.serviceAccountUser"
-
-  # TODO limit to github_runner_sa
+# Scoped to the github_runner_sa resource only (not project-wide): the autoscaler
+# only ever attaches github_runner_sa to the runner VMs it creates, so it never
+# needs actAs on any other service account. This closes the confused-deputy vector
+# where a compromised autoscaler could launch a VM impersonating an arbitrary SA.
+resource "google_service_account_iam_member" "autoscaler_acts_as_runner_sa" {
+  service_account_id = google_service_account.github_runner_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.autoscaler_sa.email}"
 }
 
 resource "google_project_iam_member" "create_vm_from_instance_template_member" {
