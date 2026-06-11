@@ -36,10 +36,16 @@ resource "google_project_iam_custom_role" "list_vm_instances" {
   permissions = ["compute.instances.list"]
 }
 
+// CreateCallbackTaskWithToken calls GetTask before creating a new task to
+// distinguish a still-active task (skip the duplicate) from a tombstoned name
+// (bump the retry suffix and create fresh). Without tasks.get that probe
+// returns PERMISSION_DENIED, causing both webhook dedup and the recreate-loop's
+// suffix-bumping to silently break: duplicate tasks would be enqueued and the
+// recreate loop could never advance past a tombstoned name.
 resource "google_project_iam_custom_role" "create_delete_cloud_task" {
   role_id     = "CreateDeleteCloudTask"
   title       = "Create/Delete a Cloud Task"
-  permissions = ["cloudtasks.tasks.create", "cloudtasks.tasks.delete"]
+  permissions = ["cloudtasks.tasks.create", "cloudtasks.tasks.delete", "cloudtasks.tasks.get"]
 }
 
 resource "google_project_iam_custom_role" "create_vm_from_instance_template" {
