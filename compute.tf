@@ -1,5 +1,20 @@
 locals {
   github_runner_package_install = join(" ", var.github_runner_packages)
+
+  # installdependencies.sh runs apt-get, which prebuilt images
+  # (run_setup_on_runner_machines=false) already ran at image-build time.
+  # Re-running apt at boot races background dpkg/apt activity; a transient lock
+  # failure would `shutdown now` and orphan the queued job, so prebuilt images
+  # skip it. The systemd template sed/cp and svc.sh install/start deliberately
+  # stay unconditional in the startup script: they are local-only (no network,
+  # no apt), idempotent on an already-patched template, and keeping them avoids
+  # a hidden requirement that prebuilt images bake svc.sh themselves.
+  # NOTE: the heredoc's trailing newline is load-bearing - the startup script
+  # interpolates this local directly in front of `./svc.sh install agent`, and
+  # the newline is what keeps the two commands on separate lines.
+  runner_installdeps_subscript = <<EOT
+retry ${var.runner_setup_retries} 5 ./bin/installdependencies.sh || shutdown now
+EOT
 }
 
 resource "google_compute_instance_template" "runner_instance" {
@@ -238,8 +253,7 @@ echo -n $encoded_jit_config | base64 -d | jq '.".credentials_rsaparams"' -r | ba
 sed -i 's/{{SvcNameVar}}/actions.runner.service/g' bin/systemd.svc.sh.template
 sed -i 's/{{SvcDescription}}/GitHub Actions Runner/g' bin/systemd.svc.sh.template
 cp bin/systemd.svc.sh.template ./svc.sh && chmod +x ./svc.sh
-retry ${var.runner_setup_retries} 5 ./bin/installdependencies.sh || shutdown now
-./svc.sh install agent || shutdown now
+${var.run_setup_on_runner_machines ? local.runner_installdeps_subscript : ""}./svc.sh install agent || shutdown now
 ./svc.sh start || shutdown now
 
 echo "Setup finished - waiting for the runner to come online"
@@ -288,5 +302,60 @@ done
 
 echo "No job dispatched within $${dispatch_timeout}s - shutting down"
 shutdown now
+EOT
+}
+
+// Shared shutdown script stored in project metadata so the autoscaler's
+// per-instance wrapper (injected via the shutdown-script instance metadata
+// attribute) can fetch and execute it without bundling the logic into the
+// Go binary or re-deploying for each script change. The per-instance wrapper
+// passes four positional args:
+//   $1 = recreate_callback_url     (HMAC-authenticated URL on the autoscaler)
+//   $2 = recreate_callback_payload (JSON body, pre-serialised by Go)
+//   $3 = recreate_callback_sig     (hex HMAC-SHA256 of payload, no prefix)
+//   $4 = job_accepted_log_pattern  (journald grep pattern, e.g. "Running job:")
+//
+// Design notes:
+//   - Every step fails open (exit 0): a missed callback degrades to today's
+//     behaviour (job stays queued until the user re-runs) and must never block
+//     or delay the shutdown path (GCE gives ~30 s budget on preemption).
+//   - The job-accepted check reads the local journald log, not GitHub — no
+//     outbound API call is needed to decide whether to fire the callback.
+//   - %{...} in the curl -w format string is a Terraform template directive
+//     delimiter, so it is written as %%{...} in this heredoc.
+resource "google_compute_project_metadata_item" "shutdown_script_recreate_runner" {
+  key   = "shutdown_script_recreate_runner"
+  value = <<EOT
+#!/bin/bash
+# Args: $1=callback_url  $2=job_payload_json  $3=hmac_sig_hex  $4=job_accepted_log_pattern
+# Runs on every GCE shutdown: spot preemption (~30s budget), the startup script's
+# own `shutdown now` timeouts, and instance deletion by the autoscaler. If this
+# runner accepted a job, GitHub will fire a `completed` webhook and normal
+# lifecycle handles cleanup/retry - do nothing. If it never accepted a job, the
+# queued job it represents capacity for would be orphaned: post a signed
+# recreate callback so the autoscaler re-enqueues a create-vm task. Every step
+# fails open (exit 0) - a missed callback degrades to today's behavior and must
+# never block the shutdown path.
+CB_URL="$1"
+CB_PAYLOAD="$2"
+CB_SIG="$3"
+JOB_PATTERN="$4"
+if [ -z "$JOB_PATTERN" ]; then JOB_PATTERN='Running job:'; fi
+if [ -z "$CB_URL" ] || [ -z "$CB_PAYLOAD" ] || [ -z "$CB_SIG" ]; then
+  echo "Shutdown: missing recreate metadata - skipping recreate callback"
+  exit 0
+fi
+if journalctl -u actions.runner.service --no-pager 2>/dev/null | grep -q "$JOB_PATTERN"; then
+  echo "Shutdown: a job was accepted on this runner - no recreate needed"
+  exit 0
+fi
+echo "Shutdown: no job was ever accepted - posting recreate callback"
+# --data-raw so a payload can never be misread as curl's @file syntax; one retry
+# because the dying VM is the only sender of this signal (a transient 5xx would
+# otherwise lose it permanently). Worst case ~21s of curl + ~3s metadata fetch
+# stays inside the ~30s preemption budget.
+HTTP_CODE=$(curl -s --max-time 10 --retry 1 --retry-delay 1 -X POST -H "Content-Type: application/json" -H "x-hub-signature-256: sha256=$CB_SIG" --data-raw "$CB_PAYLOAD" -o /dev/null -w '%%{http_code}' "$CB_URL") || true
+echo "Shutdown: recreate callback returned HTTP $HTTP_CODE"
+exit 0
 EOT
 }

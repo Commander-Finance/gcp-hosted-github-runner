@@ -1,8 +1,8 @@
 resource "google_compute_firewall" "http_egress" {
-  name    = "http-egress"
+  name        = "http-egress"
   description = "Allows egress on port 80, 443"
-  network = google_compute_network.vpc_network.name
-  direction = "EGRESS"
+  network     = google_compute_network.vpc_network.name
+  direction   = "EGRESS"
 
   allow {
     protocol = "tcp"
@@ -27,11 +27,11 @@ resource "google_compute_firewall" "icmp_ingress" {
 }
 
 resource "google_compute_firewall" "ssh_ingress" {
-  count   = var.enable_ssh ? 1 : 0
-  name    = "ssh-ingress"
+  count       = var.enable_ssh ? 1 : 0
+  name        = "ssh-ingress"
   description = "Allows ingress on port 22"
-  network = google_compute_network.vpc_network.name
-  direction = "INGRESS"
+  network     = google_compute_network.vpc_network.name
+  direction   = "INGRESS"
 
   allow {
     protocol = "tcp"
@@ -39,5 +39,5 @@ resource "google_compute_firewall" "ssh_ingress" {
   }
 
   source_ranges = ["0.0.0.0/0"]
-  target_tags = ["ssh-ingress"]
+  target_tags   = ["ssh-ingress"]
 }

@@ -67,6 +67,7 @@ func main() {
 		RouteWebhook:             getEnvDefault("ROUTE_WEBHOOK", "/webhook"),
 		RouteDeleteVm:            getEnvDefault("ROUTE_DELETE_VM", "/delete_vm"),
 		RouteCreateVm:            getEnvDefault("ROUTE_CREATE_VM", "/create_vm"),
+		RouteRecreateVm:          getEnvDefault("ROUTE_RECREATE_VM", "/recreate_vm"),
 		ProjectId:                mustGetEnv("PROJECT_ID"),
 		Zones:                    strings.Split(mustGetEnv("ZONES"), ","),
 		TaskQueue:                mustGetEnv("TASK_QUEUE"),
@@ -79,6 +80,7 @@ func main() {
 		RegisteredSources:        map[string]pkg.Source{},
 		SourceQueryParam:         getEnvDefault("SOURCE_QUERY_PARAM_NAME", "src"),
 		CreateVmDelay:            getEnvDefaultInt64("CREATE_VM_DELAY", 10),
+		RunnerJobLogPattern:      getEnvDefault("RUNNER_JOB_LOG_PATTERN", pkg.DefaultRunnerJobLogPattern),
 		Simulate:                 getEnvDefaultInt64("SIMULATE", 0) == 1,
 	}
 
