@@ -48,6 +48,22 @@ const RUNNER_JIT_CONFIG_ATTR string = "jit_config"
 const RUNNER_SCRIPT_REGISTER_RUNNER_ATTR string = "startup_script_register_runner"         // has to match the global custom metadata in compute.tf
 const RUNNER_SCRIPT_REGISTER_JIT_RUNNER_ATTR string = "startup_script_register_jit_runner" // has to match the global custom metadata in compute.tf
 
+// RUNNER_SCRIPT_SHUTDOWN_ATTR is the project-metadata key for the shutdown script body (Terraform creates it).
+const RUNNER_SCRIPT_SHUTDOWN_ATTR string = "shutdown_script_recreate_runner"
+
+// RECREATE_CALLBACK_* are the instance-metadata keys written by createVmWithJitConfig and
+// consumed by shutdown_script_wrapper when the VM shuts down without accepting a job.
+const RECREATE_CALLBACK_URL_ATTR string = "recreate_callback_url"
+const RECREATE_CALLBACK_PAYLOAD_ATTR string = "recreate_callback_payload"
+const RECREATE_CALLBACK_SIG_ATTR string = "recreate_callback_sig"
+const RECREATE_CALLBACK_JOB_PATTERN_ATTR string = "recreate_job_accepted_pattern"
+
+// DefaultRunnerJobLogPattern matches the runner_job_log_pattern Terraform default. Both
+// the startup script's phase-2 dispatch wait and the shutdown script's job-accepted
+// check grep journald for it; createVmWithJitConfig falls back to it so the stored
+// pattern is never empty (an empty grep pattern would match everything).
+const DefaultRunnerJobLogPattern = "Running job:"
+
 // Cloud Task callback kinds. The task name embeds the kind so the create-vm and
 // delete-vm callbacks for the same job never collide on the same task name (a
 // collision can make enqueueing the delete callback fail with AlreadyExists
@@ -68,6 +84,11 @@ const maxSweepDeletes = 25
 // 0..maxTaskRetryCount). CreateCallbackTaskWithToken bumps the suffix on
 // AlreadyExists; DeleteCallbackTask must cancel every candidate.
 const maxTaskRetryCount = 2
+
+// recreateVmDelay is how long to wait before the re-create task fires after a
+// VM dies without accepting a job. The delay lets the dying VM fully disappear
+// before the replacement create runs; decideCreate handles any stopped leftover.
+const recreateVmDelay = 45 * time.Second
 
 const RUNNER_REGISTER_TOKEN_ORG_ENDPOINT string = "https://api.github.com/orgs/%s/actions/runners/registration-token"
 
@@ -90,18 +111,25 @@ type Source struct {
 }
 
 type Job struct {
-	Id              int64    `json:"id"`
-	Name            string   `json:"name"`
-	Status          string   `json:"status"`
-	Labels          []string `json:"labels"`
-	RunnerName      string   `json:"runner_name"`
-	RunnerGroupName string   `json:"runner_group_name"`
-	RunnerGroupId   int64    `json:"runner_group_id"`
+	Id                 int64    `json:"id"`
+	Name               string   `json:"name"`
+	Status             string   `json:"status"`
+	Labels             []string `json:"labels"`
+	RunnerName         string   `json:"runner_name"`
+	RunnerGroupName    string   `json:"runner_group_name"`
+	RunnerGroupId      int64    `json:"runner_group_id"`
+	RepositoryFullName string   `json:"repository_full_name,omitempty"`
+}
+
+// Repository is the top-level "repository" object in a GitHub webhook payload.
+type Repository struct {
+	FullName string `json:"full_name"`
 }
 
 type Payload struct {
-	Action Action `json:"action"`
-	Job    Job    `json:"workflow_job"`
+	Action     Action     `json:"action"`
+	Job        Job        `json:"workflow_job"`
+	Repository Repository `json:"repository"`
 }
 
 type VmSettings struct {
@@ -1074,17 +1102,53 @@ chmod +x ./runner_startup.sh
 rm runner_startup.sh
 `
 
+// shutdown_script_wrapper runs on GCE shutdown (preemption, `shutdown now`, instance delete).
+// All five metadata fetches run in parallel via temp files (a `VAR=$(...) &` background
+// assignment would be lost in its subshell), bounding the fetch phase at ~3s of the ~30s
+// preemption budget instead of 15s sequentially. Every step is fail-open - missing files
+// yield empty args, which the shutdown script treats as "skip the callback" - so a
+// metadata hiccup never blocks shutdown.
+// Five %s placeholders: RECREATE_CALLBACK_URL_ATTR, RECREATE_CALLBACK_PAYLOAD_ATTR,
+// RECREATE_CALLBACK_SIG_ATTR, RECREATE_CALLBACK_JOB_PATTERN_ATTR, RUNNER_SCRIPT_SHUTDOWN_ATTR.
+const shutdown_script_wrapper = `#!/bin/bash
+md() { curl -sf --max-time 3 "http://metadata.google.internal/computeMetadata/v1/$1" -H "Metadata-Flavor: Google" -o "$2"; }
+md "instance/attributes/%s" /tmp/recreate_cb_url &
+md "instance/attributes/%s" /tmp/recreate_cb_payload &
+md "instance/attributes/%s" /tmp/recreate_cb_sig &
+md "instance/attributes/%s" /tmp/recreate_cb_pattern &
+md "project/attributes/%s" /tmp/runner_shutdown.sh &
+wait
+[ -s /tmp/runner_shutdown.sh ] || exit 0
+sed -i 's/\r$//' /tmp/runner_shutdown.sh
+chmod +x /tmp/runner_shutdown.sh
+/tmp/runner_shutdown.sh "$(cat /tmp/recreate_cb_url 2>/dev/null)" "$(cat /tmp/recreate_cb_payload 2>/dev/null)" "$(cat /tmp/recreate_cb_sig 2>/dev/null)" "$(cat /tmp/recreate_cb_pattern 2>/dev/null)"
+rm -f /tmp/runner_shutdown.sh /tmp/recreate_cb_url /tmp/recreate_cb_payload /tmp/recreate_cb_sig /tmp/recreate_cb_pattern
+`
+
+// shutdownScriptValue is constant across all VM creations - render it once.
+var shutdownScriptValue = fmt.Sprintf(shutdown_script_wrapper,
+	RECREATE_CALLBACK_URL_ATTR,
+	RECREATE_CALLBACK_PAYLOAD_ATTR,
+	RECREATE_CALLBACK_SIG_ATTR,
+	RECREATE_CALLBACK_JOB_PATTERN_ATTR,
+	RUNNER_SCRIPT_SHUTDOWN_ATTR,
+)
+
 // createVmWithJitConfig generates a JIT runner config and creates the VM. ginCtx is
 // used only to write the HTTP response; all GCP operations run on opCtx, which is
 // decoupled from the request so a Cloud Run request-deadline cancellation can't
 // abort an in-flight create (and cause a duplicate VM on retry).
-func (s *Autoscaler) createVmWithJitConfig(ginCtx *gin.Context, opCtx context.Context, url string, runnerGroupId int64, settings VmSettings, labels []string) {
+func (s *Autoscaler) createVmWithJitConfig(ginCtx *gin.Context, opCtx context.Context, url string, runnerGroupId int64, settings VmSettings, labels []string, job Job, src Source) {
 
 	// Idempotency: inspect any existing VM with this job's deterministic name. A live
 	// runner means this callback already did its job (don't regenerate a JIT config /
 	// duplicate it); a stopped leftover (e.g. a runner that shut down without taking
 	// the job) must be deleted and recreated so the queued job isn't stranded.
-	found, state, err := s.instanceState(opCtx, settings.Name)
+	instanceState := s.instanceStateFn
+	if instanceState == nil {
+		instanceState = s.instanceState
+	}
+	found, state, err := instanceState(opCtx, settings.Name)
 	if err != nil {
 		ginCtx.AbortWithError(http.StatusInternalServerError, err)
 		return
@@ -1102,21 +1166,76 @@ func (s *Autoscaler) createVmWithJitConfig(ginCtx *gin.Context, opCtx context.Co
 		}
 	}
 
-	if jitConfig, err := s.GenerateRunnerJitConfig(opCtx, url, settings.Name, runnerGroupId, labels); err != nil {
+	generateJitConfig := s.jitConfigFn
+	if generateJitConfig == nil {
+		generateJitConfig = s.GenerateRunnerJitConfig
+	}
+	if jitConfig, err := generateJitConfig(opCtx, url, settings.Name, runnerGroupId, labels); err != nil {
 		ginCtx.AbortWithError(http.StatusInternalServerError, err)
 	} else {
 		jit_config_attr := fmt.Sprintf("%s_%s", RUNNER_JIT_CONFIG_ATTR, RandStringRunes(16))
-		if err := s.CreateInstanceFromTemplate(opCtx, settings.Name, settings.MachineType, &computepb.Items{
-			Key:   proto.String(jit_config_attr),
-			Value: proto.String(jitConfig),
-		}, &computepb.Items{
-			Key:   proto.String("startup-script"),
-			Value: proto.String(fmt.Sprintf(runner_script_wrapper, jit_config_attr, RUNNER_SCRIPT_REGISTER_JIT_RUNNER_ATTR)),
-		}); err != nil {
+		metadata := []*computepb.Items{
+			{
+				Key:   proto.String(jit_config_attr),
+				Value: proto.String(jitConfig),
+			},
+			{
+				Key:   proto.String("startup-script"),
+				Value: proto.String(fmt.Sprintf(runner_script_wrapper, jit_config_attr, RUNNER_SCRIPT_REGISTER_JIT_RUNNER_ATTR)),
+			},
+		}
+		if s.conf.RouteRecreateVm != "" {
+			metadata = append(metadata, s.recreateMetadata(ginCtx, job, src)...)
+		} else {
+			// Without a recreate route the shutdown callback can't exist: a VM that
+			// dies before accepting a job will not be replaced. Loud on purpose -
+			// this is almost always a misconfiguration, not a choice.
+			log.Warnf("RouteRecreateVm is not configured - creating %s without the recreate shutdown callback", settings.Name)
+		}
+		if err := s.CreateInstanceFromTemplate(opCtx, settings.Name, settings.MachineType, metadata...); err != nil {
 			ginCtx.AbortWithError(http.StatusInternalServerError, err)
 		} else {
 			ginCtx.Status(http.StatusOK)
 		}
+	}
+}
+
+// recreateMetadata builds the shutdown-script wrapper and the per-instance attributes
+// it consumes, so a VM that shuts down without ever accepting a job can post a signed
+// recreate callback. jobJSON is both the stored payload and the signed data so the
+// recreate handler can verify origin with the regular webhook signature check.
+func (s *Autoscaler) recreateMetadata(ginCtx *gin.Context, job Job, src Source) []*computepb.Items {
+
+	jobJSON, _ := json.Marshal(job)
+	recreateUrl := createCallbackUrl(ginCtx, s.conf.RouteRecreateVm, s.conf.SourceQueryParam, src.Name)
+	recreateSig := CalcSigHex([]byte(src.Secret), jobJSON)
+	// An empty grep pattern would match everything, so never store empty.
+	// Coupled to the Terraform variable runner_job_log_pattern.
+	jobPattern := s.conf.RunnerJobLogPattern
+	if jobPattern == "" {
+		jobPattern = DefaultRunnerJobLogPattern
+	}
+	return []*computepb.Items{
+		{
+			Key:   proto.String("shutdown-script"),
+			Value: proto.String(shutdownScriptValue),
+		},
+		{
+			Key:   proto.String(RECREATE_CALLBACK_URL_ATTR),
+			Value: proto.String(recreateUrl),
+		},
+		{
+			Key:   proto.String(RECREATE_CALLBACK_PAYLOAD_ATTR),
+			Value: proto.String(string(jobJSON)),
+		},
+		{
+			Key:   proto.String(RECREATE_CALLBACK_SIG_ATTR),
+			Value: proto.String(recreateSig),
+		},
+		{
+			Key:   proto.String(RECREATE_CALLBACK_JOB_PATTERN_ATTR),
+			Value: proto.String(jobPattern),
+		},
 	}
 }
 
@@ -1125,7 +1244,12 @@ func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 	log.Info("Received create-vm cloud task callback")
 	if data, src, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
-		json.Unmarshal(data, &job)
+		if err := json.Unmarshal(data, &job); err != nil || job.Id == 0 {
+			// Corrupt or missing payload: retrying can't help, so ack with 200.
+			log.Warnf("Create-vm callback has invalid or zero-id job payload - skipping")
+			ctx.Status(http.StatusOK)
+			return
+		}
 		opCtx, cancel := s.opContext()
 		defer cancel()
 		// Deterministic name derived from the job id makes create-vm retries idempotent.
@@ -1136,14 +1260,14 @@ func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 		switch src.SourceType {
 		case TypeEnterprise:
 			log.Infof("Using jit config for runner registration for enterprise: %s", src.Name)
-			s.createVmWithJitConfig(ctx, opCtx, fmt.Sprintf(RUNNER_ENTERPRISE_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, settings, job.Labels)
+			s.createVmWithJitConfig(ctx, opCtx, fmt.Sprintf(RUNNER_ENTERPRISE_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, settings, job.Labels, job, src)
 		case TypeOrganization:
 			log.Infof("Using jit config for runner registration for organization: %s", src.Name)
-			s.createVmWithJitConfig(ctx, opCtx, fmt.Sprintf(RUNNER_ORG_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, settings, job.Labels)
+			s.createVmWithJitConfig(ctx, opCtx, fmt.Sprintf(RUNNER_ORG_JIT_CONFIG_ENDPOINT, src.Name), s.conf.RunnerGroupId, settings, job.Labels, job, src)
 		case TypeRepository:
 			log.Infof("Using jit config for runner registration for repository: %s", src.Name)
 			// for repositories there is an implicit runner group with id 1
-			s.createVmWithJitConfig(ctx, opCtx, fmt.Sprintf(RUNNER_REPO_JIT_CONFIG_ENDPOINT, src.Name), 1, settings, job.Labels)
+			s.createVmWithJitConfig(ctx, opCtx, fmt.Sprintf(RUNNER_REPO_JIT_CONFIG_ENDPOINT, src.Name), 1, settings, job.Labels, job, src)
 		default:
 			log.Errorf("Missing source type for %s", src.Name)
 			ctx.Status(http.StatusBadRequest)
@@ -1158,7 +1282,12 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 	log.Info("Received delete-vm cloud task callback")
 	if data, _, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
-		json.Unmarshal(data, &job)
+		if err := json.Unmarshal(data, &job); err != nil || job.Id == 0 {
+			// Corrupt or missing payload: retrying can't help, so ack with 200.
+			log.Warnf("Delete-vm callback has invalid or zero-id job payload - skipping")
+			ctx.Status(http.StatusOK)
+			return
+		}
 		if !IsOwnedRunnerName(s.conf.RunnerPrefix, job.RunnerName) {
 			// Either empty (the job was never picked up, e.g. cancelled while queued)
 			// or a name that isn't one of our runners. Don't issue a delete for an
@@ -1183,6 +1312,40 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 	}
 }
 
+func (s *Autoscaler) handleRecreateVm(ctx *gin.Context) {
+
+	log.Info("Received recreate-vm callback from a shutting-down runner VM")
+	if data, src, err := s.verifySignature(ctx); err == nil {
+		job := Job{}
+		if err := json.Unmarshal(data, &job); err != nil || job.Id == 0 {
+			// Corrupt or missing payload: retrying can't help, so ack with 200.
+			log.Warnf("Recreate-vm callback has invalid or zero-id job payload - skipping")
+			ctx.Status(http.StatusOK)
+			return
+		}
+		log.Infof("Recreate-vm callback for job %d - VM died before accepting a job, re-enqueueing create task", job.Id)
+		createUrl := createCallbackUrl(ctx, s.conf.RouteCreateVm, s.conf.SourceQueryParam, src.Name)
+
+		createTask := s.createTaskFn
+		if createTask == nil {
+			createTask = s.CreateCallbackTaskWithToken
+		}
+		// The enqueue runs on opCtx, not the request context: the dying VM's curl has
+		// a short timeout and never retries, so a request-deadline cancellation
+		// mid-enqueue would silently lose the only recreate signal for this job.
+		opCtx, cancel := s.opContext()
+		defer cancel()
+		// CreateCallbackTaskWithToken's tombstone suffix bumping caps total creates
+		// per job id - this is the recreate loop protection.
+		if err := createTask(opCtx, TaskKindCreate, createUrl, src.Secret, job, recreateVmDelay); err != nil {
+			log.Errorf("Can not enqueue create-vm cloud task callback for recreate: %s", err.Error())
+			ctx.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
+		ctx.Status(http.StatusOK)
+	}
+}
+
 func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 
 	log.Info("Received webhook")
@@ -1198,6 +1361,10 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 				log.Errorf("Can not unmarshal payload - is the webhook content type set to \"application/json\"? %s", err.Error())
 				ctx.AbortWithError(http.StatusBadRequest, err)
 			} else {
+				// Copy the top-level repository into the job so it survives the Cloud
+				// Tasks round-trip (the task body is the marshaled Job). Used for
+				// diagnostics and future job-status lookup.
+				payload.Job.RepositoryFullName = payload.Repository.FullName
 				if payload.Action == QUEUED {
 					if payload.Job.HasLegacyMagicLabel() {
 						// Skip the create-vm callback: a runner we spawn for this job can
@@ -1233,7 +1400,9 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 						if ok, reason := payload.Job.HasAnyLabelGroup(s.conf.RunnerLabelGroups); ok {
 
 							// if the user immediately cancels a workflow we have the chance to delete the callback if not older than 10 seconds - best effort, ignore all errors
-							s.DeleteCallbackTask(ctx, payload.Job)
+							if err := s.DeleteCallbackTask(ctx, payload.Job); err != nil {
+								log.Warnf("Can not delete create-vm cloud task callback: %s", err.Error())
+							}
 
 							deleteUrl := createCallbackUrl(ctx, s.conf.RouteDeleteVm, s.conf.SourceQueryParam, src.Name)
 							if err := s.CreateCallbackTaskWithToken(ctx, TaskKindDelete, deleteUrl, src.Secret, payload.Job, 1*time.Second); err != nil {
@@ -1270,6 +1439,7 @@ type AutoscalerConfig struct {
 	RouteWebhook     string
 	RouteCreateVm    string
 	RouteDeleteVm    string
+	RouteRecreateVm  string
 	ProjectId        string
 	Zones            []string
 	TaskQueue        string
@@ -1286,6 +1456,7 @@ type AutoscalerConfig struct {
 	RegisteredSources        map[string]Source
 	SourceQueryParam         string
 	CreateVmDelay            int64
+	RunnerJobLogPattern      string
 	Simulate                 bool
 }
 
@@ -1316,6 +1487,12 @@ type Autoscaler struct {
 	// compute-client-backed implementations are used.
 	tryInsertFn    func(ctx context.Context, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error
 	deleteInZoneFn func(ctx context.Context, instanceName string, zone string) (bool, error)
+
+	// createTaskFn / jitConfigFn / instanceStateFn are test seams for Cloud Tasks
+	// enqueue, JIT-config generation, and instance-state lookup. nil in production.
+	createTaskFn    func(ctx context.Context, kind string, url string, secret string, job Job, delay time.Duration) error
+	jitConfigFn     func(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error)
+	instanceStateFn func(ctx context.Context, instanceName string) (bool, State, error)
 }
 
 func NewAutoscaler(config AutoscalerConfig) *Autoscaler {
@@ -1330,6 +1507,11 @@ func NewAutoscaler(config AutoscalerConfig) *Autoscaler {
 	engine.POST(config.RouteCreateVm, scaler.handleCreateVm)
 	engine.POST(config.RouteDeleteVm, scaler.handleDeleteVm)
 	engine.POST(config.RouteWebhook, scaler.handleWebhook)
+	// Register the recreate-vm route only when configured, for backward
+	// compatibility with callers that don't set RouteRecreateVm.
+	if config.RouteRecreateVm != "" {
+		engine.POST(config.RouteRecreateVm, scaler.handleRecreateVm)
+	}
 	engine.GET("/healthcheck", func(ctx *gin.Context) { ctx.Status(http.StatusOK) })
 	return &scaler
 }

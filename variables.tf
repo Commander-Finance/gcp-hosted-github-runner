@@ -255,6 +255,6 @@ variable "simulate" {
 
 variable "run_setup_on_runner_machines" {
   type        = bool
-  description = "If true, the startup script will install required dependencies (docker.io, docker-buildx, curl, sed, jq, and any github_runner_packages) and add the 'agent' user with required permissions. Set to false if you are using a custom image that already contains all required dependencies."
+  description = "If true, the startup script will install required dependencies (docker.io, docker-buildx, curl, sed, jq, and any github_runner_packages), add the 'agent' user with required permissions, and run the runner's installdependencies.sh at boot. Set to false when using a prebuilt image that already has these baked in: installdependencies.sh is then skipped at boot, because re-running apt races background dpkg activity and a transient failure would shut the VM down, orphaning its queued job. The systemd template patching and svc.sh install/start always run at boot regardless of this setting - they are local-only, idempotent, and required to register the unit."
   default     = true
 }

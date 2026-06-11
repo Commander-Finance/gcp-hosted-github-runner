@@ -105,6 +105,24 @@ resource "google_cloud_run_v2_service" "autoscaler" {
         name  = "AUTOSCALER_VERSION"
         value = local.runnerDockerTag
       }
+      env {
+        # Route served by the autoscaler for recreate-VM callbacks posted by
+        # the per-instance shutdown script when a runner dies without accepting
+        # a job (spot preemption pre-pickup, register/dispatch timeout). Kept
+        # as an env var (matching ROUTE_WEBHOOK) so the route can be overridden
+        # without a code change.
+        name  = "ROUTE_RECREATE_VM"
+        value = "/recreate_vm"
+      }
+      env {
+        # journald log substring the shutdown script uses to decide whether this
+        # runner ever accepted a workflow job. Must match the pattern the startup
+        # script uses for its Phase-2 dispatch-wait (runner_job_log_pattern),
+        # keeping both sides of the job-accepted check in sync via a single
+        # variable.
+        name  = "RUNNER_JOB_LOG_PATTERN"
+        value = var.runner_job_log_pattern
+      }
       dynamic "env" {
         for_each = var.force_cloud_run_deployment ? [0] : []
         content {

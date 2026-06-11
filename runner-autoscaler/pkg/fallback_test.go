@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -281,4 +282,25 @@ func TestAutoscalerConfigValidateRejectsEmptyRunnerPrefix(t *testing.T) {
 	// autoscaler run in a broken state.
 	require.Error(t, AutoscalerConfig{RunnerPrefix: ""}.Validate())
 	require.NoError(t, AutoscalerConfig{RunnerPrefix: "runner"}.Validate())
+}
+
+// RepositoryFullName must survive a JSON marshal/unmarshal round-trip and must
+// be keyed "repository_full_name" in the wire format. The recreate-vm flow
+// embeds the whole Job struct in VM instance metadata as JSON, and the recreate
+// callback handler unmarshals it back — if the field were dropped or renamed the
+// handler would reconstruct a Job that looks valid (non-zero Id) but lacks the
+// repo context needed for JIT-config generation.
+func TestJobRepositoryFullNameSurvivesJsonRoundTrip(t *testing.T) {
+
+	original := Job{Id: 42, RepositoryFullName: "owner/repo"}
+	data, err := json.Marshal(original)
+	require.NoError(t, err)
+
+	// Wire format must use the snake_case JSON tag, not the Go field name.
+	assert.Contains(t, string(data), `"repository_full_name"`, "JSON must use the repository_full_name key")
+
+	var result Job
+	require.NoError(t, json.Unmarshal(data, &result))
+	assert.Equal(t, "owner/repo", result.RepositoryFullName, "RepositoryFullName must survive the round-trip")
+	assert.Equal(t, int64(42), result.Id, "Id must survive the round-trip alongside RepositoryFullName")
 }
