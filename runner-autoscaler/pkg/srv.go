@@ -224,6 +224,22 @@ func splitTrimmed(raw, sep string) []string {
 	return parts
 }
 
+// dedupePreserveOrder returns in with later duplicates removed, keeping the first
+// occurrence of each value in its original position.
+func dedupePreserveOrder(in []string) []string {
+
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
 // ParseLabelGroups decodes the RUNNER_LABELS env value into the OR-of-ANDs
 // shape: groups separated by ';', labels within a group by ','. Whitespace is
 // trimmed per label; empty labels and empty groups are dropped.
@@ -857,7 +873,10 @@ func (s *Autoscaler) legacyPlan(zones []string, primaryModel string, machineType
 // the attempt count to fit the create deadline.
 func (s *Autoscaler) familyFallbackPlan(zones []string, primaryModel string) []creationAttempt {
 
-	fams := s.conf.MachineTypeFallbacks
+	// De-duplicate (preserving order) so a repeated family can't waste a creation
+	// attempt or let the capped STANDARD pass spend both slots on the same type and
+	// skip a later distinct fallback - the plan is genuinely one-attempt-per-family.
+	fams := dedupePreserveOrder(s.conf.MachineTypeFallbacks)
 	plan := make([]creationAttempt, 0, len(fams)+standardFallbackFamilies)
 
 	for i, fam := range fams {
@@ -968,12 +987,12 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 			return nil
 		}
 		if IsCapacityError(err) {
-			log.Warnf("Capacity error creating instance %s (%s, %s): %s - trying next zone/model", instanceName, attempt.zone, attempt.provisioningModel, err.Error())
+			log.Warnf("Capacity error creating instance %s (%s, %s, %s): %s - trying next zone/model", instanceName, attempt.zone, attempt.machineType, attempt.provisioningModel, err.Error())
 			lastErr = err
 			continue
 		}
 		// Non-retryable error (bad template, permission, invalid machine type, ...).
-		log.Errorf("Could not create instance %s (%s) from %s template: %s", instanceName, attempt.zone, attempt.provisioningModel, err.Error())
+		log.Errorf("Could not create instance %s (%s, %s) from %s template: %s", instanceName, attempt.zone, attempt.machineType, attempt.provisioningModel, err.Error())
 		return err
 	}
 

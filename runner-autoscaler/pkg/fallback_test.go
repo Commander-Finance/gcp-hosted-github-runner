@@ -239,6 +239,7 @@ func TestCreateInstanceFamilyFallbackExhaustionReturnsCapacityError(t *testing.T
 
 	err := s.CreateInstanceFromTemplate(context.Background(), "runner-7", nil)
 	require.Error(t, err)
+	assert.True(t, IsCapacityError(err), "must surface a capacity error after exhausting all fallbacks")
 	assert.Len(t, attempts, len(testFamilies)+standardFallbackFamilies) // 7 spot + 2 standard
 }
 
@@ -255,7 +256,26 @@ func TestCreateInstanceFamilyFallbackInvalidTypeIsFatal(t *testing.T) {
 
 	err := s.CreateInstanceFromTemplate(context.Background(), "runner-7", nil)
 	require.Error(t, err)
+	assert.False(t, IsCapacityError(err), "invalid machine types must stay non-capacity fatal errors")
+	assert.Contains(t, err.Error(), "resource.machineType")
 	assert.Len(t, attempts, 1, "a non-capacity error must abort without trying the next family")
+}
+
+// A duplicated fallback entry must not waste a creation attempt: the plan is one attempt
+// per DISTINCT family (and the capped on-demand pass still reaches a later distinct one).
+func TestCreationPlanFamilyFallbackDedupes(t *testing.T) {
+
+	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, []string{"n4-standard-2", "n4-standard-2", "c4-standard-2"})
+	plan := s.creationPlan("runner-7", nil)
+
+	// 2 distinct SPOT attempts + 2 on-demand (clamped to the 2 distinct families).
+	require.Len(t, plan, 4)
+	assert.Equal(t, "n4-standard-2", plan[0].machineType)
+	assert.Equal(t, "c4-standard-2", plan[1].machineType)
+	assert.Equal(t, "spot", plan[1].provisioningModel)
+	assert.Equal(t, "standard", plan[2].provisioningModel)
+	assert.Equal(t, "n4-standard-2", plan[2].machineType)
+	assert.Equal(t, "c4-standard-2", plan[3].machineType)
 }
 
 // With a single-family fallback list and a SPOT template, the STANDARD pass is clamped
