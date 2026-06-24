@@ -211,6 +211,35 @@ func (j Job) hasAllLabels(labels []string) []string {
 	return missingLabels
 }
 
+// splitTrimmed splits raw on sep, trims whitespace from each element, and drops the
+// empties — the shared shape behind the comma/semicolon-separated env-list parsers.
+func splitTrimmed(raw, sep string) []string {
+
+	parts := []string{}
+	for _, p := range strings.Split(raw, sep) {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return parts
+}
+
+// dedupePreserveOrder returns in with later duplicates removed, keeping the first
+// occurrence of each value in its original position.
+func dedupePreserveOrder(in []string) []string {
+
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
 // ParseLabelGroups decodes the RUNNER_LABELS env value into the OR-of-ANDs
 // shape: groups separated by ';', labels within a group by ','. Whitespace is
 // trimmed per label; empty labels and empty groups are dropped.
@@ -218,17 +247,20 @@ func ParseLabelGroups(raw string) [][]string {
 
 	groups := [][]string{}
 	for _, rawGroup := range strings.Split(raw, ";") {
-		group := []string{}
-		for _, label := range strings.Split(rawGroup, ",") {
-			if trimmed := strings.TrimSpace(label); trimmed != "" {
-				group = append(group, trimmed)
-			}
-		}
-		if len(group) > 0 {
+		if group := splitTrimmed(rawGroup, ","); len(group) > 0 {
 			groups = append(groups, group)
 		}
 	}
 	return groups
+}
+
+// ParseMachineTypeFallbacks decodes the RUNNER_MACHINE_TYPE_FALLBACKS env value (a
+// comma-separated list of machine types) into an ordered slice. Whitespace is trimmed
+// per entry and empties are dropped, so an empty/blank value yields an empty slice
+// (legacy behavior: no family fallback).
+func ParseMachineTypeFallbacks(raw string) []string {
+
+	return splitTrimmed(raw, ",")
 }
 
 // FormatLabelGroups renders groups as `[a, b], [c, d]`, or `(none)` if empty.
@@ -760,47 +792,126 @@ func decideCreate(found bool, state State) createDecision {
 	return createSkip
 }
 
-// creationAttempt is a single (template, zone, provisioning model) tuple to try.
+// creationAttempt is a single (template, zone, provisioning model, machine type) tuple
+// to try. machineType is "" when the template's own machine_type should be used.
 type creationAttempt struct {
 	template          string
 	zone              string
 	provisioningModel string // "spot" or "standard"
+	machineType       string // "" => the template's default machine_type
 }
 
-// creationPlan returns the ordered list of creation attempts. The primary template
-// is tried across EVERY configured zone first; only when the primary is SPOT
-// (FallbackInstanceTemplate is set) is the on-demand (STANDARD) template appended,
-// again across every zone. This guarantees SPOT is attempted everywhere it is
-// feasible before any on-demand fallback. Pure (no I/O) so the ordering is testable.
-func (s *Autoscaler) creationPlan(instanceName string) []creationAttempt {
+// standardFallbackFamilies bounds how many configured machine types are retried on the
+// on-demand (STANDARD) template after the SPOT family sweep. Keeping it small keeps the
+// worst-case attempt count inside the Cloud Tasks dispatch deadline (see the deadline
+// budget in TestCreationPlanFamilyFallbackBoundsAttemptCount / autoscaler_timeout).
+const standardFallbackFamilies = 2
 
-	type tmpl struct{ template, model string }
+// creationPlan returns the ordered list of creation attempts.
+//
+//   - With a magic-label machine type (override != nil) OR no MachineTypeFallbacks
+//     configured, it returns the legacy shape: the primary template across EVERY zone,
+//     then (when the primary is SPOT) the on-demand template across every zone. A magic
+//     label stamps that exact type on every attempt; otherwise machineType stays "".
+//   - With a fallback list and no magic label, it returns the family-fallback shape (see
+//     familyFallbackPlan): one attempt per machine type on the SPOT template (rotating
+//     zones), then the top few on-demand.
+//
+// Pure (no I/O) so the ordering is testable.
+func (s *Autoscaler) creationPlan(instanceName string, override *string) []creationAttempt {
+
+	zones := s.OrderedZones(instanceName)
+	if len(zones) == 0 {
+		return []creationAttempt{}
+	}
+
 	primaryModel := "standard"
 	if s.conf.FallbackInstanceTemplate != "" {
 		// A fallback template only exists when the primary is preemptible/SPOT.
 		primaryModel = "spot"
 	}
+
+	// Family fallback applies only to the default pool (no magic-label override) and
+	// only when a fallback list is configured.
+	if override == nil && len(s.conf.MachineTypeFallbacks) > 0 {
+		return s.familyFallbackPlan(zones, primaryModel)
+	}
+
+	machineType := ""
+	if override != nil {
+		machineType = *override
+	}
+	return s.legacyPlan(zones, primaryModel, machineType)
+}
+
+// legacyPlan is the original template×zone sweep: the primary template across every
+// zone, then (when the primary is SPOT) the on-demand template across every zone. Every
+// attempt carries the given machineType ("" = template default).
+func (s *Autoscaler) legacyPlan(zones []string, primaryModel string, machineType string) []creationAttempt {
+
+	type tmpl struct{ template, model string }
 	templates := []tmpl{{s.conf.InstanceTemplate, primaryModel}}
 	if s.conf.FallbackInstanceTemplate != "" {
 		templates = append(templates, tmpl{s.conf.FallbackInstanceTemplate, "standard"})
 	}
 
-	zones := s.OrderedZones(instanceName)
 	plan := make([]creationAttempt, 0, len(templates)*len(zones))
 	for _, t := range templates {
 		for _, zone := range zones {
-			plan = append(plan, creationAttempt{template: t.template, zone: zone, provisioningModel: t.model})
+			plan = append(plan, creationAttempt{template: t.template, zone: zone, provisioningModel: t.model, machineType: machineType})
 		}
 	}
 	return plan
 }
 
-// tryInsertInstance attempts a single Insert+Wait for one creation attempt.
-func (s *Autoscaler) tryInsertInstance(ctx context.Context, client *InstanceClient, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error {
+// familyFallbackPlan tries each configured machine type once on the primary template,
+// rotating zones for incidental zone diversity, then (when the primary is SPOT) retries
+// the first standardFallbackFamilies types on the on-demand template as a last-resort
+// backstop. One attempt per family — rather than family×zone — is deliberate: capacity
+// for a family tends to be correlated across a region's zones but uncorrelated across
+// families, so rotating families is far more valuable than rotating zones, and it bounds
+// the attempt count to fit the create deadline.
+func (s *Autoscaler) familyFallbackPlan(zones []string, primaryModel string) []creationAttempt {
+
+	// De-duplicate (preserving order) so a repeated family can't waste a creation
+	// attempt or let the capped STANDARD pass spend both slots on the same type and
+	// skip a later distinct fallback - the plan is genuinely one-attempt-per-family.
+	fams := dedupePreserveOrder(s.conf.MachineTypeFallbacks)
+	plan := make([]creationAttempt, 0, len(fams)+standardFallbackFamilies)
+
+	for i, fam := range fams {
+		plan = append(plan, creationAttempt{
+			template:          s.conf.InstanceTemplate,
+			zone:              zones[i%len(zones)],
+			provisioningModel: primaryModel,
+			machineType:       fam,
+		})
+	}
+
+	if s.conf.FallbackInstanceTemplate != "" {
+		n := standardFallbackFamilies
+		if n > len(fams) {
+			n = len(fams)
+		}
+		for i := 0; i < n; i++ {
+			plan = append(plan, creationAttempt{
+				template:          s.conf.FallbackInstanceTemplate,
+				zone:              zones[i%len(zones)],
+				provisioningModel: "standard",
+				machineType:       fams[i],
+			})
+		}
+	}
+	return plan
+}
+
+// tryInsertInstance attempts a single Insert+Wait for one creation attempt. The machine
+// type comes from the attempt ("" => the source template's default machine_type).
+func (s *Autoscaler) tryInsertInstance(ctx context.Context, client *InstanceClient, attempt creationAttempt, instanceName string, metadata []*computepb.Items) error {
 
 	var machine *string
-	if machineType != nil {
-		machine = proto.String(fmt.Sprintf("zones/%s/machineTypes/%s", attempt.zone, *machineType))
+	if attempt.machineType != "" {
+		machine = proto.String(fmt.Sprintf("zones/%s/machineTypes/%s", attempt.zone, attempt.machineType))
 	}
 	res, err := client.Insert(ctx, &computepb.InsertInstanceRequest{
 		Project: s.conf.ProjectId,
@@ -838,7 +949,7 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 		return nil
 	}
 
-	plan := s.creationPlan(instanceName)
+	plan := s.creationPlan(instanceName, machineType)
 	if len(plan) == 0 {
 		// No attempt would run (no zones configured) - surface it instead of
 		// silently reporting success.
@@ -846,25 +957,27 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 	}
 
 	// tryInsert is a seam: tests inject a fake; in production we build one compute
-	// client and reuse it across every attempt.
+	// client and reuse it across every attempt. The machine type now travels on each
+	// attempt, so the closure no longer needs a separate parameter.
 	tryInsert := s.tryInsertFn
 	if tryInsert == nil {
 		client := newComputeClient(ctx)
 		defer client.Close()
-		tryInsert = func(ctx context.Context, attempt creationAttempt, name string, mt *string, md []*computepb.Items) error {
-			return s.tryInsertInstance(ctx, client, attempt, name, mt, md)
+		tryInsert = func(ctx context.Context, attempt creationAttempt, name string, md []*computepb.Items) error {
+			return s.tryInsertInstance(ctx, client, attempt, name, md)
 		}
 	}
 
 	var lastErr error
 	for _, attempt := range plan {
-		log.Debugf("About to create instance %s (%s) from %s template", instanceName, attempt.zone, attempt.provisioningModel)
-		err := tryInsert(ctx, attempt, instanceName, machineType, metadata)
+		log.Debugf("About to create instance %s (%s, %s) from %s template", instanceName, attempt.zone, attempt.machineType, attempt.provisioningModel)
+		err := tryInsert(ctx, attempt, instanceName, metadata)
 		if err == nil {
 			log.WithFields(log.Fields{
 				"instance":           instanceName,
 				"zone":               attempt.zone,
 				"provisioning_model": attempt.provisioningModel,
+				"machine_type":       attempt.machineType,
 			}).Infof("Created instance %s (%s) as %s", instanceName, attempt.zone, attempt.provisioningModel)
 			return nil
 		}
@@ -874,12 +987,12 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 			return nil
 		}
 		if IsCapacityError(err) {
-			log.Warnf("Capacity error creating instance %s (%s, %s): %s - trying next zone/model", instanceName, attempt.zone, attempt.provisioningModel, err.Error())
+			log.Warnf("Capacity error creating instance %s (%s, %s, %s): %s - trying next zone/model", instanceName, attempt.zone, attempt.machineType, attempt.provisioningModel, err.Error())
 			lastErr = err
 			continue
 		}
 		// Non-retryable error (bad template, permission, invalid machine type, ...).
-		log.Errorf("Could not create instance %s (%s) from %s template: %s", instanceName, attempt.zone, attempt.provisioningModel, err.Error())
+		log.Errorf("Could not create instance %s (%s, %s) from %s template: %s", instanceName, attempt.zone, attempt.machineType, attempt.provisioningModel, err.Error())
 		return err
 	}
 
@@ -1480,15 +1593,21 @@ type AutoscalerConfig struct {
 	// primary (SPOT) template is capacity-exhausted in every zone. Empty when the
 	// primary is already on-demand (no fallback needed).
 	FallbackInstanceTemplate string
-	SecretVersion            string
-	RunnerPrefix             string
-	RunnerGroupId            int64
-	RunnerLabelGroups        [][]string
-	RegisteredSources        map[string]Source
-	SourceQueryParam         string
-	CreateVmDelay            int64
-	RunnerJobLogPattern      string
-	Simulate                 bool
+	// MachineTypeFallbacks is the ordered list of x86-64 machine types the autoscaler
+	// tries (in region) when a job has NO gce-machine-* magic label and capacity is
+	// exhausted for the current type. Empty => legacy behavior (the template's default
+	// machine_type, no family fallback). A magic label always overrides this list.
+	// Every entry must be compatible with the instance template's disk type.
+	MachineTypeFallbacks []string
+	SecretVersion        string
+	RunnerPrefix         string
+	RunnerGroupId        int64
+	RunnerLabelGroups    [][]string
+	RegisteredSources    map[string]Source
+	SourceQueryParam     string
+	CreateVmDelay        int64
+	RunnerJobLogPattern  string
+	Simulate             bool
 }
 
 // Validate checks startup invariants that, if violated, would leave the
@@ -1516,7 +1635,7 @@ type Autoscaler struct {
 	// tryInsertFn / deleteInZoneFn are test seams for intercepting individual
 	// VM-creation / per-zone-delete attempts. nil in production, where the real
 	// compute-client-backed implementations are used.
-	tryInsertFn    func(ctx context.Context, attempt creationAttempt, instanceName string, machineType *string, metadata []*computepb.Items) error
+	tryInsertFn    func(ctx context.Context, attempt creationAttempt, instanceName string, metadata []*computepb.Items) error
 	deleteInZoneFn func(ctx context.Context, instanceName string, zone string) (bool, error)
 
 	// createTaskFn / jitConfigFn / instanceStateFn are test seams for Cloud Tasks

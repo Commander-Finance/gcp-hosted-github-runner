@@ -4,6 +4,24 @@ variable "machine_type" {
   default     = "e2-micro"
 }
 
+variable "machine_type_fallbacks" {
+  type        = list(string)
+  description = <<-EOT
+    Ordered list of x86-64 machine types the autoscaler tries (in region) when a job
+    has NO gce-machine-* magic label and capacity is exhausted for the current type.
+    On a capacity error it moves to the next family rather than only the next zone, so a
+    region-wide stockout of one family no longer hangs the job. Empty (default) preserves
+    legacy behavior: the template's machine_type with no family fallback. A gce-machine-*
+    magic label always overrides this list (that exact type is used, fallback disabled).
+
+    All entries MUST be compatible with the instance template's disk_type — e.g. with a
+    hyperdisk-balanced template, every family must support Hyperdisk Balanced (C4/C4D/C3/
+    C3D/N4/N2/N2D/T2D do; E2/N1/C2/C2D do not). An incompatible or non-existent family
+    yields a non-capacity (fatal) error, not a skippable one.
+  EOT
+  default     = []
+}
+
 variable "disk_type" {
   type        = string
   description = "The VM instance disk type"

@@ -234,7 +234,7 @@ func TestHandleCreateVmRejectsZeroJobId(t *testing.T) {
 		jitCalled = true
 		return "fake-jit-config", nil
 	}
-	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
 		insertCalled = true
 		return nil
 	}
@@ -292,7 +292,7 @@ func createMetadataScaler(secret string, jobLogPattern string, capturedMetadata 
 	s.jitConfigFn = func(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error) {
 		return "fake-jit-config-value", nil
 	}
-	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
 		*capturedMetadata = md
 		return nil
 	}
