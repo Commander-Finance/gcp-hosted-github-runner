@@ -27,7 +27,7 @@ func spotFallbackScaler(zones []string) *Autoscaler {
 func TestCreationPlanSpotFirstThenStandard(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"z1", "z2", "z3"})
-	plan := s.creationPlan("runner-7")
+	plan := s.creationPlan("runner-7", nil)
 
 	require.Len(t, plan, 6) // 2 templates x 3 zones
 	// All SPOT/primary attempts come first, then all STANDARD/ondemand attempts.
@@ -54,7 +54,7 @@ func TestCreationPlanSpotFirstThenStandard(t *testing.T) {
 func TestCreationPlanEmptyWhenNoZones(t *testing.T) {
 
 	s := &Autoscaler{conf: AutoscalerConfig{InstanceTemplate: "primary", FallbackInstanceTemplate: "ondemand"}}
-	assert.Empty(t, s.creationPlan("runner-7"))
+	assert.Empty(t, s.creationPlan("runner-7", nil))
 }
 
 func TestIsStoppedPredicate(t *testing.T) {
@@ -85,6 +85,213 @@ func TestDecideCreate(t *testing.T) {
 	}
 }
 
+func TestParseMachineTypeFallbacks(t *testing.T) {
+
+	assert.Empty(t, ParseMachineTypeFallbacks(""), "blank => no fallback (legacy)")
+	assert.Empty(t, ParseMachineTypeFallbacks("  ,  ,"), "only separators/space => empty")
+	assert.Equal(t,
+		[]string{"n4-standard-2", "c4-standard-2", "c4d-standard-2"},
+		ParseMachineTypeFallbacks(" n4-standard-2 , c4-standard-2,c4d-standard-2 "),
+		"trims whitespace, drops empties, preserves order",
+	)
+}
+
+// familyScaler builds a SPOT-primary scaler with a configured machine-type fallback list.
+func familyScaler(zones, fams []string) *Autoscaler {
+	return &Autoscaler{conf: AutoscalerConfig{
+		Zones:                    zones,
+		InstanceTemplate:         "primary",
+		FallbackInstanceTemplate: "ondemand", // non-empty => primary is SPOT
+		MachineTypeFallbacks:     fams,
+	}}
+}
+
+var testFamilies = []string{
+	"n4-standard-2", "c4-standard-2", "c4d-standard-2", "c4d-highmem-2",
+	"n4d-standard-2", "c3d-standard-4", "c3-standard-4",
+}
+
+// With a fallback list and no magic label, the plan tries each family once on the SPOT
+// (primary) template rotating zones, then the first standardFallbackFamilies on-demand.
+func TestCreationPlanFamilyFallbackOrder(t *testing.T) {
+
+	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, testFamilies)
+	plan := s.creationPlan("runner-7", nil)
+	ordered := s.OrderedZones("runner-7")
+
+	require.Len(t, plan, len(testFamilies)+standardFallbackFamilies) // 7 + 2 = 9
+
+	// SPOT pass: one attempt per family, in list order, rotating zones.
+	for i, fam := range testFamilies {
+		assert.Equal(t, "spot", plan[i].provisioningModel, "attempt %d", i)
+		assert.Equal(t, "primary", plan[i].template, "attempt %d", i)
+		assert.Equal(t, fam, plan[i].machineType, "attempt %d", i)
+		assert.Equal(t, ordered[i%len(ordered)], plan[i].zone, "attempt %d zone", i)
+	}
+	// STANDARD pass: first standardFallbackFamilies families on the on-demand template.
+	for i := 0; i < standardFallbackFamilies; i++ {
+		a := plan[len(testFamilies)+i]
+		assert.Equal(t, "standard", a.provisioningModel, "standard attempt %d", i)
+		assert.Equal(t, "ondemand", a.template, "standard attempt %d", i)
+		assert.Equal(t, testFamilies[i], a.machineType, "standard attempt %d", i)
+	}
+}
+
+// A magic-label machine type disables family fallback: that exact type is stamped on
+// every attempt and the plan keeps the legacy template×zone shape.
+func TestCreationPlanMagicLabelDisablesFamilyFallback(t *testing.T) {
+
+	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, testFamilies)
+	override := "c2d-standard-16"
+	plan := s.creationPlan("runner-7", &override)
+
+	require.Len(t, plan, 8) // legacy 2 templates x 4 zones, NOT the family shape
+	for i, a := range plan {
+		assert.Equal(t, override, a.machineType, "attempt %d", i)
+	}
+	for i := 0; i < 4; i++ {
+		assert.Equal(t, "spot", plan[i].provisioningModel, "attempt %d", i)
+	}
+	for i := 4; i < 8; i++ {
+		assert.Equal(t, "standard", plan[i].provisioningModel, "attempt %d", i)
+	}
+}
+
+// An empty fallback list with no magic label is byte-for-byte the legacy plan: the
+// template default machine type (empty) on the legacy template×zone shape.
+func TestCreationPlanEmptyFallbackListIsLegacy(t *testing.T) {
+
+	s := spotFallbackScaler([]string{"z1", "z2", "z3"}) // no MachineTypeFallbacks
+	plan := s.creationPlan("runner-7", nil)
+
+	require.Len(t, plan, 6) // 2 templates x 3 zones
+	for i, a := range plan {
+		assert.Equal(t, "", a.machineType, "attempt %d must use the template default", i)
+	}
+}
+
+// When the primary is already on-demand (no fallback template), family fallback still
+// works on the primary template with no extra STANDARD pass.
+func TestCreationPlanFamilyFallbackNoSpotTemplate(t *testing.T) {
+
+	fams := []string{"n4-standard-2", "c4-standard-2", "c4d-standard-2"}
+	s := &Autoscaler{conf: AutoscalerConfig{
+		Zones:                []string{"z1", "z2"},
+		InstanceTemplate:     "primary",
+		MachineTypeFallbacks: fams, // no FallbackInstanceTemplate => primary is on-demand
+	}}
+	plan := s.creationPlan("runner-7", nil)
+
+	require.Len(t, plan, len(fams)) // no STANDARD pass appended
+	for i, fam := range fams {
+		assert.Equal(t, "standard", plan[i].provisioningModel, "attempt %d", i)
+		assert.Equal(t, "primary", plan[i].template, "attempt %d", i)
+		assert.Equal(t, fam, plan[i].machineType, "attempt %d", i)
+	}
+}
+
+// Deadline-budget guard. The create-vm callback runs under autoscaler_timeout (240s in
+// prod). At ~12s per capacity-failed Insert and ~40s for a success, the safe budget is
+// roughly (240-40)/12 ≈ 16 attempts. Keep the worst-case plan well under that so a
+// near-deadline success still acks before Cloud Tasks retries and spawns a duplicate VM.
+// If a future family-list/timeout change breaks this, revisit the budget deliberately.
+func TestCreationPlanFamilyFallbackBoundsAttemptCount(t *testing.T) {
+
+	const maxCreateAttemptsBudget = 12
+	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, testFamilies)
+	plan := s.creationPlan("runner-7", nil)
+
+	assert.LessOrEqual(t, len(plan), len(testFamilies)+standardFallbackFamilies, "no attempt explosion (e.g. reverting to family×zone)")
+	assert.Less(t, len(plan), maxCreateAttemptsBudget, "plan must fit the deadline budget")
+}
+
+// Family fallback stops at the first successful family and never reaches the STANDARD pass.
+func TestCreateInstanceFamilyFallbackStopsAtFirstSuccess(t *testing.T) {
+
+	fams := []string{"f1", "f2", "f3", "f4", "f5"}
+	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, fams)
+	var attempts []creationAttempt
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
+		attempts = append(attempts, a)
+		if len(attempts) < 4 {
+			return fmt.Errorf("ZONE_RESOURCE_POOL_EXHAUSTED")
+		}
+		return nil // the 4th family succeeds
+	}
+
+	require.NoError(t, s.CreateInstanceFromTemplate(context.Background(), "runner-7", nil))
+	require.Len(t, attempts, 4)
+	assert.Equal(t, "f4", attempts[3].machineType)
+	for i, a := range attempts {
+		assert.Equal(t, "spot", a.provisioningModel, "attempt %d should be SPOT", i)
+	}
+}
+
+// When every family is capacity-exhausted, all 9 attempts run and a capacity error is returned.
+func TestCreateInstanceFamilyFallbackExhaustionReturnsCapacityError(t *testing.T) {
+
+	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, testFamilies)
+	var attempts []creationAttempt
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
+		attempts = append(attempts, a)
+		return fmt.Errorf("ZONE_RESOURCE_POOL_EXHAUSTED")
+	}
+
+	err := s.CreateInstanceFromTemplate(context.Background(), "runner-7", nil)
+	require.Error(t, err)
+	assert.Len(t, attempts, len(testFamilies)+standardFallbackFamilies) // 7 spot + 2 standard
+}
+
+// An invalid/typo'd family yields a non-capacity error, which is fatal: the walk aborts
+// immediately rather than silently limping along on a later family.
+func TestCreateInstanceFamilyFallbackInvalidTypeIsFatal(t *testing.T) {
+
+	s := familyScaler([]string{"z1", "z2"}, []string{"bogus-type", "f2"})
+	var attempts []creationAttempt
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
+		attempts = append(attempts, a)
+		return fmt.Errorf("Invalid value for field 'resource.machineType': 'bogus-type'")
+	}
+
+	err := s.CreateInstanceFromTemplate(context.Background(), "runner-7", nil)
+	require.Error(t, err)
+	assert.Len(t, attempts, 1, "a non-capacity error must abort without trying the next family")
+}
+
+// With a single-family fallback list and a SPOT template, the STANDARD pass is clamped
+// to the family count (1) rather than standardFallbackFamilies — guards the index clamp.
+func TestCreationPlanFamilyFallbackClampsStandardPassToFamilyCount(t *testing.T) {
+
+	s := familyScaler([]string{"z1", "z2"}, []string{"only-fam"})
+	plan := s.creationPlan("runner-7", nil)
+
+	require.Len(t, plan, 2) // 1 SPOT + 1 (clamped) STANDARD
+	assert.Equal(t, "spot", plan[0].provisioningModel)
+	assert.Equal(t, "only-fam", plan[0].machineType)
+	assert.Equal(t, "standard", plan[1].provisioningModel)
+	assert.Equal(t, "ondemand", plan[1].template)
+	assert.Equal(t, "only-fam", plan[1].machineType)
+}
+
+// End-to-end: a magic-label machine type passed to CreateInstanceFromTemplate must reach
+// the Insert (the attempt the seam receives), proving the override travels through the
+// plan and is not dropped by the refactor — even when a fallback list is also configured.
+func TestCreateInstanceMagicLabelStampsMachineTypeOnInsert(t *testing.T) {
+
+	s := familyScaler([]string{"z1", "z2", "z3"}, testFamilies) // fallback list present...
+	var attempts []creationAttempt
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
+		attempts = append(attempts, a)
+		return nil
+	}
+
+	override := "c2d-standard-16"
+	require.NoError(t, s.CreateInstanceFromTemplate(context.Background(), "runner-7", &override))
+	// ...but the magic label wins: a single attempt stamped with the requested type.
+	require.Len(t, attempts, 1)
+	assert.Equal(t, override, attempts[0].machineType)
+}
+
 func TestCreationPlanStandardOnlyWhenNotPreemptible(t *testing.T) {
 
 	// No fallback template => the primary is already on-demand; SPOT must never appear.
@@ -92,7 +299,7 @@ func TestCreationPlanStandardOnlyWhenNotPreemptible(t *testing.T) {
 		Zones:            []string{"z1", "z2"},
 		InstanceTemplate: "primary",
 	}}
-	plan := s.creationPlan("runner-7")
+	plan := s.creationPlan("runner-7", nil)
 
 	require.Len(t, plan, 2)
 	for _, a := range plan {
@@ -105,7 +312,7 @@ func TestCreateInstanceUsesSpotWhenAvailable(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"z1", "z2", "z3"})
 	var attempts []creationAttempt
-	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
 		attempts = append(attempts, a)
 		return nil // first (SPOT) attempt succeeds
 	}
@@ -120,7 +327,7 @@ func TestCreateInstanceFallsBackToStandardOnlyAfterAllSpotZones(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"z1", "z2", "z3"})
 	var attempts []creationAttempt
-	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
 		attempts = append(attempts, a)
 		if a.provisioningModel == "spot" {
 			return fmt.Errorf("ZONE_RESOURCE_POOL_EXHAUSTED") // SPOT exhausted everywhere
@@ -142,7 +349,7 @@ func TestCreateInstanceAbortsOnNonCapacityErrorWithoutFallback(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"z1", "z2", "z3"})
 	var attempts []creationAttempt
-	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
 		attempts = append(attempts, a)
 		return fmt.Errorf("PERMISSION_DENIED: caller lacks compute.instances.create")
 	}
@@ -159,7 +366,7 @@ func TestCreateInstanceReturnsCapacityErrorWhenAllExhausted(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"z1", "z2", "z3"})
 	var attempts []creationAttempt
-	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
 		attempts = append(attempts, a)
 		return fmt.Errorf("ZONE_RESOURCE_POOL_EXHAUSTED")
 	}
@@ -174,7 +381,7 @@ func TestCreateInstanceTreatsAlreadyExistsAsSuccess(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"z1", "z2", "z3"})
 	var attempts []creationAttempt
-	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
 		attempts = append(attempts, a)
 		return fmt.Errorf("The resource 'runner-7' already exists")
 	}
@@ -189,7 +396,7 @@ func TestCreateInstanceFailsWithNoZones(t *testing.T) {
 
 	s := &Autoscaler{conf: AutoscalerConfig{InstanceTemplate: "primary"}}
 	called := false
-	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, mt *string, md []*computepb.Items) error {
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
 		called = true
 		return nil
 	}

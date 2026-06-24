@@ -70,6 +70,14 @@ resource "google_cloud_run_v2_service" "autoscaler" {
         value = var.machine_preemtible ? google_compute_instance_template.runner_instance_ondemand[0].id : ""
       }
       env {
+        # Ordered, comma-separated x86-64 machine types the autoscaler tries (in region)
+        # when a job has no gce-machine-* magic label and capacity is exhausted. Empty =>
+        # legacy behavior (template default machine_type). All entries must be compatible
+        # with the template's disk_type (e.g. Hyperdisk-balanced families).
+        name  = "RUNNER_MACHINE_TYPE_FALLBACKS"
+        value = join(",", var.machine_type_fallbacks)
+      }
+      env {
         name  = "SECRET_VERSION"
         value = "${google_secret_manager_secret.github_pat_token.id}/versions/latest"
       }

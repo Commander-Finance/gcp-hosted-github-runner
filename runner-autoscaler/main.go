@@ -80,8 +80,15 @@ func main() {
 		RegisteredSources:        map[string]pkg.Source{},
 		SourceQueryParam:         getEnvDefault("SOURCE_QUERY_PARAM_NAME", "src"),
 		CreateVmDelay:            getEnvDefaultInt64("CREATE_VM_DELAY", 10),
+		MachineTypeFallbacks:     pkg.ParseMachineTypeFallbacks(getEnvDefault("RUNNER_MACHINE_TYPE_FALLBACKS", "")),
 		RunnerJobLogPattern:      getEnvDefault("RUNNER_JOB_LOG_PATTERN", pkg.DefaultRunnerJobLogPattern),
 		Simulate:                 getEnvDefaultInt64("SIMULATE", 0) == 1,
+	}
+
+	// Echo the parsed machine-type fallback list so a misconfiguration (e.g. a typo or
+	// a disk-incompatible family) is visible at boot rather than only on a failed Insert.
+	if len(config.MachineTypeFallbacks) > 0 {
+		log.Infof("Machine-type fallback list (used when a job has no gce-machine-* label): %s", strings.Join(config.MachineTypeFallbacks, ", "))
 	}
 
 	if enterpriseEnv := strings.Split(getEnvDefault("GITHUB_ENTERPRISE", ""), ";"); len(enterpriseEnv) == 2 {
