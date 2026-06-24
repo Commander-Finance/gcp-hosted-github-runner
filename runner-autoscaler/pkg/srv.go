@@ -503,6 +503,24 @@ func (s *Autoscaler) opContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 }
 
+// maxTaskRPCDeadline bounds how far in the future the gRPC request deadline sent to
+// the Cloud Tasks API may be. Cloud Tasks rejects any request whose deadline is more
+// than 30s in the future ("The deadline cannot be more than 30s in the future"), so a
+// caller that passes a long-lived context - notably the recreate path, which enqueues
+// on the 180s opContext - would otherwise have every CreateTask fail with
+// InvalidArgument, silently dropping the only recreate signal for a job whose VM died
+// before accepting it. 25s stays clear of the 30s cap while leaving room for the
+// in-call AlreadyExists/GetTask retries to complete.
+const maxTaskRPCDeadline = 25 * time.Second
+
+// boundTaskRPCContext caps ctx so the deadline propagated to Cloud Tasks RPCs is never
+// more than maxTaskRPCDeadline in the future. A parent with an earlier deadline keeps
+// it (we only ever shorten); a deadline-less parent gains the cap.
+func boundTaskRPCContext(ctx context.Context) (context.Context, context.CancelFunc) {
+
+	return context.WithTimeout(ctx, maxTaskRPCDeadline)
+}
+
 // returns http body, "src" query, error
 func (s *Autoscaler) verifySignature(ctx *gin.Context) ([]byte, Source, error) {
 
@@ -1030,6 +1048,13 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 	}
 	req.Task.GetHttpRequest().Body = []byte(data)
 
+	// Cloud Tasks rejects any request whose gRPC deadline is >30s in the future, and
+	// callers may hand us a long-lived context (the recreate path uses the 180s
+	// opContext). Cap the deadline used for the CreateTask/GetTask RPCs so the enqueue
+	// is accepted instead of failing with InvalidArgument and dropping the callback.
+	ctx, cancel := boundTaskRPCContext(ctx)
+	defer cancel()
+
 	client := newTaskClient(ctx)
 	defer client.Close()
 
@@ -1067,6 +1092,12 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 // CreateCallbackTaskWithToken bumps the suffix on AlreadyExists, so we attempt to
 // delete every candidate. Best-effort: a not-found candidate is not an error.
 func (s *Autoscaler) DeleteCallbackTask(ctx context.Context, job Job) error {
+
+	// Same Cloud Tasks 30s-deadline cap as CreateCallbackTaskWithToken: today this is
+	// only reached with the short-lived gin request context, but bound it anyway so a
+	// future long-context caller can't make every DeleteTask fail with InvalidArgument.
+	ctx, cancel := boundTaskRPCContext(ctx)
+	defer cancel()
 
 	client := newTaskClient(ctx)
 	defer client.Close()
