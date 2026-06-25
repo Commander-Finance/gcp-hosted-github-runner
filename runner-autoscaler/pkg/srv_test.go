@@ -482,8 +482,20 @@ func TestHandleCreateVmJitConflictDeleteFailureReturns500(t *testing.T) {
 	w := postCreate(s, secret, Job{Id: 778, Labels: []string{"spock"}})
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code, "delete failure should surface as 500")
+	assert.Equal(t, 1, deleteCalls, "the stale registration delete should be attempted once")
+	assert.Equal(t, "runner-778", deletedName, "must attempt deletion by the deterministic runner name")
 	assert.Equal(t, 1, jitCalls, "no second jit-config attempt when the delete failed")
 	assert.False(t, inserted, "no VM should be created")
+}
+
+// Only an offline, not-busy registration (a stale phantom) is deletable; an online or busy
+// runner must never be deleted (it may be live mid-job or a fresh concurrent registration).
+func TestRunnerIsDeletable(t *testing.T) {
+
+	assert.True(t, runnerIsDeletable("offline", false), "offline + idle is a stale phantom - deletable")
+	assert.False(t, runnerIsDeletable("online", false), "an online runner must not be deleted")
+	assert.False(t, runnerIsDeletable("offline", true), "a busy runner must not be deleted")
+	assert.False(t, runnerIsDeletable("online", true))
 }
 
 func TestRunnersBaseFromJitURL(t *testing.T) {
