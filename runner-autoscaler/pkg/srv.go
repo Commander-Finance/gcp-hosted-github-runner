@@ -1131,6 +1131,115 @@ func (s *Autoscaler) readPat(ctx context.Context) (string, error) {
 	}
 }
 
+// ErrRunnerNameConflict is returned by GenerateRunnerJitConfig when GitHub rejects the
+// registration with 409 because a runner with the same (deterministic) name already
+// exists. The create path recovers by deleting the stale registration and retrying.
+var ErrRunnerNameConflict = errors.New("runner name already registered with GitHub")
+
+// githubAuthHeaders sets the standard GitHub REST headers used by the runner API calls.
+func githubAuthHeaders(req *http.Request, pat string) {
+
+	req.Header.Add("Accept", "application/vnd.github+json")
+	req.Header.Add("Authorization", "Bearer "+pat)
+	req.Header.Add("X-GitHub-Api-Version", GITHUB_API_VERSION)
+	req.Header.Add("User-Agent", "github-runner-autoscaler")
+}
+
+// runnersBaseFromJitURL turns a ".../actions/runners/generate-jitconfig" endpoint into the
+// ".../actions/runners" collection URL used to list and delete runner registrations.
+func runnersBaseFromJitURL(jitURL string) string {
+
+	return strings.TrimSuffix(jitURL, "/generate-jitconfig")
+}
+
+// runnerIsDeletable reports whether a GitHub runner registration is safe to delete during
+// 409 recovery: only an explicitly OFFLINE, not-busy runner (a stale phantom whose VM never
+// came up). Fail closed - an online, busy, or unknown/empty status is NOT deletable, since
+// it may be a live runner mid-job or a fresh registration from a concurrent create whose VM
+// isn't visible yet, and deleting it could strand a live runner.
+func runnerIsDeletable(status string, busy bool) bool {
+
+	return status == "offline" && !busy
+}
+
+// deleteRunnerByName removes a self-hosted runner registration by name (the deterministic
+// runner-<jobId>). It is used to clear a stale/orphan registration - one whose VM never
+// materialized - so a retried create can re-register the name. It only deletes an offline,
+// not-busy registration (see runnerIsDeletable) and refuses to touch an active one.
+// Best-effort and idempotent: a runner that is already gone is treated as success.
+func (s *Autoscaler) deleteRunnerByName(ctx context.Context, jitURL string, name string) error {
+
+	pat, err := s.readPat(ctx)
+	if err != nil {
+		return err
+	}
+	base := runnersBaseFromJitURL(jitURL)
+
+	// Find the runner id by name.
+	listReq, err := http.NewRequestWithContext(ctx, "GET", base+"?name="+url.QueryEscape(name), nil)
+	if err != nil {
+		return fmt.Errorf("could not build list-runners request: %w", err)
+	}
+	githubAuthHeaders(listReq, pat)
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		return fmt.Errorf("list runners request failed: %w", err)
+	}
+	defer listResp.Body.Close()
+	if listResp.StatusCode != 200 {
+		return fmt.Errorf("list runners unexpected status: %s", listResp.Status)
+	}
+	body, err := io.ReadAll(listResp.Body)
+	if err != nil {
+		return fmt.Errorf("could not read runners list: %w", err)
+	}
+	var payload struct {
+		Runners []struct {
+			Id     int64  `json:"id"`
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Busy   bool   `json:"busy"`
+		} `json:"runners"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return fmt.Errorf("could not parse runners list: %w", err)
+	}
+	var id int64
+	for _, r := range payload.Runners {
+		if r.Name == name {
+			// Never delete an active registration - it may be a live runner mid-job or a
+			// fresh registration from a concurrent create whose VM isn't visible yet.
+			// Refuse so the caller backs off (Cloud Tasks retries) rather than stranding it.
+			if !runnerIsDeletable(r.Status, r.Busy) {
+				return fmt.Errorf("runner %s is active (status=%q busy=%v) - refusing to delete", name, r.Status, r.Busy)
+			}
+			id = r.Id
+			break
+		}
+	}
+	if id == 0 {
+		// Already gone (or never existed) - nothing to delete.
+		return nil
+	}
+
+	// Delete it.
+	delReq, err := http.NewRequestWithContext(ctx, "DELETE", fmt.Sprintf("%s/%d", base, id), nil)
+	if err != nil {
+		return fmt.Errorf("could not build delete-runner request: %w", err)
+	}
+	githubAuthHeaders(delReq, pat)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		return fmt.Errorf("delete runner request failed: %w", err)
+	}
+	defer delResp.Body.Close()
+	if delResp.StatusCode != 204 && delResp.StatusCode != 404 {
+		return fmt.Errorf("delete runner unexpected status: %s", delResp.Status)
+	}
+	log.Infof("Deleted stale GitHub runner registration %s (id %d)", name, id)
+	return nil
+}
+
 // A jit-config needs: RunnerName, RunnerGroupId, Labels, WorkFolder
 func (s *Autoscaler) GenerateRunnerJitConfig(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error) {
 
@@ -1157,6 +1266,14 @@ func (s *Autoscaler) GenerateRunnerJitConfig(ctx context.Context, url string, ru
 			if resp, err := http.DefaultClient.Do(req); err != nil {
 				log.Errorf("GitHub runner jit-config request failed: %s", err.Error())
 				return "", fmt.Errorf("failed jit-config response")
+			} else if resp.StatusCode == 409 {
+				// A runner with this (deterministic) name is already registered - a stale
+				// registration from a prior create whose VM never materialized. Surface a
+				// typed error so the caller can delete the orphan and retry, rather than
+				// stranding the job behind a phantom runner.
+				log.Warnf("GitHub runner jit-config conflict (409) for %s: runner name already registered", runnerName)
+				defer resp.Body.Close()
+				return "", ErrRunnerNameConflict
 			} else if resp.StatusCode != 201 {
 				log.Errorf("GitHub runner jit-config request unsuccessful: %s", resp.Status)
 				defer resp.Body.Close()
@@ -1359,7 +1476,26 @@ func (s *Autoscaler) createVmWithJitConfig(ginCtx *gin.Context, opCtx context.Co
 	if generateJitConfig == nil {
 		generateJitConfig = s.GenerateRunnerJitConfig
 	}
-	if jitConfig, err := generateJitConfig(opCtx, url, settings.Name, runnerGroupId, labels); err != nil {
+	deleteRunner := s.deleteRunnerFn
+	if deleteRunner == nil {
+		deleteRunner = s.deleteRunnerByName
+	}
+
+	jitConfig, err := generateJitConfig(opCtx, url, settings.Name, runnerGroupId, labels)
+	if errors.Is(err, ErrRunnerNameConflict) {
+		// A runner with this name is registered with GitHub but - per the instanceState
+		// check above - no live VM backs it (a prior create registered the runner then
+		// failed to materialize its VM). Delete the orphan registration and retry once so
+		// the queued job isn't stranded behind a phantom runner.
+		log.Warnf("Runner %s already registered with GitHub but has no live VM - deleting the stale registration and retrying", settings.Name)
+		if delErr := deleteRunner(opCtx, url, settings.Name); delErr != nil {
+			log.Errorf("Could not delete stale runner registration %s: %s", settings.Name, delErr.Error())
+			ginCtx.AbortWithError(http.StatusInternalServerError, delErr)
+			return
+		}
+		jitConfig, err = generateJitConfig(opCtx, url, settings.Name, runnerGroupId, labels)
+	}
+	if err != nil {
 		ginCtx.AbortWithError(http.StatusInternalServerError, err)
 	} else {
 		jit_config_attr := fmt.Sprintf("%s_%s", RUNNER_JIT_CONFIG_ATTR, RandStringRunes(16))
@@ -1687,6 +1823,7 @@ type Autoscaler struct {
 	// enqueue, JIT-config generation, and instance-state lookup. nil in production.
 	createTaskFn    func(ctx context.Context, kind string, url string, secret string, job Job, delay time.Duration) error
 	jitConfigFn     func(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error)
+	deleteRunnerFn  func(ctx context.Context, jitURL string, name string) error
 	instanceStateFn func(ctx context.Context, instanceName string) (bool, State, error)
 }
 
