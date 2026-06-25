@@ -496,6 +496,9 @@ func TestRunnerIsDeletable(t *testing.T) {
 	assert.False(t, runnerIsDeletable("online", false), "an online runner must not be deleted")
 	assert.False(t, runnerIsDeletable("offline", true), "a busy runner must not be deleted")
 	assert.False(t, runnerIsDeletable("online", true))
+	// Fail closed on unknown/empty status - only an explicit "offline" is deletable.
+	assert.False(t, runnerIsDeletable("", false), "empty status must fail closed")
+	assert.False(t, runnerIsDeletable("unknown", false), "unknown status must fail closed")
 }
 
 func TestRunnersBaseFromJitURL(t *testing.T) {

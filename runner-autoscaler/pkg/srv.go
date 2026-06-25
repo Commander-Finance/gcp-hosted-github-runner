@@ -1153,12 +1153,13 @@ func runnersBaseFromJitURL(jitURL string) string {
 }
 
 // runnerIsDeletable reports whether a GitHub runner registration is safe to delete during
-// 409 recovery: only an OFFLINE, not-busy runner (a stale phantom whose VM never came up).
-// An online or busy runner may be actively running a job, or a fresh registration from a
-// concurrent create whose VM isn't visible yet - deleting it could strand a live runner.
+// 409 recovery: only an explicitly OFFLINE, not-busy runner (a stale phantom whose VM never
+// came up). Fail closed - an online, busy, or unknown/empty status is NOT deletable, since
+// it may be a live runner mid-job or a fresh registration from a concurrent create whose VM
+// isn't visible yet, and deleting it could strand a live runner.
 func runnerIsDeletable(status string, busy bool) bool {
 
-	return status != "online" && !busy
+	return status == "offline" && !busy
 }
 
 // deleteRunnerByName removes a self-hosted runner registration by name (the deterministic
