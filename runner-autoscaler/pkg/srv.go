@@ -494,6 +494,37 @@ func IsCapacityError(err error) bool {
 	return false
 }
 
+// IsRateLimitError reports whether err is a per-minute API rate-limit (throttle), as
+// opposed to a resource/capacity shortage. These must be handled differently: a
+// capacity error means "this family/zone is out, try another" (family fallback), but a
+// rate-limit means "we're issuing Compute writes too fast" — cycling more families just
+// issues MORE writes and deepens the throttle. On a rate-limit the caller should stop
+// and let Cloud Tasks back off and retry the single create. Matched narrowly so genuine
+// resource quotas (e.g. "Quota 'N4_CPUS' exceeded") stay capacity errors that DO fall
+// back across families. Checked before IsCapacityError because the rate-limit 403 text
+// also contains "Quota exceeded".
+func IsRateLimitError(err error) bool {
+
+	if err == nil {
+		return false
+	}
+	if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPCode() == 429 {
+		return true
+	}
+	msg := strings.ToUpper(err.Error())
+	for _, needle := range []string{
+		"PER MINUTE", // compute's "Write/Read requests per minute per region" rate quotas
+		"RATE_LIMIT_EXCEEDED",
+		"RATELIMITEXCEEDED",
+		"RATE LIMIT EXCEEDED",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsAlreadyExists reports whether err indicates the resource already exists (HTTP
 // 409 / gRPC AlreadyExists), which create-vm treats as idempotent success.
 func IsAlreadyExists(err error) bool {
@@ -985,6 +1016,14 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 			// A previous (possibly cancelled) attempt already created this VM.
 			log.Infof("Instance %s already exists - treating create as idempotent success", instanceName)
 			return nil
+		}
+		if IsRateLimitError(err) {
+			// A per-minute Compute write-rate throttle: cycling more families would
+			// only issue more Insert writes and deepen the throttle. Stop and return so
+			// Cloud Tasks backs off and retries this single create when the rate budget
+			// refreshes (rather than turning a transient throttle into a hung job).
+			log.Warnf("Rate limited creating instance %s (%s, %s, %s): %s - returning for Cloud Tasks backoff (not cycling families)", instanceName, attempt.zone, attempt.machineType, attempt.provisioningModel, err.Error())
+			return err
 		}
 		if IsCapacityError(err) {
 			log.Warnf("Capacity error creating instance %s (%s, %s, %s): %s - trying next zone/model", instanceName, attempt.zone, attempt.machineType, attempt.provisioningModel, err.Error())

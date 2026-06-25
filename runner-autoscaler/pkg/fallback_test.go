@@ -96,6 +96,40 @@ func TestParseMachineTypeFallbacks(t *testing.T) {
 	)
 }
 
+// A per-minute API rate-limit must be classified as a rate-limit (→ back off and let
+// Cloud Tasks retry), NOT as a capacity error (which would cycle families and amplify
+// the very write-request rate that tripped the quota). Resource/capacity quotas must
+// still NOT be rate-limits — a different family has different CPU/disk quota, so those
+// should keep triggering family fallback.
+func TestIsRateLimitError(t *testing.T) {
+
+	rate := fmt.Errorf("googleapi: Error 403: Quota exceeded for quota metric 'Write requests' and limit 'Write requests per minute per region' of service 'compute.googleapis.com'")
+	assert.True(t, IsRateLimitError(rate), "per-minute write-rate 403 must be a rate-limit error")
+	assert.True(t, IsRateLimitError(fmt.Errorf("rpc error: code = ResourceExhausted desc = RATE_LIMIT_EXCEEDED")))
+
+	assert.False(t, IsRateLimitError(fmt.Errorf("ZONE_RESOURCE_POOL_EXHAUSTED")), "stockout is capacity, not rate-limit")
+	assert.False(t, IsRateLimitError(fmt.Errorf("Quota 'N4_CPUS' exceeded. Limit: 24.0 in region us-central1")), "a resource quota should still trigger family fallback")
+	assert.False(t, IsRateLimitError(fmt.Errorf("does not have enough resources")))
+	assert.False(t, IsRateLimitError(nil))
+}
+
+// On a rate-limit, the create must NOT cycle families (that amplifies the write rate);
+// it returns after the current attempt so Cloud Tasks backs off and retries.
+func TestCreateInstanceRateLimitReturnsWithoutCycling(t *testing.T) {
+
+	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, testFamilies)
+	var attempts []creationAttempt
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
+		attempts = append(attempts, a)
+		return fmt.Errorf("googleapi: Error 403: Quota exceeded for quota metric 'Write requests' and limit 'Write requests per minute per region'")
+	}
+
+	err := s.CreateInstanceFromTemplate(context.Background(), "runner-7", nil)
+	require.Error(t, err)
+	assert.Len(t, attempts, 1, "a rate-limit must return immediately, not cycle all the families")
+	assert.True(t, IsRateLimitError(err), "the surfaced error must be the rate-limit (so Cloud Tasks retries)")
+}
+
 // familyScaler builds a SPOT-primary scaler with a configured machine-type fallback list.
 func familyScaler(zones, fams []string) *Autoscaler {
 	return &Autoscaler{conf: AutoscalerConfig{
