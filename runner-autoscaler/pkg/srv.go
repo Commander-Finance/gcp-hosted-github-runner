@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -508,7 +509,10 @@ func IsRateLimitError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPCode() == 429 {
+	// errors.As (not a direct type assertion) so a wrapped *apierror.APIError is still
+	// matched - otherwise a wrapped 429 would slip through to family cycling.
+	var apiErr *apierror.APIError
+	if errors.As(err, &apiErr) && apiErr.HTTPCode() == 429 {
 		return true
 	}
 	msg := strings.ToUpper(err.Error())
@@ -532,7 +536,8 @@ func IsAlreadyExists(err error) bool {
 	if err == nil {
 		return false
 	}
-	if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPCode() == 409 {
+	var apiErr *apierror.APIError
+	if errors.As(err, &apiErr) && apiErr.HTTPCode() == 409 {
 		return true
 	}
 	msg := strings.ToUpper(err.Error())
@@ -546,7 +551,8 @@ func IsNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
-	if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPCode() == 404 {
+	var apiErr *apierror.APIError
+	if errors.As(err, &apiErr) && apiErr.HTTPCode() == 404 {
 		return true
 	}
 	msg := strings.ToUpper(err.Error())
