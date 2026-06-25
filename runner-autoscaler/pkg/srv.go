@@ -1568,7 +1568,11 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 							return
 						}
 					} else {
-						log.Warnf("Webhook requested to start a runner: %s - ignoring", reason)
+						// Routine for an org/enterprise-wide webhook subscription: the autoscaler
+						// receives every workflow_job event and most don't target our runner labels.
+						// Debug (not Warn) so these high-volume "not ours" lines don't bury genuine
+						// warnings. A real label misconfig surfaces as zero VMs + the startup label log.
+						log.Debugf("Webhook requested to start a runner: %s - ignoring", reason)
 					}
 				} else if payload.Action == WAITING {
 					// the waiting action happens if a deployment environment is configured in the workflow that requires a review. We have to cancel the cloud task callback
@@ -1578,7 +1582,7 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 							log.Warnf("Can not delete create-vm cloud task callback: %s", err.Error())
 						}
 					} else {
-						log.Warnf("Webhook signals 'wait': %s - ignoring", reason)
+						log.Debugf("Webhook signals 'wait': %s - ignoring", reason) // not ours (see queued)
 					}
 				} else if payload.Action == COMPLETED {
 					runnerGroupId := s.conf.RunnerGroupId
@@ -1600,10 +1604,13 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 								return
 							}
 						} else {
-							log.Warnf("Webhook signaled to delete a runner: %s - ignoring", reason)
+							log.Debugf("Webhook signaled to delete a runner: %s - ignoring", reason) // not ours (see queued)
 						}
 					} else {
-						log.Warnf("Webhook signaled to delete a runner that does not belong to the expected runner group (expected \"%d\" got \"%d\") - ignoring", runnerGroupId, payload.Job.RunnerGroupId)
+						// Highest-volume of the "not ours" lines: a completed job that ran on a
+						// different runner group (e.g. GitHub-hosted = group 0, or another pool).
+						// Expected for an org-wide subscription - Debug, not Warn.
+						log.Debugf("Webhook signaled to delete a runner that does not belong to the expected runner group (expected \"%d\" got \"%d\") - ignoring", runnerGroupId, payload.Job.RunnerGroupId)
 					}
 				}
 				ctx.Status(http.StatusOK)
