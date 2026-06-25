@@ -73,3 +73,89 @@ resource "google_monitoring_alert_policy" "runner_vm_create_failed" {
 
   notification_channels = var.alert_notification_channels
 }
+
+// Counts JIT runner-registration failures (GitHub generate-jitconfig errors: 409
+// name conflicts, non-201 responses, network/parse failures). These abort the
+// create BEFORE the Insert, so they are NOT covered by vm_create_failed - and they
+// strand the job with no runner ("stuck pending"). A spike here is the exact signal
+// that went unnoticed during the 2026-06 incident, where a flood of 409 conflicts
+// silently left jobs pending until a human spotted it.
+resource "google_logging_metric" "runner_jit_config_failed" {
+  name   = "github_runner/jit_config_failed"
+  filter = "${local.autoscaler_log_filter} severity>=WARNING jsonPayload.message=~\"jit-config\""
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_monitoring_alert_policy" "runner_jit_config_failed" {
+  display_name = "GitHub runner: JIT runner-registration failures (jobs stuck pending)"
+  combiner     = "OR"
+  depends_on   = [google_project_service.monitoring_api]
+
+  conditions {
+    display_name = "jit-config failures in the last 5 min"
+    condition_threshold {
+      filter     = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.runner_jit_config_failed.name}\" resource.type=\"cloud_run_revision\""
+      comparison = "COMPARISON_GT"
+      // Baseline is ~0 (a few transient failures over weeks); a real incident is dozens
+      // in minutes. >5 / 5min distinguishes a registration-failure spike from noise.
+      threshold_value = 5
+      duration        = "0s"
+      trigger {
+        count = 1
+      }
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+  }
+
+  notification_channels = var.alert_notification_channels
+}
+
+// Counts Compute write-rate throttles where the autoscaler backed off instead of
+// cycling families (the "returning for Cloud Tasks backoff" log). A sustained rate
+// here means the Compute "Write requests per minute per region" quota is under
+// pressure - the precursor to the create-amplification spiral that hangs jobs.
+resource "google_logging_metric" "runner_rate_limited" {
+  name   = "github_runner/rate_limited"
+  filter = "${local.autoscaler_log_filter} jsonPayload.message=~\"returning for Cloud Tasks backoff\""
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_monitoring_alert_policy" "runner_rate_limited" {
+  display_name = "GitHub runner: Compute write-rate throttling"
+  combiner     = "OR"
+  depends_on   = [google_project_service.monitoring_api]
+
+  conditions {
+    display_name = "rate-limit backoffs in the last 5 min"
+    condition_threshold {
+      filter     = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.runner_rate_limited.name}\" resource.type=\"cloud_run_revision\""
+      comparison = "COMPARISON_GT"
+      // Occasional backoffs are handled gracefully; a sustained burst (>10 / 5min)
+      // signals the write-rate quota is too low for current load - act before it hurts.
+      threshold_value = 10
+      duration        = "0s"
+      trigger {
+        count = 1
+      }
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+  }
+
+  notification_channels = var.alert_notification_channels
+}
