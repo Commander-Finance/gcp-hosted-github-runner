@@ -401,3 +401,95 @@ func TestHandleCreateVmDefaultsJobPatternWhenConfigEmpty(t *testing.T) {
 	mdMap := metadataByKey(capturedMetadata)
 	assert.Equal(t, DefaultRunnerJobLogPattern, mdMap[RECREATE_CALLBACK_JOB_PATTERN_ATTR], "empty config must fall back to the default pattern, never empty")
 }
+
+// conflictScaler builds a create-vm scaler whose jit-config returns 409 on the first call
+// (a stale registration) and a valid config thereafter; deleteRunnerFn and tryInsertFn are
+// recorded so the recovery path can be asserted.
+func conflictScaler(secret string, jitCalls, deleteCalls *int, deletedName *string, inserted *bool, deleteErr error) *Autoscaler {
+	gin.SetMode(gin.TestMode)
+	s := &Autoscaler{conf: AutoscalerConfig{
+		RunnerPrefix:     "runner",
+		Zones:            []string{"z1"},
+		SourceQueryParam: "src",
+		RouteCreateVm:    "/create_vm",
+		RegisteredSources: map[string]Source{
+			"repo": {Name: "repo", Secret: secret, SourceType: TypeOrganization},
+		},
+	}}
+	s.instanceStateFn = func(ctx context.Context, name string) (bool, State, error) {
+		return false, Unknown, nil // no live VM backs the stale registration -> proceed to jit-config
+	}
+	s.jitConfigFn = func(ctx context.Context, url, runnerName string, gid int64, labels []string) (string, error) {
+		*jitCalls++
+		if *jitCalls == 1 {
+			return "", ErrRunnerNameConflict
+		}
+		return "fake-jit", nil
+	}
+	s.deleteRunnerFn = func(ctx context.Context, jitURL, name string) error {
+		*deleteCalls++
+		*deletedName = name
+		return deleteErr
+	}
+	s.tryInsertFn = func(ctx context.Context, a creationAttempt, name string, md []*computepb.Items) error {
+		*inserted = true
+		return nil
+	}
+	s.lastSweep = time.Now()
+	return s
+}
+
+func postCreate(s *Autoscaler, secret string, job Job) *httptest.ResponseRecorder {
+	body, _ := json.Marshal(job)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/create_vm?src=repo", bytes.NewReader(body))
+	c.Request.Header.Set(SHA_HEADER, SHA_PREFIX+CalcSigHex([]byte(secret), body))
+	s.handleCreateVm(c)
+	return w
+}
+
+// A 409 Conflict from generate-jitconfig (a stale runner registration from a prior create
+// whose VM never materialized) must be recovered: delete the stale registration by name,
+// retry, and create the VM - so the queued job isn't stranded behind a phantom runner.
+func TestHandleCreateVmRecoversFromJitConfigConflict(t *testing.T) {
+
+	secret := "conflictsecret"
+	jitCalls, deleteCalls := 0, 0
+	deletedName := ""
+	inserted := false
+	s := conflictScaler(secret, &jitCalls, &deleteCalls, &deletedName, &inserted, nil)
+
+	w := postCreate(s, secret, Job{Id: 777, Labels: []string{"spock"}})
+
+	assert.Equal(t, http.StatusOK, w.Code, "should delete the stale registration, retry, and create the VM")
+	assert.Equal(t, 1, deleteCalls, "the stale registration must be deleted exactly once")
+	assert.Equal(t, "runner-777", deletedName, "must delete by the deterministic runner name")
+	assert.Equal(t, 2, jitCalls, "jit-config must be retried after the stale registration is removed")
+	assert.True(t, inserted, "the VM must be created after recovery")
+}
+
+// If deleting the stale registration fails, surface a 500 (Cloud Tasks retries) rather than
+// retrying jit-config or creating a VM with no clean registration.
+func TestHandleCreateVmJitConflictDeleteFailureReturns500(t *testing.T) {
+
+	secret := "conflictsecret2"
+	jitCalls, deleteCalls := 0, 0
+	deletedName := ""
+	inserted := false
+	s := conflictScaler(secret, &jitCalls, &deleteCalls, &deletedName, &inserted, fmt.Errorf("github API error"))
+
+	w := postCreate(s, secret, Job{Id: 778, Labels: []string{"spock"}})
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code, "delete failure should surface as 500")
+	assert.Equal(t, 1, jitCalls, "no second jit-config attempt when the delete failed")
+	assert.False(t, inserted, "no VM should be created")
+}
+
+func TestRunnersBaseFromJitURL(t *testing.T) {
+
+	assert.Equal(t, "https://api.github.com/orgs/acme/actions/runners",
+		runnersBaseFromJitURL("https://api.github.com/orgs/acme/actions/runners/generate-jitconfig"))
+	assert.Equal(t, "https://api.github.com/repos/acme/app/actions/runners",
+		runnersBaseFromJitURL("https://api.github.com/repos/acme/app/actions/runners/generate-jitconfig"))
+}
