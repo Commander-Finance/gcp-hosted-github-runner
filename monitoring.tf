@@ -111,6 +111,11 @@ resource "google_monitoring_alert_policy" "runner_jit_config_failed" {
       aggregations {
         alignment_period   = "300s"
         per_series_aligner = "ALIGN_SUM"
+        // Sum across Cloud Run revisions: failures split between an old and new
+        // revision (e.g. mid-deploy) must still total against the threshold, or a
+        // real spike spread thin per-revision would never cross >5.
+        cross_series_reducer = "REDUCE_SUM"
+        group_by_fields      = []
       }
     }
   }
@@ -124,7 +129,7 @@ resource "google_monitoring_alert_policy" "runner_jit_config_failed" {
 // pressure - the precursor to the create-amplification spiral that hangs jobs.
 resource "google_logging_metric" "runner_rate_limited" {
   name   = "github_runner/rate_limited"
-  filter = "${local.autoscaler_log_filter} jsonPayload.message=~\"returning for Cloud Tasks backoff\""
+  filter = "${local.autoscaler_log_filter} severity>=WARNING jsonPayload.message=~\"returning for Cloud Tasks backoff\""
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -153,6 +158,10 @@ resource "google_monitoring_alert_policy" "runner_rate_limited" {
       aggregations {
         alignment_period   = "300s"
         per_series_aligner = "ALIGN_SUM"
+        // Sum across Cloud Run revisions so backoffs split between revisions still
+        // total against the >10 threshold (see jit_config_failed for rationale).
+        cross_series_reducer = "REDUCE_SUM"
+        group_by_fields      = []
       }
     }
   }
