@@ -1355,7 +1355,7 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 					// from the job's perspective the runner silently stops coming back.
 					// The "callback budget exhausted" prefix feeds a log-based metric.
 					log.Errorf("Callback budget exhausted for %s job Id %d - dropping enqueue after %d tombstoned suffixes", kind, job.Id, maxTaskRetryCount+1)
-					return fmt.Errorf("callback budget exhausted for %s job Id %d: %v", kind, job.Id, err)
+					return fmt.Errorf("callback budget exhausted for %s job Id %d: %w", kind, job.Id, err)
 				}
 			}
 			return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %v", job.Id, err)
