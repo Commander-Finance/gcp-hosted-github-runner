@@ -19,8 +19,19 @@ EOT
 
 resource "google_compute_instance_template" "runner_instance" {
 
-  name         = "ephemeral-github-runner"
-  region       = local.region
+  // name_prefix + create_before_destroy: instance templates are immutable, so any
+  // change to machine type/disk/scheduling replaces the resource. With a static
+  // name Terraform must destroy the old template before creating the new one,
+  // leaving a window with no template (every autoscaler create fails) - and if the
+  // create then fails, none at all. A prefixed name lets the replacement exist
+  // first; everything downstream (Cloud Run env, IAM conditions) references the
+  // template by id, so the generated suffix is invisible to consumers.
+  name_prefix = "ephemeral-github-runner-"
+  region      = local.region
+
+  lifecycle {
+    create_before_destroy = true
+  }
   machine_type = var.machine_type
   tags         = var.enable_ssh ? ["http-egress", "icmp-ingress", "ssh-ingress"] : ["http-egress", "icmp-ingress"]
   depends_on   = [google_project_service.compute_api]
@@ -75,8 +86,13 @@ resource "google_compute_instance_template" "runner_instance_ondemand" {
 
   count = var.machine_preemtible ? 1 : 0
 
-  name         = "ephemeral-github-runner-ondemand"
-  region       = local.region
+  // See runner_instance for the name_prefix + create_before_destroy rationale.
+  name_prefix = "ephemeral-github-runner-ondemand-"
+  region      = local.region
+
+  lifecycle {
+    create_before_destroy = true
+  }
   machine_type = var.machine_type
   tags         = var.enable_ssh ? ["http-egress", "icmp-ingress", "ssh-ingress"] : ["http-egress", "icmp-ingress"]
   depends_on   = [google_project_service.compute_api]
