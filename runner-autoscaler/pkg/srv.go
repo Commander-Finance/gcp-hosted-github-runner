@@ -86,6 +86,13 @@ const maxSweepDeletes = 25
 // AlreadyExists; DeleteCallbackTask must cancel every candidate.
 const maxTaskRetryCount = 2
 
+// maxRecreatesPerJob caps how many replacement VMs one job id may get after its
+// runners die before accepting a job (Job.RecreateCount is the durable counter).
+// 2 recreates = 3 VMs total per job id, matching the budget the tombstone
+// suffixes (0..maxTaskRetryCount) were intended to express before the counter
+// existed. A job still dying after 3 VMs is not going to be saved by a 4th.
+const maxRecreatesPerJob = 2
+
 // recreateVmDelay is how long to wait before the re-create task fires after a
 // VM dies without accepting a job. The delay lets the dying VM fully disappear
 // before the replacement create runs; decideCreate handles any stopped leftover.
@@ -120,6 +127,14 @@ type Job struct {
 	RunnerGroupName    string   `json:"runner_group_name"`
 	RunnerGroupId      int64    `json:"runner_group_id"`
 	RepositoryFullName string   `json:"repository_full_name,omitempty"`
+	// RecreateCount is how many times this job's runner VM has been recreated after
+	// dying before accepting a job (SPOT preemption, startup failure). It rides the
+	// Job JSON through the create task and the VM's recreate_callback_payload
+	// metadata, so the per-job recreate budget survives Cloud Tasks tombstone expiry
+	// (a dedup window, not a counter, which preemptions >1h apart silently outlive).
+	// omitempty keeps pre-counter payloads (and their HMAC signatures) unchanged;
+	// absent unmarshals to 0.
+	RecreateCount int `json:"recreate_count,omitempty"`
 }
 
 // Repository is the top-level "repository" object in a GitHub webhook payload.
@@ -1655,7 +1670,20 @@ func (s *Autoscaler) handleRecreateVm(ctx *gin.Context) {
 			ctx.Status(http.StatusOK)
 			return
 		}
-		log.Infof("Recreate-vm callback for job %d - VM died before accepting a job, re-enqueueing create task", job.Id)
+		// The durable per-job recreate budget. The count travels in the job payload
+		// itself, so it caps total recreates regardless of how far apart the VM
+		// deaths are - unlike the task-name tombstone suffix (a ~1h dedup window
+		// that slow preemption cycles silently outlive). Ack the drop with 200: it
+		// is deliberate, so neither the dying VM's curl nor Cloud Tasks should
+		// retry it. The "Callback budget exhausted" prefix feeds the same
+		// log-based metric/alert as the enqueue-side suffix cap.
+		if job.RecreateCount >= maxRecreatesPerJob {
+			log.Errorf("Callback budget exhausted for job Id %d - dropping recreate signal after %d recreates (max %d per job)", job.Id, job.RecreateCount, maxRecreatesPerJob)
+			ctx.Status(http.StatusOK)
+			return
+		}
+		job.RecreateCount++
+		log.Infof("Recreate-vm callback for job %d - VM died before accepting a job, re-enqueueing create task (recreate %d of %d)", job.Id, job.RecreateCount, maxRecreatesPerJob)
 		createUrl := createCallbackUrl(ctx, s.conf.RouteCreateVm, s.conf.SourceQueryParam, src.Name)
 
 		createTask := s.createTaskFn
@@ -1667,8 +1695,8 @@ func (s *Autoscaler) handleRecreateVm(ctx *gin.Context) {
 		// mid-enqueue would silently lose the only recreate signal for this job.
 		opCtx, cancel := s.opContext()
 		defer cancel()
-		// CreateCallbackTaskWithToken's tombstone suffix bumping caps total creates
-		// per job id - this is the recreate loop protection.
+		// Tombstone suffix bumping in CreateCallbackTaskWithToken still dedups the
+		// enqueue; the RecreateCount gate above is the actual loop cap.
 		if err := createTask(opCtx, TaskKindCreate, createUrl, src.Secret, job, recreateVmDelay); err != nil {
 			log.Errorf("Can not enqueue create-vm cloud task callback for recreate: %s", err.Error())
 			ctx.AbortWithError(http.StatusInternalServerError, err)
