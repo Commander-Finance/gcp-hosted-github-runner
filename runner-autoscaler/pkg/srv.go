@@ -1358,7 +1358,7 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 					return fmt.Errorf("callback budget exhausted for %s job Id %d: %w", kind, job.Id, err)
 				}
 			}
-			return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %v", job.Id, err)
+			return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %w", job.Id, err)
 		} else {
 			log.Infof("Created cloud task callback for workflow job Id %d with url \"%s\" and payload \"%s\"", job.Id, url, data)
 			return nil
