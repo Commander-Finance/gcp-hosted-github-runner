@@ -203,6 +203,52 @@ func TestHandleRecreateVmReturns500OnTaskFailure(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
+// Each recreate must stamp an incremented recreate_count into the re-enqueued
+// job payload. The count rides the Job JSON through the create task, into the
+// replacement VM's recreate_callback_payload metadata, and back through the
+// next recreate callback - making the per-job budget durable instead of
+// dependent on Cloud Tasks tombstone timing (a dedup window, not a counter,
+// which slow preemptions >1h apart silently outlive).
+func TestHandleRecreateVmIncrementsRecreateCount(t *testing.T) {
+
+	secret := "recreatesecret"
+	var kind string
+	var url string
+	var delay time.Duration
+	var job Job
+	s := recreateHandlerScaler(secret, &kind, &url, &delay, &job, nil)
+
+	// A pre-counter payload (field absent -> zero value) is the first recreate.
+	w := postRecreate(s, secret, Job{Id: 42})
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 1, job.RecreateCount, "first recreate must enqueue with count 1")
+
+	// A payload that already carries a count continues from it.
+	w = postRecreate(s, secret, Job{Id: 42, RecreateCount: 1})
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 2, job.RecreateCount, "second recreate must enqueue with count 2")
+}
+
+// Once a job has consumed its recreate budget the handler must drop the signal
+// without enqueueing another create task: this is the loop cap that stops a
+// job whose VMs keep dying from spawning VMs forever. Acknowledge with 200 -
+// the drop is deliberate, so neither the dying VM's curl nor Cloud Tasks
+// should retry it.
+func TestHandleRecreateVmDropsWhenBudgetExhausted(t *testing.T) {
+
+	secret := "recreatesecret"
+	var kind string
+	var url string
+	var delay time.Duration
+	var job Job
+	s := recreateHandlerScaler(secret, &kind, &url, &delay, &job, nil)
+
+	w := postRecreate(s, secret, Job{Id: 42, RecreateCount: maxRecreatesPerJob})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Empty(t, kind, "createTaskFn must not be called once the recreate budget is exhausted")
+}
+
 // handleCreateVm with a zero job id must acknowledge with 200 and must not
 // attempt VM creation or JIT-config generation. A zero id means the payload is
 // corrupt or the task was mis-enqueued; retrying (via a 5xx) would just repeat
