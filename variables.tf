@@ -15,9 +15,12 @@ variable "machine_type_fallbacks" {
     magic label always overrides this list (that exact type is used, fallback disabled).
 
     All entries MUST be compatible with the instance template's disk_type — e.g. with a
-    hyperdisk-balanced template, every family must support Hyperdisk Balanced (C4/C4D/C3/
-    C3D/N4/N2/N2D/T2D do; E2/N1/C2/C2D do not). An incompatible or non-existent family
-    yields a non-capacity (fatal) error, not a skippable one.
+    hyperdisk-balanced template, every family must support Hyperdisk Balanced
+    (C3/C3D/C4/C4A/C4D/N4/N4D do; E2/N1/C2/C2D/N2/N2D/T2D do not). A pd-balanced or
+    pd-ssd template inverts that set, and C3/C3D are the only families that boot from
+    both kinds of template. pd-standard (the module default) supports none of the
+    Hyperdisk-Balanced-capable families, C3/C3D included. An incompatible or
+    non-existent family yields a non-capacity (fatal) error, not a skippable one.
   EOT
   default     = []
 }
