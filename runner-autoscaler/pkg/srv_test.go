@@ -33,6 +33,10 @@ func deleteHandlerScaler(secret string, deleted *[]string) *Autoscaler {
 		return true, nil // found + deleted in this zone
 	}
 	s.lastSweep = time.Now() // suppress the detached maybeSweepOrphans goroutine
+	// Defaults hold the starvation gate inert: with no originating job recoverable
+	// from metadata, a delete can never be classified as theft, so no top-up fires.
+	s.instanceJobFn = func(ctx context.Context, name string) (*Job, error) { return nil, nil }
+	s.needsRunnerFn = func(ctx context.Context, job Job, src Source, exclude string) (bool, error) { return false, nil }
 	return s
 }
 
@@ -106,6 +110,9 @@ func recreateHandlerScaler(secret string, capturedKind *string, capturedUrl *str
 		return taskErr
 	}
 	s.lastSweep = time.Now() // suppress the detached maybeSweepOrphans goroutine
+	// Default to "a runner is needed" so the pre-gate recreate contract still holds;
+	// the tests that exercise the gate override this.
+	s.needsRunnerFn = func(ctx context.Context, job Job, src Source, exclude string) (bool, error) { return true, nil }
 	return s
 }
 
@@ -507,4 +514,343 @@ func TestRunnersBaseFromJitURL(t *testing.T) {
 		runnersBaseFromJitURL("https://api.github.com/orgs/acme/actions/runners/generate-jitconfig"))
 	assert.Equal(t, "https://api.github.com/repos/acme/app/actions/runners",
 		runnersBaseFromJitURL("https://api.github.com/repos/acme/app/actions/runners/generate-jitconfig"))
+}
+
+// --- starvation gate -------------------------------------------------------
+
+// needsRunner gates every replacement create. A recreate for a job that has since
+// ended - or that an already-idle runner could serve - must not re-enqueue,
+// otherwise a VM that boots with nothing to pick up loops idle -> recreate ->
+// idle until the task-name suffix budget silently runs out.
+func TestHandleRecreateVmSkipsWhenRunnerNotNeeded(t *testing.T) {
+
+	secret := "topsecret"
+	var kind, url string
+	var delay time.Duration
+	var job Job
+	s := recreateHandlerScaler(secret, &kind, &url, &delay, &job, nil)
+	s.needsRunnerFn = func(ctx context.Context, j Job, src Source, exclude string) (bool, error) { return false, nil }
+
+	w := postRecreate(s, secret, Job{Id: 42, RepositoryFullName: "org/repo"})
+
+	assert.Equal(t, http.StatusOK, w.Code, "a declined recreate must still be acked")
+	assert.Empty(t, kind, "no create task may be enqueued when no runner is needed")
+}
+
+// A stolen VM's delete is the only signal that the job it was built for lost its
+// runner. The original job's id and repo come from the VM's own metadata, because
+// the completed webhook names a different job - usually in another repository.
+func TestHandleDeleteVmTopsUpStolenRunner(t *testing.T) {
+
+	secret := "topsecret"
+	var deleted []string
+	s := deleteHandlerScaler(secret, &deleted)
+	s.conf.RouteCreateVm = "/create_vm"
+	s.instanceJobFn = func(ctx context.Context, name string) (*Job, error) {
+		return &Job{Id: 111, RepositoryFullName: "org/mccoy", Labels: []string{"spock"}}, nil
+	}
+	s.needsRunnerFn = func(ctx context.Context, j Job, src Source, exclude string) (bool, error) { return true, nil }
+	var kinds, urls, secrets []string
+	var jobs []Job
+	var delays []time.Duration
+	s.createTaskFn = func(ctx context.Context, kind string, url string, secret string, job Job, delay time.Duration) error {
+		kinds = append(kinds, kind)
+		urls = append(urls, url)
+		secrets = append(secrets, secret)
+		delays = append(delays, delay)
+		jobs = append(jobs, job)
+		return nil
+	}
+
+	w := postDelete(s, secret, Job{Id: 222, RunnerName: "runner-111"})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []string{"runner-111"}, deleted, "the webhook-named VM must still be deleted")
+	assert.Equal(t, []string{TaskKindTopUp}, kinds, "a stolen VM tops up under its own task kind")
+	if assert.Len(t, urls, 1) {
+		assert.Contains(t, urls[0], "/create_vm", "the top-up must post to the create route")
+		assert.Equal(t, secret, secrets[0], "and be signed with the source's secret")
+		assert.Equal(t, topUpVmDelay, delays[0], "the name is already free, so it must not wait recreateVmDelay")
+	}
+	if assert.Len(t, jobs, 1) {
+		assert.Equal(t, int64(111), jobs[0].Id, "the top-up targets the original job, not the completed one")
+		assert.Equal(t, "org/mccoy", jobs[0].RepositoryFullName, "and carries the original job's repo")
+	}
+}
+
+// The mutual-swap case: two VMs run each other's jobs. When the first job
+// finishes, its own VM is deleted by webhook-supplied name - but the job that VM
+// was built for is already running on the other VM, so nothing may be topped up.
+func TestHandleDeleteVmNoTopUpWhenOriginalJobRunning(t *testing.T) {
+
+	secret := "topsecret"
+	var deleted []string
+	s := deleteHandlerScaler(secret, &deleted)
+	s.instanceJobFn = func(ctx context.Context, name string) (*Job, error) {
+		return &Job{Id: 111, RepositoryFullName: "org/mccoy"}, nil
+	}
+	s.needsRunnerFn = func(ctx context.Context, j Job, src Source, exclude string) (bool, error) { return false, nil }
+	var kinds []string
+	s.createTaskFn = func(ctx context.Context, kind string, url string, secret string, job Job, delay time.Duration) error {
+		kinds = append(kinds, kind)
+		return nil
+	}
+
+	w := postDelete(s, secret, Job{Id: 222, RunnerName: "runner-111"})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []string{"runner-111"}, deleted)
+	assert.Empty(t, kinds, "the original job is already running - no top-up")
+}
+
+// A VM that ran the job it was built for is an ordinary completion, not theft.
+// The gate must not even be consulted, so a normal delete costs no GitHub calls.
+func TestHandleDeleteVmNoTopUpForSameJob(t *testing.T) {
+
+	secret := "topsecret"
+	var deleted []string
+	s := deleteHandlerScaler(secret, &deleted)
+	s.instanceJobFn = func(ctx context.Context, name string) (*Job, error) {
+		return &Job{Id: 222, RepositoryFullName: "org/backend"}, nil
+	}
+	gateCalls := 0
+	s.needsRunnerFn = func(ctx context.Context, j Job, src Source, exclude string) (bool, error) { gateCalls++; return true, nil }
+	var kinds []string
+	s.createTaskFn = func(ctx context.Context, kind string, url string, secret string, job Job, delay time.Duration) error {
+		kinds = append(kinds, kind)
+		return nil
+	}
+
+	w := postDelete(s, secret, Job{Id: 222, RunnerName: "runner-222"})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []string{"runner-222"}, deleted)
+	assert.Zero(t, gateCalls, "a same-job delete must not consult the gate")
+	assert.Empty(t, kinds)
+}
+
+// A VM created before the metadata attribute existed - or with the recreate route
+// unset - carries no originating payload. The delete must still succeed, and the
+// unknown origin must fail closed to no top-up rather than guessing.
+func TestHandleDeleteVmNoTopUpWhenMetadataAbsent(t *testing.T) {
+
+	secret := "topsecret"
+	var deleted []string
+	s := deleteHandlerScaler(secret, &deleted)
+	s.instanceJobFn = func(ctx context.Context, name string) (*Job, error) { return nil, nil }
+	var kinds []string
+	s.createTaskFn = func(ctx context.Context, kind string, url string, secret string, job Job, delay time.Duration) error {
+		kinds = append(kinds, kind)
+		return nil
+	}
+
+	w := postDelete(s, secret, Job{Id: 222, RunnerName: "runner-111"})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []string{"runner-111"}, deleted, "an unreadable origin must not block the delete")
+	assert.Empty(t, kinds, "unknown origin fails closed")
+}
+
+// --- the gate's own GitHub calls -------------------------------------------
+
+// GitHub answers 404 for a resource the token cannot see, not 403, so a PAT
+// without actions:read is indistinguishable from a deleted job. Reading 404 as
+// "not queued" would make the gate decline every recreate and silently disable
+// the fleet's only self-heal, so it must surface as an error and let each caller
+// apply its own fail-open / fail-closed policy.
+func TestJobIsQueuedTreatsNotFoundAsError(t *testing.T) {
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	s := &Autoscaler{githubAPIBase: srv.URL}
+
+	queued, err := s.jobIsQueued(context.Background(), "pat", Job{Id: 7, RepositoryFullName: "o/r"})
+
+	assert.Error(t, err, "404 is ambiguous (missing scope vs missing job) - it must not read as a confident negative")
+	assert.False(t, queued)
+}
+
+func TestJobIsQueuedReadsStatus(t *testing.T) {
+
+	for _, tc := range []struct {
+		status string
+		want   bool
+	}{{"queued", true}, {"in_progress", false}, {"completed", false}} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, `{"status":%q}`, tc.status)
+		}))
+		s := &Autoscaler{githubAPIBase: srv.URL}
+
+		queued, err := s.jobIsQueued(context.Background(), "pat", Job{Id: 7, RepositoryFullName: "o/r"})
+
+		assert.NoError(t, err)
+		assert.Equal(t, tc.want, queued, "status %q", tc.status)
+		srv.Close()
+	}
+}
+
+// runnersPage serves a single runners page built from the given entries.
+func runnersJSON(entries ...string) string {
+	return `{"runners":[` + strings.Join(entries, ",") + `]}`
+}
+
+func runnerEntry(name string, status string, busy bool, labels ...string) string {
+	l := make([]string, 0, len(labels))
+	for _, n := range labels {
+		l = append(l, fmt.Sprintf(`{"name":%q}`, n))
+	}
+	return fmt.Sprintf(`{"name":%q,"status":%q,"busy":%v,"labels":[%s]}`, name, status, busy, strings.Join(l, ","))
+}
+
+// A JIT runner registers with its own job's labels, so an idle runner only
+// counts as supply for jobs whose labels it carries. Treating a plain "spock"
+// runner as supply for a magic-label job strands that job: the gate is confident,
+// so no fail-open path rescues it.
+func TestHasIdleRunnerRequiresMatchingLabels(t *testing.T) {
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, runnersJSON(runnerEntry("runner-1", "online", false, "spock")))
+	}))
+	defer srv.Close()
+	s := &Autoscaler{conf: AutoscalerConfig{RunnerPrefix: "runner"}}
+	jit := srv.URL + "/orgs/x/actions/runners/generate-jitconfig"
+
+	plain, err := s.hasIdleRunner(context.Background(), "pat", jit, []string{"spock"}, "")
+	assert.NoError(t, err)
+	assert.True(t, plain, "an idle runner carrying the job's labels is supply")
+
+	magic, err := s.hasIdleRunner(context.Background(), "pat", jit, []string{"spock", "gce-machine-c4d-highmem-2"}, "")
+	assert.NoError(t, err)
+	assert.False(t, magic, "it cannot serve a job needing a label it does not carry")
+}
+
+func TestHasIdleRunnerIgnoresBusyOfflineAndExcluded(t *testing.T) {
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, runnersJSON(
+			runnerEntry("runner-1", "online", true, "spock"),
+			runnerEntry("runner-2", "offline", false, "spock"),
+			runnerEntry("runner-3", "online", false, "spock"),
+			runnerEntry("other-4", "online", false, "spock"),
+		))
+	}))
+	defer srv.Close()
+	s := &Autoscaler{conf: AutoscalerConfig{RunnerPrefix: "runner"}}
+	jit := srv.URL + "/orgs/x/actions/runners/generate-jitconfig"
+
+	idle, err := s.hasIdleRunner(context.Background(), "pat", jit, []string{"spock"}, "")
+	assert.NoError(t, err)
+	assert.True(t, idle, "runner-3 is online and free")
+
+	// The VM we just deleted may still be registered; it is not supply.
+	idle, err = s.hasIdleRunner(context.Background(), "pat", jit, []string{"spock"}, "runner-3")
+	assert.NoError(t, err)
+	assert.False(t, idle, "the excluded runner must not count, and busy/offline/foreign never do")
+}
+
+func TestHasIdleRunnerPaginates(t *testing.T) {
+
+	full := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		full = append(full, runnerEntry(fmt.Sprintf("runner-%d", i), "online", true, "spock"))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "1" {
+			fmt.Fprint(w, runnersJSON(full...))
+			return
+		}
+		fmt.Fprint(w, runnersJSON(runnerEntry("runner-late", "online", false, "spock")))
+	}))
+	defer srv.Close()
+	s := &Autoscaler{conf: AutoscalerConfig{RunnerPrefix: "runner"}}
+
+	idle, err := s.hasIdleRunner(context.Background(), "pat",
+		srv.URL+"/orgs/x/actions/runners/generate-jitconfig", []string{"spock"}, "")
+
+	assert.NoError(t, err)
+	assert.True(t, idle, "a full first page must not end the scan - the idle runner is on page 2")
+}
+
+func TestHasIdleRunnerSurfacesHTTPError(t *testing.T) {
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"message":"nope"}`)
+	}))
+	defer srv.Close()
+	s := &Autoscaler{conf: AutoscalerConfig{RunnerPrefix: "runner"}}
+
+	_, err := s.hasIdleRunner(context.Background(), "pat",
+		srv.URL+"/orgs/x/actions/runners/generate-jitconfig", []string{"spock"}, "")
+
+	assert.Error(t, err, "a non-200 must never be read as 'no idle runners'")
+}
+
+// --- gate error policy and ordering ----------------------------------------
+
+// Fail open: a demand check that errors must leave the pre-gate recreate
+// behaviour untouched, so a GitHub outage cannot strand every dead VM.
+func TestHandleRecreateVmRecreatesWhenGateErrors(t *testing.T) {
+
+	secret := "topsecret"
+	var kind, url string
+	var delay time.Duration
+	var job Job
+	s := recreateHandlerScaler(secret, &kind, &url, &delay, &job, nil)
+	s.needsRunnerFn = func(ctx context.Context, j Job, src Source, exclude string) (bool, error) {
+		return false, fmt.Errorf("github unreachable")
+	}
+
+	w := postRecreate(s, secret, Job{Id: 42, RepositoryFullName: "org/repo"})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, TaskKindCreate, kind, "an unreadable gate must not suppress the recreate")
+}
+
+// Fail closed: an unreadable gate must never authorise a VM nobody asked for.
+func TestHandleDeleteVmNoTopUpWhenGateErrors(t *testing.T) {
+
+	secret := "topsecret"
+	var deleted []string
+	s := deleteHandlerScaler(secret, &deleted)
+	s.conf.RouteCreateVm = "/create_vm"
+	s.instanceJobFn = func(ctx context.Context, name string) (*Job, error) {
+		return &Job{Id: 111, RepositoryFullName: "org/mccoy"}, nil
+	}
+	s.needsRunnerFn = func(ctx context.Context, j Job, src Source, exclude string) (bool, error) {
+		return false, fmt.Errorf("github unreachable")
+	}
+	var kinds []string
+	s.createTaskFn = func(ctx context.Context, kind string, url string, secret string, job Job, delay time.Duration) error {
+		kinds = append(kinds, kind)
+		return nil
+	}
+
+	w := postDelete(s, secret, Job{Id: 222, RunnerName: "runner-111"})
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []string{"runner-111"}, deleted)
+	assert.Empty(t, kinds, "an unreadable gate must not authorise a VM")
+}
+
+// The originating job lives in the VM's metadata, which dies with the VM. If the
+// read ever moves after the delete the feature silently stops working, so pin
+// the ordering rather than trusting the call site to stay put.
+func TestHandleDeleteVmReadsMetadataBeforeDeleting(t *testing.T) {
+
+	secret := "topsecret"
+	var deleted []string
+	s := deleteHandlerScaler(secret, &deleted)
+	readWhileAlive := false
+	s.instanceJobFn = func(ctx context.Context, name string) (*Job, error) {
+		readWhileAlive = len(deleted) == 0
+		return &Job{Id: 111, RepositoryFullName: "org/mccoy"}, nil
+	}
+
+	postDelete(s, secret, Job{Id: 222, RunnerName: "runner-111"})
+
+	assert.True(t, readWhileAlive, "the metadata must be read before the VM is deleted")
+	assert.Equal(t, []string{"runner-111"}, deleted)
 }
