@@ -72,6 +72,15 @@ const DefaultRunnerJobLogPattern = "Running job:"
 const TaskKindCreate string = "create"
 const TaskKindDelete string = "delete"
 
+// TaskKindTopUp names the replacement create enqueued when a VM is deleted after
+// running a *different* job than the one it was built for. It is a distinct kind
+// so a top-up never spends the create-<jobId>-N task-name suffix budget that the
+// original create and the recreate path already draw on. The cost of that
+// separation is that one job id can now back up to 6 VMs per tombstone window
+// (create-{0,1,2} plus topup-{0,1,2}) rather than 3 - still bounded, and each
+// top-up is gated on the job being queued with no idle runner.
+const TaskKindTopUp string = "topup"
+
 // How often the opportunistic orphan sweep is allowed to run. The sweep reclaims
 // stopped/terminated runner VMs (e.g. a runner that shut itself down without ever
 // picking up a job, which produces no completed-webhook). It piggybacks on the
@@ -86,10 +95,22 @@ const maxSweepDeletes = 25
 // AlreadyExists; DeleteCallbackTask must cancel every candidate.
 const maxTaskRetryCount = 2
 
+// Highest number of runner-list pages the idle scan will walk (100 per page).
+// "No idle runner" is the conclusion that authorises a create, so the scan must
+// not reach it by looking at one page; this bounds the walk without capping it
+// below any realistic pool size.
+const maxRunnerListPages = 10
+
 // recreateVmDelay is how long to wait before the re-create task fires after a
 // VM dies without accepting a job. The delay lets the dying VM fully disappear
 // before the replacement create runs; decideCreate handles any stopped leftover.
 const recreateVmDelay = 45 * time.Second
+
+// topUpVmDelay is deliberately much shorter than recreateVmDelay. DeleteInstance
+// is synchronous, so the instance name is already free when the top-up is
+// enqueued - the delay buys nothing, and every second of it widens the window in
+// which the job gets served elsewhere and the VM boots with nothing to do.
+const topUpVmDelay = 5 * time.Second
 
 const RUNNER_REGISTER_TOKEN_ORG_ENDPOINT string = "https://api.github.com/orgs/%s/actions/runners/registration-token"
 
@@ -1241,6 +1262,218 @@ func (s *Autoscaler) deleteRunnerByName(ctx context.Context, jitURL string, name
 }
 
 // A jit-config needs: RunnerName, RunnerGroupId, Labels, WorkFolder
+// jitURLForSource builds the generate-jitconfig endpoint for a source, mirroring
+// the switch in handleCreateVm. The runners-list base is derived from it.
+// apiBase is the GitHub REST root, overridable in tests.
+func (s *Autoscaler) apiBase() string {
+
+	if s.githubAPIBase != "" {
+		return s.githubAPIBase
+	}
+	return "https://api.github.com"
+}
+
+func jitURLForSource(src Source) string {
+
+	switch src.SourceType {
+	case TypeEnterprise:
+		return fmt.Sprintf(RUNNER_ENTERPRISE_JIT_CONFIG_ENDPOINT, src.Name)
+	case TypeOrganization:
+		return fmt.Sprintf(RUNNER_ORG_JIT_CONFIG_ENDPOINT, src.Name)
+	case TypeRepository:
+		return fmt.Sprintf(RUNNER_REPO_JIT_CONFIG_ENDPOINT, src.Name)
+	}
+	return ""
+}
+
+// jobIsQueued reports whether a workflow job is still waiting for a runner. A job
+// GitHub no longer knows about (404) counts as not queued.
+func (s *Autoscaler) jobIsQueued(ctx context.Context, pat string, job Job) (bool, error) {
+
+	if job.RepositoryFullName == "" {
+		return false, fmt.Errorf("job %d carries no repository - cannot read its status", job.Id)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET",
+		fmt.Sprintf("%s/repos/%s/actions/jobs/%d", s.apiBase(), job.RepositoryFullName, job.Id), nil)
+	if err != nil {
+		return false, fmt.Errorf("could not build job-status request: %w", err)
+	}
+	githubAuthHeaders(req, pat)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("job-status request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// 404 deliberately shares this path. GitHub answers 404 - not 403 - for a
+		// resource the token cannot see, so a PAT without actions:read is
+		// indistinguishable from a deleted job. Reading it as "not queued" would
+		// decline every recreate and silently disable the fleet's self-heal, so it
+		// surfaces as an error and each caller applies its own policy.
+		return false, fmt.Errorf("job-status unexpected status: %s", resp.Status)
+	}
+	var payload struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return false, fmt.Errorf("could not parse job status: %w", err)
+	}
+	return payload.Status == "queued", nil
+}
+
+// hasIdleRunner reports whether any runner we own is registered and not busy, i.e.
+// whether the current pool can already serve a queued job. Paginated on purpose:
+// a false negative here authorises a VM nobody needs.
+func (s *Autoscaler) hasIdleRunner(ctx context.Context, pat string, jitURL string, required []string, excludeName string) (bool, error) {
+
+	base := runnersBaseFromJitURL(jitURL)
+	if base == "" {
+		return false, fmt.Errorf("no runners endpoint for this source")
+	}
+	for page := 1; page <= maxRunnerListPages; page++ {
+		req, err := http.NewRequestWithContext(ctx, "GET",
+			fmt.Sprintf("%s?per_page=100&page=%d", base, page), nil)
+		if err != nil {
+			return false, fmt.Errorf("could not build list-runners request: %w", err)
+		}
+		githubAuthHeaders(req, pat)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return false, fmt.Errorf("list runners request failed: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return false, fmt.Errorf("list runners unexpected status: %s", resp.Status)
+		}
+		var payload struct {
+			Runners []struct {
+				Name   string `json:"name"`
+				Status string `json:"status"`
+				Busy   bool   `json:"busy"`
+				Labels []struct {
+					Name string `json:"name"`
+				} `json:"labels"`
+			} `json:"runners"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&payload)
+		resp.Body.Close()
+		if err != nil {
+			return false, fmt.Errorf("could not parse runners list: %w", err)
+		}
+		for _, r := range payload.Runners {
+			if r.Name == excludeName || !IsOwnedRunnerName(s.conf.RunnerPrefix, r.Name) {
+				continue
+			}
+			if r.Status != "online" || r.Busy {
+				continue
+			}
+			labels := make([]string, 0, len(r.Labels))
+			for _, l := range r.Labels {
+				labels = append(labels, l.Name)
+			}
+			if runnerCarriesLabels(labels, required) {
+				return true, nil
+			}
+		}
+		if len(payload.Runners) < 100 {
+			break
+		}
+	}
+	return false, nil
+}
+
+// runnerCarriesLabels reports whether a runner can serve a job needing `required`.
+// A JIT runner registers with its own job's labels - magic gce-machine-* labels
+// included - so an idle runner is only supply for jobs whose labels it carries.
+// Counting a plain runner as supply for a magic-label job strands that job with a
+// confident answer no fail-open path can rescue.
+func runnerCarriesLabels(has []string, required []string) bool {
+
+	for _, want := range required {
+		found := false
+		for _, got := range has {
+			if strings.EqualFold(got, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// needsRunner reports whether a replacement VM is actually warranted for job:
+// the job must still be queued (demand) and no runner may be idle (no supply).
+//
+// Both halves are load-bearing. Queued alone is not evidence - with any backlog
+// some job is nearly always queued, so replacing on that signal alone creates
+// VMs for jobs the existing pool is about to serve. It also self-limits: a
+// top-up becomes the idle runner that declines the next one.
+//
+// Known limits, both erring towards creating too few rather than too many. The
+// supply side is a boolean, not a count, so one idle runner suppresses every
+// concurrent check even though an ephemeral runner takes exactly one job; and it
+// only sees runners already registered, not VMs still booting or creates still
+// queued. GitHub exposes no org-scoped list of queued jobs, so a true
+// queued-vs-live reconciliation is not available here.
+func (s *Autoscaler) needsRunner(ctx context.Context, job Job, src Source, excludeRunner string) (bool, error) {
+
+	pat, err := s.readPat(ctx)
+	if err != nil {
+		return false, err
+	}
+	queued, err := s.jobIsQueued(ctx, pat, job)
+	if err != nil || !queued {
+		return false, err
+	}
+	idle, err := s.hasIdleRunner(ctx, pat, jitURLForSource(src), job.Labels, excludeRunner)
+	if err != nil {
+		return false, err
+	}
+	return !idle, nil
+}
+
+// instanceJob recovers the job a VM was created for, from the recreate payload
+// stored in its own metadata. The completed webhook names whichever job actually
+// ran on the VM - routinely a different job, in a different repository - so this
+// is the only place the originating job's id and repo survive. Returns nil when
+// the VM or the attribute is gone, which callers treat as "unknown, do nothing".
+func (s *Autoscaler) instanceJob(ctx context.Context, instanceName string) (*Job, error) {
+
+	if s.conf.Simulate {
+		return nil, nil
+	}
+	client := newComputeClient(ctx)
+	defer client.Close()
+	for _, zone := range s.OrderedZones(instanceName) {
+		inst, err := client.Get(ctx, &computepb.GetInstanceRequest{
+			Project:  s.conf.ProjectId,
+			Zone:     zone,
+			Instance: instanceName,
+		})
+		if err != nil {
+			if IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		for _, item := range inst.GetMetadata().GetItems() {
+			if item.GetKey() != RECREATE_CALLBACK_PAYLOAD_ATTR {
+				continue
+			}
+			var job Job
+			if err := json.Unmarshal([]byte(item.GetValue()), &job); err != nil {
+				return nil, fmt.Errorf("could not parse %s on %s: %w", RECREATE_CALLBACK_PAYLOAD_ATTR, instanceName, err)
+			}
+			return &job, nil
+		}
+		return nil, nil
+	}
+	return nil, nil
+}
+
 func (s *Autoscaler) GenerateRunnerJitConfig(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error) {
 
 	log.Debugf("About to request GitHub runner %s jit config from %s (runner group %d) using PAT from secret version: %s", runnerName, url, runnerGroupId, s.conf.SecretVersion)
@@ -1379,14 +1612,19 @@ func (s *Autoscaler) DeleteCallbackTask(ctx context.Context, job Job) error {
 
 	var lastErr error
 	deletedAny := false
-	for retryCount := 0; retryCount <= maxTaskRetryCount; retryCount++ {
-		err := client.DeleteTask(ctx, &taskspb.DeleteTaskRequest{
-			Name: CallbackTaskName(s.conf.TaskQueue, TaskKindCreate, job.Id, retryCount),
-		})
-		if err == nil {
-			deletedAny = true
-		} else if !IsNotFound(err) {
-			lastErr = err
+	// Both kinds: a top-up carries its own task-name namespace, so cancelling only
+	// the create kind would leave a queued top-up to build a VM for a job that has
+	// since been cancelled or moved to 'waiting'.
+	for _, kind := range []string{TaskKindCreate, TaskKindTopUp} {
+		for retryCount := 0; retryCount <= maxTaskRetryCount; retryCount++ {
+			err := client.DeleteTask(ctx, &taskspb.DeleteTaskRequest{
+				Name: CallbackTaskName(s.conf.TaskQueue, kind, job.Id, retryCount),
+			})
+			if err == nil {
+				deletedAny = true
+			} else if !IsNotFound(err) {
+				lastErr = err
+			}
 		}
 	}
 	if deletedAny {
@@ -1564,6 +1802,66 @@ func (s *Autoscaler) recreateMetadata(ginCtx *gin.Context, job Job, src Source) 
 	}
 }
 
+// runnerNeeded resolves the demand-gate seam.
+func (s *Autoscaler) runnerNeeded(ctx context.Context, job Job, src Source, excludeRunner string) (bool, error) {
+
+	needs := s.needsRunnerFn
+	if needs == nil {
+		needs = s.needsRunner
+	}
+	return needs(ctx, job, src, excludeRunner)
+}
+
+// originatingJob resolves the metadata-read seam. A origin we cannot read must
+// never block the delete - it only means no top-up.
+func (s *Autoscaler) originatingJob(ctx context.Context, instanceName string) *Job {
+
+	read := s.instanceJobFn
+	if read == nil {
+		read = s.instanceJob
+	}
+	job, err := read(ctx, instanceName)
+	if err != nil {
+		log.Warnf("Could not read the originating job of %s: %s", instanceName, err.Error())
+		return nil
+	}
+	return job
+}
+
+// maybeTopUp replaces the VM a job lost to a different job. GitHub dispatches by
+// label, not job id, so the VM built for one job routinely runs another and is
+// then deleted when that other job completes - leaving the original job queued
+// with no VM and nothing to create one. This is the only point that loss is
+// observable. Errors fail closed, so the path stays inert until the PAT carries
+// actions:read.
+func (s *Autoscaler) maybeTopUp(ginCtx *gin.Context, opCtx context.Context, origin *Job, completed Job, src Source) {
+
+	if origin == nil || origin.Id == 0 || origin.Id == completed.Id {
+		return
+	}
+	if s.conf.RouteCreateVm == "" {
+		log.Warnf("Job %d lost its VM but RouteCreateVm is unset - cannot top up", origin.Id)
+		return
+	}
+	needs, err := s.runnerNeeded(opCtx, *origin, src, completed.RunnerName)
+	if err != nil {
+		log.Warnf("Top-up for job %d: demand check failed (%s) - not creating", origin.Id, err.Error())
+		return
+	}
+	if !needs {
+		return
+	}
+	createTask := s.createTaskFn
+	if createTask == nil {
+		createTask = s.CreateCallbackTaskWithToken
+	}
+	createUrl := createCallbackUrl(ginCtx, s.conf.RouteCreateVm, s.conf.SourceQueryParam, src.Name)
+	log.Infof("Job %d lost its VM to job %d and is still queued with no idle runner - topping up", origin.Id, completed.Id)
+	if err := createTask(opCtx, TaskKindTopUp, createUrl, src.Secret, *origin, topUpVmDelay); err != nil {
+		log.Errorf("Can not enqueue top-up create task for job %d: %s", origin.Id, err.Error())
+	}
+}
+
 func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 
 	log.Info("Received create-vm cloud task callback")
@@ -1605,7 +1903,7 @@ func (s *Autoscaler) handleCreateVm(ctx *gin.Context) {
 func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 
 	log.Info("Received delete-vm cloud task callback")
-	if data, _, err := s.verifySignature(ctx); err == nil {
+	if data, src, err := s.verifySignature(ctx); err == nil {
 		job := Job{}
 		if err := json.Unmarshal(data, &job); err != nil || job.Id == 0 {
 			// Corrupt or missing payload: retrying can't help, so ack with 200.
@@ -1625,10 +1923,15 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 		}
 		opCtx, cancel := s.opContext()
 		defer cancel()
+		// Read the VM's originating job before deleting it: the metadata that
+		// carries it disappears with the instance, and the webhook names a
+		// different job - usually in another repository.
+		origin := s.originatingJob(opCtx, job.RunnerName)
 		if err := s.DeleteInstance(opCtx, job.RunnerName); err != nil {
 			ctx.AbortWithError(http.StatusInternalServerError, err)
 		} else {
 			ctx.Status(http.StatusOK)
+			s.maybeTopUp(ctx, opCtx, origin, job, src)
 		}
 		// Run the orphan sweep detached so it can't hold the callback open past the
 		// Cloud Tasks dispatch deadline (which would trigger a retry). It uses its own
@@ -1660,6 +1963,19 @@ func (s *Autoscaler) handleRecreateVm(ctx *gin.Context) {
 		// mid-enqueue would silently lose the only recreate signal for this job.
 		opCtx, cancel := s.opContext()
 		defer cancel()
+		// Demand check before re-creating. Without it a VM that boots with nothing
+		// to pick up shuts down and recreates again, burning a full dispatch
+		// timeout each lap until the task-name suffix budget quietly runs out.
+		// Errors fail open, so a GitHub outage - or a PAT still missing
+		// actions:read - leaves the pre-gate behaviour exactly as it was.
+		if needs, err := s.runnerNeeded(opCtx, job, src, InstanceName(s.conf.RunnerPrefix, job.Id)); err != nil {
+			log.Warnf("Recreate-vm for job %d: demand check failed (%s) - recreating anyway", job.Id, err.Error())
+		} else if !needs {
+			log.Infof("Recreate-vm for job %d declined: it is no longer queued, or an idle runner can already serve it", job.Id)
+			ctx.Status(http.StatusOK)
+			return
+		}
+
 		// CreateCallbackTaskWithToken's tombstone suffix bumping caps total creates
 		// per job id - this is the recreate loop protection.
 		if err := createTask(opCtx, TaskKindCreate, createUrl, src.Secret, job, recreateVmDelay); err != nil {
@@ -1832,6 +2148,15 @@ type Autoscaler struct {
 	jitConfigFn     func(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error)
 	deleteRunnerFn  func(ctx context.Context, jitURL string, name string) error
 	instanceStateFn func(ctx context.Context, instanceName string) (bool, State, error)
+
+	// needsRunnerFn / instanceJobFn are test seams for the starvation gate: the
+	// GitHub demand check, and the read of a VM's originating job out of its own
+	// metadata. nil in production.
+	needsRunnerFn func(ctx context.Context, job Job, src Source, excludeRunner string) (bool, error)
+	instanceJobFn func(ctx context.Context, instanceName string) (*Job, error)
+
+	// githubAPIBase overrides the GitHub REST root. Empty in production.
+	githubAPIBase string
 }
 
 func NewAutoscaler(config AutoscalerConfig) *Autoscaler {
