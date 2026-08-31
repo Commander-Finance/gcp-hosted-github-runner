@@ -168,3 +168,49 @@ resource "google_monitoring_alert_policy" "runner_rate_limited" {
 
   notification_channels = var.alert_notification_channels
 }
+
+// Counts dropped callback enqueues: every Cloud Tasks retry suffix for a job id is
+// tombstoned, so the autoscaler refuses to mint another create/delete callback (the
+// per-job loop cap, typically hit by repeated SPOT-preemption recreates). Each count
+// is a job whose runner silently stops coming back - previously this drop was
+// indistinguishable from a generic CreateTask failure.
+resource "google_logging_metric" "runner_callback_budget_exhausted" {
+  name   = "github_runner/callback_budget_exhausted"
+  filter = "${local.autoscaler_log_filter} severity=ERROR jsonPayload.message=~\"^Callback budget exhausted\""
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_monitoring_alert_policy" "runner_callback_budget_exhausted" {
+  display_name = "GitHub runner: callback budget exhausted (job dropped)"
+  combiner     = "OR"
+  depends_on   = [google_project_service.monitoring_api]
+
+  conditions {
+    display_name = "dropped callback enqueues in the last 5 min"
+    condition_threshold {
+      filter     = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.runner_callback_budget_exhausted.name}\" resource.type=\"cloud_run_revision\""
+      comparison = "COMPARISON_GT"
+      // Any occurrence means a specific job was abandoned by the recreate loop cap;
+      // there is no benign baseline, so alert on the first one.
+      threshold_value = 0
+      duration        = "0s"
+      trigger {
+        count = 1
+      }
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_SUM"
+        // Sum across Cloud Run revisions (see jit_config_failed for rationale).
+        cross_series_reducer = "REDUCE_SUM"
+        group_by_fields      = []
+      }
+    }
+  }
+
+  notification_channels = var.alert_notification_channels
+}

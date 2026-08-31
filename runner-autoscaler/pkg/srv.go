@@ -1244,8 +1244,6 @@ func (s *Autoscaler) deleteRunnerByName(ctx context.Context, jitURL string, name
 func (s *Autoscaler) GenerateRunnerJitConfig(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error) {
 
 	log.Debugf("About to request GitHub runner %s jit config from %s (runner group %d) using PAT from secret version: %s", runnerName, url, runnerGroupId, s.conf.SecretVersion)
-	secretAccessClient := newSecretAccessClient(ctx)
-	defer secretAccessClient.Close()
 	if pat, err := s.readPat(ctx); err != nil {
 		return "", err
 	} else {
@@ -1347,11 +1345,20 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 				if _, getErr := client.GetTask(ctx, &taskspb.GetTaskRequest{Name: name}); getErr == nil {
 					log.Infof("Cloud task callback for job Id %d already queued (%s) - not duplicating", job.Id, name)
 					return nil
-				} else if IsNotFound(getErr) && retryCount < maxTaskRetryCount {
-					return sendAndRetry(retryCount + 1)
+				} else if IsNotFound(getErr) {
+					if retryCount < maxTaskRetryCount {
+						return sendAndRetry(retryCount + 1)
+					}
+					// Every suffix (0..maxTaskRetryCount) is tombstoned: this job id has
+					// consumed its whole callback budget (e.g. repeated SPOT-preemption
+					// recreates). The drop is the intended loop cap, but it must be loud -
+					// from the job's perspective the runner silently stops coming back.
+					// The "callback budget exhausted" prefix feeds a log-based metric.
+					log.Errorf("Callback budget exhausted for %s job Id %d - dropping enqueue after %d tombstoned suffixes", kind, job.Id, maxTaskRetryCount+1)
+					return fmt.Errorf("callback budget exhausted for %s job Id %d: %w", kind, job.Id, err)
 				}
 			}
-			return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %v", job.Id, err)
+			return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %w", job.Id, err)
 		} else {
 			log.Infof("Created cloud task callback for workflow job Id %d with url \"%s\" and payload \"%s\"", job.Id, url, data)
 			return nil
