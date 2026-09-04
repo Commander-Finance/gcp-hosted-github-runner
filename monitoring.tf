@@ -10,6 +10,13 @@ resource "google_project_service" "monitoring_api" {
 
 locals {
   autoscaler_log_filter = "resource.type=\"cloud_run_revision\" resource.labels.service_name=\"${google_cloud_run_v2_service.autoscaler.name}\""
+
+  // Cloud Run stores a structured log line that carries only message and severity
+  // as textPayload, and one with any extra field as jsonPayload. The autoscaler's
+  // Warnf/Errorf lines have no extra fields, so a metric that matches only
+  // jsonPayload.message never fires on them. format(local.msg_re, "<regex>")
+  // matches the pattern against both fields.
+  msg_re = "(jsonPayload.message=~\"%[1]s\" OR textPayload=~\"%[1]s\")"
 }
 
 // Counts created runner VMs, labelled by provisioning model ("spot" / "standard").
@@ -40,7 +47,7 @@ resource "google_logging_metric" "runner_vm_created" {
 // non-retryable create error).
 resource "google_logging_metric" "runner_vm_create_failed" {
   name   = "github_runner/vm_create_failed"
-  filter = "${local.autoscaler_log_filter} severity=ERROR (jsonPayload.message=~\"^Could not create instance\" OR jsonPayload.message=~\"^Exhausted all zones\")"
+  filter = "${local.autoscaler_log_filter} severity=ERROR (${format(local.msg_re, "^Could not create instance")} OR ${format(local.msg_re, "^Exhausted all zones")})"
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -82,7 +89,7 @@ resource "google_monitoring_alert_policy" "runner_vm_create_failed" {
 // silently left jobs pending until a human spotted it.
 resource "google_logging_metric" "runner_jit_config_failed" {
   name   = "github_runner/jit_config_failed"
-  filter = "${local.autoscaler_log_filter} severity>=WARNING jsonPayload.message=~\"jit-config\""
+  filter = "${local.autoscaler_log_filter} severity>=WARNING ${format(local.msg_re, "jit-config")}"
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -129,7 +136,7 @@ resource "google_monitoring_alert_policy" "runner_jit_config_failed" {
 // pressure - the precursor to the create-amplification spiral that hangs jobs.
 resource "google_logging_metric" "runner_rate_limited" {
   name   = "github_runner/rate_limited"
-  filter = "${local.autoscaler_log_filter} severity>=WARNING jsonPayload.message=~\"returning for Cloud Tasks backoff\""
+  filter = "${local.autoscaler_log_filter} severity>=WARNING ${format(local.msg_re, "returning for Cloud Tasks backoff")}"
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -175,7 +182,7 @@ resource "google_monitoring_alert_policy" "runner_rate_limited" {
 // so a zone that trips repeatedly can be reviewed for removal from machine_zones.
 resource "google_logging_metric" "runner_zone_benched" {
   name   = "github_runner/zone_benched"
-  filter = "${local.autoscaler_log_filter} severity>=WARNING jsonPayload.message=~\"^Benched zone\""
+  filter = "${local.autoscaler_log_filter} severity>=WARNING ${format(local.msg_re, "^Benched zone")}"
 
   metric_descriptor {
     metric_kind = "DELTA"
