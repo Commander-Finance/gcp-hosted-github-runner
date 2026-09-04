@@ -289,6 +289,25 @@ func TestZoneReportFromEntriesCountsDistinctVMs(t *testing.T) {
 	assert.Equal(t, map[string]int{"us-central1-b": 2, "us-central1-f": 1}, r.created)
 }
 
+func TestZoneReportFromEntriesAcceptsMapPayloads(t *testing.T) {
+
+	// logadmin v1.10.0 hands jsonPayload over as *structpb.Struct and carries a TODO
+	// to switch to map[string]interface{}. A future bump must not silently empty the
+	// sensor, so both shapes decode.
+	failing := []*logging.Entry{
+		{
+			Resource: &mrpb.MonitoredResource{Labels: map[string]string{"zone": "us-central1-b", "instance_id": "111"}},
+			Payload:  map[string]interface{}{"message": "Sep  4 03:22:26 runner-111 otelopscol[703]: Exporting failed ... i/o timeout"},
+		},
+	}
+	created := []*logging.Entry{
+		{Payload: map[string]interface{}{"message": "Created instance runner-1 (us-central1-b) as spot", "zone": "us-central1-b", "instance": "runner-1"}},
+	}
+	r := zoneReportFromEntries("runner", failing, created)
+	assert.Equal(t, map[string]int{"us-central1-b": 1}, r.failing)
+	assert.Equal(t, map[string]int{"us-central1-b": 1}, r.created)
+}
+
 func TestZoneHealthFiltersScopeByTimeProjectAndService(t *testing.T) {
 
 	since := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)

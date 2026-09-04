@@ -250,15 +250,11 @@ func zoneReportFromEntries(runnerPrefix string, failing []*logging.Entry, create
 
 	seenCreated := map[string]bool{}
 	for i, e := range created {
-		payload, ok := e.Payload.(*structpb.Struct)
-		if !ok {
-			continue
-		}
-		zone := payload.GetFields()["zone"].GetStringValue()
+		zone := payloadString(e.Payload, "zone")
 		if zone == "" {
 			continue
 		}
-		key := payload.GetFields()["instance"].GetStringValue()
+		key := payloadString(e.Payload, "instance")
 		if key == "" {
 			key = fmt.Sprintf("#%d", i)
 		}
@@ -277,15 +273,27 @@ func zoneReportFromEntries(runnerPrefix string, failing []*logging.Entry, create
 // name, so the line itself is the only place the runner's name appears.
 func syslogHostname(payload interface{}) string {
 
-	st, ok := payload.(*structpb.Struct)
-	if !ok {
-		return ""
-	}
-	fields := strings.Fields(st.GetFields()["message"].GetStringValue())
+	fields := strings.Fields(payloadString(payload, "message"))
 	if len(fields) < 4 {
 		return ""
 	}
 	return fields[3]
+}
+
+// payloadString reads one string field from a jsonPayload. logadmin currently
+// delivers jsonPayload as *structpb.Struct and carries a TODO to switch to
+// map[string]interface{}; accepting both keeps a library bump from silently
+// emptying the sensor (which fails open, so nothing would announce it).
+func payloadString(payload interface{}, key string) string {
+
+	switch p := payload.(type) {
+	case *structpb.Struct:
+		return p.GetFields()[key].GetStringValue()
+	case map[string]interface{}:
+		s, _ := p[key].(string)
+		return s
+	}
+	return ""
 }
 
 // queryZoneReport is the production sensor: two bounded Cloud Logging reads. The
