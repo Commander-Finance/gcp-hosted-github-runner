@@ -854,10 +854,13 @@ const standardFallbackFamilies = 2
 //     familyFallbackPlan): one attempt per machine type on the SPOT template (rotating
 //     zones), then the top few on-demand.
 //
+// benched zones (from the zone circuit breaker) are rotated to the end of the zone
+// order so every plan shape tries a healthy zone first; nil means none.
+//
 // Pure (no I/O) so the ordering is testable.
-func (s *Autoscaler) creationPlan(instanceName string, override *string) []creationAttempt {
+func (s *Autoscaler) creationPlan(instanceName string, override *string, benched map[string]bool) []creationAttempt {
 
-	zones := s.OrderedZones(instanceName)
+	zones := s.orderedZonesBenched(instanceName, benched)
 	if len(zones) == 0 {
 		return []creationAttempt{}
 	}
@@ -986,7 +989,9 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 		return nil
 	}
 
-	plan := s.creationPlan(instanceName, machineType)
+	// The breaker query is bounded and fails open, so it can sit on the create path
+	// (the service scales to zero; there is no other place for it to run).
+	plan := s.creationPlan(instanceName, machineType, s.benchedZonesCached(ctx))
 	if len(plan) == 0 {
 		// No attempt would run (no zones configured) - surface it instead of
 		// silently reporting success.
@@ -1796,6 +1801,14 @@ type AutoscalerConfig struct {
 	CreateVmDelay        int64
 	RunnerJobLogPattern  string
 	Simulate             bool
+
+	// Zone circuit breaker (see zonehealth.go). A zone is tried last when at least
+	// ZoneBenchMinVMs of its runner VMs logged an outbound dial timeout in the last
+	// ZoneHealthWindow seconds and they are at least ZoneBenchMinRatio of the VMs
+	// created there in that window. ZoneBenchMinVMs <= 0 disables the breaker.
+	ZoneBenchMinVMs   int64
+	ZoneBenchMinRatio float64
+	ZoneHealthWindow  int64
 }
 
 // Validate checks startup invariants that, if violated, would leave the
@@ -1809,6 +1822,13 @@ func (c AutoscalerConfig) Validate() error {
 	// own. An empty prefix breaks both create and delete, so refuse to start.
 	if c.RunnerPrefix == "" {
 		return fmt.Errorf("RunnerPrefix must not be empty")
+	}
+	// The bench ratio is compared against failing/created, which lies in (0, 1]
+	// because the denominator floors at the failing count. A ratio <= 0 benches on
+	// the VM count alone and a ratio > 1 can never be met; both silently change
+	// what the breaker does, so refuse to start while the breaker is enabled.
+	if c.ZoneBenchMinVMs > 0 && (c.ZoneBenchMinRatio <= 0 || c.ZoneBenchMinRatio > 1) {
+		return fmt.Errorf("ZoneBenchMinRatio must be in (0, 1] when ZoneBenchMinVMs > 0, got %v", c.ZoneBenchMinRatio)
 	}
 	return nil
 }
@@ -1832,6 +1852,15 @@ type Autoscaler struct {
 	jitConfigFn     func(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error)
 	deleteRunnerFn  func(ctx context.Context, jitURL string, name string) error
 	instanceStateFn func(ctx context.Context, instanceName string) (bool, State, error)
+
+	// Zone circuit breaker state (see zonehealth.go). zoneReportFn is the test seam
+	// for the Cloud Logging sensor; nil in production. The cache fields are guarded
+	// by zoneMu and are deliberately process-local: the service scales to zero, so
+	// Cloud Logging holds the durable state and this is only a rate limiter.
+	zoneReportFn  func(ctx context.Context, since time.Time) (zoneReport, error)
+	zoneMu        sync.Mutex
+	zoneBenched   map[string]bool
+	zoneCheckedAt time.Time
 }
 
 func NewAutoscaler(config AutoscalerConfig) *Autoscaler {

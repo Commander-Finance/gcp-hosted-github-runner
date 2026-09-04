@@ -21,6 +21,16 @@ func getEnvDefaultInt64(name string, defaultValue int64) int64 {
 	return defaultValue
 }
 
+func getEnvDefaultFloat64(name string, defaultValue float64) float64 {
+
+	if val, ok := os.LookupEnv(name); ok {
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return f
+		}
+	}
+	return defaultValue
+}
+
 func getEnvDefault(name string, defaultValue string) string {
 
 	if val, ok := os.LookupEnv(name); ok {
@@ -77,6 +87,9 @@ func main() {
 		SecretVersion:            mustGetEnv("SECRET_VERSION"),
 		RunnerPrefix:             getEnvDefault("RUNNER_PREFIX", "runner"),
 		RunnerGroupId:            getEnvDefaultInt64("RUNNER_GROUP_ID", 1),
+		ZoneBenchMinVMs:          getEnvDefaultInt64("ZONE_BENCH_MIN_VMS", 3),
+		ZoneBenchMinRatio:        getEnvDefaultFloat64("ZONE_BENCH_MIN_RATIO", 0.2),
+		ZoneHealthWindow:         getEnvDefaultInt64("ZONE_HEALTH_WINDOW", 600),
 		RegisteredSources:        map[string]pkg.Source{},
 		SourceQueryParam:         getEnvDefault("SOURCE_QUERY_PARAM_NAME", "src"),
 		CreateVmDelay:            getEnvDefaultInt64("CREATE_VM_DELAY", 10),
