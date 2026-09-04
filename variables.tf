@@ -137,6 +137,37 @@ variable "autoscaler_timeout" {
   default     = 180
 }
 
+variable "zone_bench_min_vms" {
+  type        = number
+  description = <<-EOT
+    Zone circuit breaker: a zone is tried last when at least this many of its runner VMs
+    logged an outbound dial timeout (the Ops Agent's "Exporting failed ... i/o timeout"
+    line) in the last zone_health_window seconds. The autoscaler reads the signal from
+    Cloud Logging on the VM-create path, cached for 60 s, and fails open. The signal
+    exists only if machine_image ships the Ops Agent with its default syslog receiver
+    (this module does not install it); without it the breaker never trips. 0 disables
+    the breaker.
+  EOT
+  default     = 3
+}
+
+variable "zone_bench_min_ratio" {
+  type        = number
+  description = "Zone circuit breaker: the failing VMs must also be at least this fraction of the VMs created in that zone in the window (0.2 = 20%). Both thresholds must hold."
+  default     = 0.2
+
+  validation {
+    condition     = var.zone_bench_min_ratio > 0 && var.zone_bench_min_ratio <= 1
+    error_message = "zone_bench_min_ratio must be a fraction in (0, 1]."
+  }
+}
+
+variable "zone_health_window" {
+  type        = number
+  description = "Zone circuit breaker lookback in seconds. Long enough to span the cache TTL and the Ops Agent's one-minute retry, short enough that a zone is released soon after it recovers."
+  default     = 600
+}
+
 variable "enable_ssh" {
   type        = bool
   description = "Enable SSH access to the VM instances."

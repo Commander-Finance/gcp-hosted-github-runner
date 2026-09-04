@@ -56,6 +56,18 @@ resource "google_cloud_run_v2_service" "autoscaler" {
         value = var.autoscaler_timeout
       }
       env {
+        name  = "ZONE_BENCH_MIN_VMS"
+        value = var.zone_bench_min_vms
+      }
+      env {
+        name  = "ZONE_BENCH_MIN_RATIO"
+        value = var.zone_bench_min_ratio
+      }
+      env {
+        name  = "ZONE_HEALTH_WINDOW"
+        value = var.zone_health_window
+      }
+      env {
         name  = "CREATE_VM_DELAY"
         value = var.machine_creation_delay
       }

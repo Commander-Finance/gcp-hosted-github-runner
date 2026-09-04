@@ -27,7 +27,7 @@ func spotFallbackScaler(zones []string) *Autoscaler {
 func TestCreationPlanSpotFirstThenStandard(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"z1", "z2", "z3"})
-	plan := s.creationPlan("runner-7", nil)
+	plan := s.creationPlan("runner-7", nil, nil)
 
 	require.Len(t, plan, 6) // 2 templates x 3 zones
 	// All SPOT/primary attempts come first, then all STANDARD/ondemand attempts.
@@ -54,7 +54,7 @@ func TestCreationPlanSpotFirstThenStandard(t *testing.T) {
 func TestCreationPlanEmptyWhenNoZones(t *testing.T) {
 
 	s := &Autoscaler{conf: AutoscalerConfig{InstanceTemplate: "primary", FallbackInstanceTemplate: "ondemand"}}
-	assert.Empty(t, s.creationPlan("runner-7", nil))
+	assert.Empty(t, s.creationPlan("runner-7", nil, nil))
 }
 
 func TestIsStoppedPredicate(t *testing.T) {
@@ -150,7 +150,7 @@ var testFamilies = []string{
 func TestCreationPlanFamilyFallbackOrder(t *testing.T) {
 
 	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, testFamilies)
-	plan := s.creationPlan("runner-7", nil)
+	plan := s.creationPlan("runner-7", nil, nil)
 	ordered := s.OrderedZones("runner-7")
 
 	require.Len(t, plan, len(testFamilies)+standardFallbackFamilies) // 7 + 2 = 9
@@ -177,7 +177,7 @@ func TestCreationPlanMagicLabelDisablesFamilyFallback(t *testing.T) {
 
 	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, testFamilies)
 	override := "c2d-standard-16"
-	plan := s.creationPlan("runner-7", &override)
+	plan := s.creationPlan("runner-7", &override, nil)
 
 	require.Len(t, plan, 8) // legacy 2 templates x 4 zones, NOT the family shape
 	for i, a := range plan {
@@ -196,7 +196,7 @@ func TestCreationPlanMagicLabelDisablesFamilyFallback(t *testing.T) {
 func TestCreationPlanEmptyFallbackListIsLegacy(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"z1", "z2", "z3"}) // no MachineTypeFallbacks
-	plan := s.creationPlan("runner-7", nil)
+	plan := s.creationPlan("runner-7", nil, nil)
 
 	require.Len(t, plan, 6) // 2 templates x 3 zones
 	for i, a := range plan {
@@ -214,7 +214,7 @@ func TestCreationPlanFamilyFallbackNoSpotTemplate(t *testing.T) {
 		InstanceTemplate:     "primary",
 		MachineTypeFallbacks: fams, // no FallbackInstanceTemplate => primary is on-demand
 	}}
-	plan := s.creationPlan("runner-7", nil)
+	plan := s.creationPlan("runner-7", nil, nil)
 
 	require.Len(t, plan, len(fams)) // no STANDARD pass appended
 	for i, fam := range fams {
@@ -233,7 +233,7 @@ func TestCreationPlanFamilyFallbackBoundsAttemptCount(t *testing.T) {
 
 	const maxCreateAttemptsBudget = 12
 	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, testFamilies)
-	plan := s.creationPlan("runner-7", nil)
+	plan := s.creationPlan("runner-7", nil, nil)
 
 	assert.LessOrEqual(t, len(plan), len(testFamilies)+standardFallbackFamilies, "no attempt explosion (e.g. reverting to family×zone)")
 	assert.Less(t, len(plan), maxCreateAttemptsBudget, "plan must fit the deadline budget")
@@ -300,7 +300,7 @@ func TestCreateInstanceFamilyFallbackInvalidTypeIsFatal(t *testing.T) {
 func TestCreationPlanFamilyFallbackDedupes(t *testing.T) {
 
 	s := familyScaler([]string{"z1", "z2", "z3", "z4"}, []string{"n4-standard-2", "n4-standard-2", "c4-standard-2"})
-	plan := s.creationPlan("runner-7", nil)
+	plan := s.creationPlan("runner-7", nil, nil)
 
 	// 2 distinct SPOT attempts + 2 on-demand (clamped to the 2 distinct families).
 	require.Len(t, plan, 4)
@@ -317,7 +317,7 @@ func TestCreationPlanFamilyFallbackDedupes(t *testing.T) {
 func TestCreationPlanFamilyFallbackClampsStandardPassToFamilyCount(t *testing.T) {
 
 	s := familyScaler([]string{"z1", "z2"}, []string{"only-fam"})
-	plan := s.creationPlan("runner-7", nil)
+	plan := s.creationPlan("runner-7", nil, nil)
 
 	require.Len(t, plan, 2) // 1 SPOT + 1 (clamped) STANDARD
 	assert.Equal(t, "spot", plan[0].provisioningModel)
@@ -353,7 +353,7 @@ func TestCreationPlanStandardOnlyWhenNotPreemptible(t *testing.T) {
 		Zones:            []string{"z1", "z2"},
 		InstanceTemplate: "primary",
 	}}
-	plan := s.creationPlan("runner-7", nil)
+	plan := s.creationPlan("runner-7", nil, nil)
 
 	require.Len(t, plan, 2)
 	for _, a := range plan {

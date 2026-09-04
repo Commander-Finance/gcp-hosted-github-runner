@@ -168,3 +168,45 @@ resource "google_monitoring_alert_policy" "runner_rate_limited" {
 
   notification_channels = var.alert_notification_channels
 }
+
+// Counts zone circuit-breaker trips (the "Benched zone" log, emitted once per
+// transition, not per minute). One trip is GCP zonal network degradation that the
+// breaker is already routing around; the alert exists so the event is visible and
+// so a zone that trips repeatedly can be reviewed for removal from machine_zones.
+resource "google_logging_metric" "runner_zone_benched" {
+  name   = "github_runner/zone_benched"
+  filter = "${local.autoscaler_log_filter} severity>=WARNING jsonPayload.message=~\"^Benched zone\""
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_monitoring_alert_policy" "runner_zone_benched" {
+  display_name = "GitHub runner: zone benched for outbound connectivity loss"
+  combiner     = "OR"
+  depends_on   = [google_project_service.monitoring_api]
+
+  conditions {
+    display_name = "a zone was benched in the last 5 min"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.runner_zone_benched.name}\" resource.type=\"cloud_run_revision\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+      trigger {
+        count = 1
+      }
+      aggregations {
+        alignment_period     = "300s"
+        per_series_aligner   = "ALIGN_SUM"
+        cross_series_reducer = "REDUCE_SUM"
+        group_by_fields      = []
+      }
+    }
+  }
+
+  notification_channels = var.alert_notification_channels
+}

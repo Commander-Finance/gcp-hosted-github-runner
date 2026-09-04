@@ -104,6 +104,24 @@ resource "google_project_iam_member" "list_vm_instances_member" {
   role    = google_project_iam_custom_role.list_vm_instances.id
 }
 
+// logging.logEntries.list is required by the zone circuit breaker, which reads the
+// runner VMs' Ops Agent dial-timeout lines and the autoscaler's own create log to
+// decide which zone to try last. Log reads cannot be narrowed by IAM condition to a
+// log name, so like the instance-list grant this is project-wide, and like it the
+// role holds the one permission the call needs rather than the predefined viewer
+// role, which would also expose sinks, exclusions, metrics and bucket config.
+resource "google_project_iam_custom_role" "read_log_entries" {
+  role_id     = "ReadLogEntries"
+  title       = "Read log entries"
+  permissions = ["logging.logEntries.list"]
+}
+
+resource "google_project_iam_member" "read_log_entries_member" {
+  project = local.projectId
+  member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
+  role    = google_project_iam_custom_role.read_log_entries.id
+}
+
 resource "google_project_iam_member" "create_delete_cloud_task_member" {
   project = local.projectId
   member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
