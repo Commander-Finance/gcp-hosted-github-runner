@@ -172,6 +172,19 @@ func TestCreationPlanNilBenchedMatchesPlainOrder(t *testing.T) {
 	assert.Equal(t, s.OrderedZones("runner-7")[0], s.creationPlan("runner-7", nil, nil)[0].zone)
 }
 
+// messagesWithPrefix returns every captured log message starting with prefix, in
+// emission order.
+func messagesWithPrefix(hook *logtest.Hook, prefix string) []string {
+
+	var out []string
+	for _, e := range hook.AllEntries() {
+		if strings.HasPrefix(e.Message, prefix) {
+			out = append(out, e.Message)
+		}
+	}
+	return out
+}
+
 func breakerScaler(minVMs int64) *Autoscaler {
 	return &Autoscaler{conf: AutoscalerConfig{
 		Zones:             []string{"a", "b"},
@@ -391,32 +404,49 @@ func TestBenchAndReleaseAreLoggedOncePerTransition(t *testing.T) {
 		s.zoneCheckedAt = time.Time{}
 		s.benchedZonesCached(context.Background())
 	}
-	var benched, released []string
-	for _, e := range hook.AllEntries() {
-		if strings.HasPrefix(e.Message, "Benched zone") {
-			benched = append(benched, e.Message)
-		}
-		if strings.HasPrefix(e.Message, "Released zone") {
-			released = append(released, e.Message)
-		}
-	}
+	benched := messagesWithPrefix(hook, "Benched zone")
+	released := messagesWithPrefix(hook, "Released zone")
 	require.Len(t, benched, 1, "the alert metric counts this line; it must fire once per bench")
 	// monitoring.tf matches ^Benched zone on the message; pin the literal prefix.
 	assert.True(t, strings.HasPrefix(benched[0], "Benched zone b: 5 of 10 VMs"), benched[0])
 	assert.Empty(t, released)
 
+	// Every successful refresh reports what the sensor saw and how long it took, so
+	// the query budget can be tuned from the log instead of guessed at.
+	refreshes := messagesWithPrefix(hook, "Zone health:")
+	require.Len(t, refreshes, 3, "one report per refresh, none from the cache")
+	assert.Contains(t, refreshes[0], "b=5/10")
+	assert.Regexp(t, `took [0-9.]+(ms|µs|ns|s)`, refreshes[0])
+
 	// Zone recovers: exactly one release line, and still one bench line.
 	report = zoneReport{}
 	s.zoneCheckedAt = time.Time{}
 	s.benchedZonesCached(context.Background())
-	released = nil
-	for _, e := range hook.AllEntries() {
-		if strings.HasPrefix(e.Message, "Released zone") {
-			released = append(released, e.Message)
-		}
-	}
+	released = messagesWithPrefix(hook, "Released zone")
 	require.Len(t, released, 1)
 	assert.True(t, strings.HasPrefix(released[0], "Released zone b"), released[0])
+}
+
+func TestZoneReportSummary(t *testing.T) {
+
+	cases := []struct {
+		name string
+		r    zoneReport
+		want string
+	}{
+		{"empty", zoneReport{}, "no VMs"},
+		{"single zone", zoneReport{failing: map[string]int{"b": 5}, created: map[string]int{"b": 10}}, "b=5/10"},
+		{
+			"zones sorted, failing/created in that order, zero values kept",
+			zoneReport{failing: map[string]int{"b": 5, "a": 0}, created: map[string]int{"b": 10, "a": 3, "f": 7}},
+			"a=0/3 b=5/10 f=0/7",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.r.summary())
+		})
+	}
 }
 
 func TestBenchedZonesCachedDefaultsWindowWhenUnset(t *testing.T) {

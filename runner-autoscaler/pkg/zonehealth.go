@@ -43,8 +43,11 @@ const (
 
 	// zoneHealthQueryTimeout caps what the sensor may cost a create. The whole create
 	// callback shares a 180 s budget with the JIT-config round trip and every zone and
-	// family attempt, so the sensor gets a small fixed slice and fails open past it.
-	zoneHealthQueryTimeout = 5 * time.Second
+	// family attempt, so the sensor gets a fixed slice and fails open past it. The two
+	// reads finish in under a second from a workstation but can take several seconds
+	// from Cloud Run; the refresh log line records the real duration so this can be
+	// tuned from evidence.
+	zoneHealthQueryTimeout = 15 * time.Second
 
 	// Caps on entries read per query. A stuck VM logs one or two timeout lines a
 	// minute, so 3000 covers hundreds of VM-minutes; creates run at most tens a minute.
@@ -60,6 +63,27 @@ const (
 type zoneReport struct {
 	failing map[string]int
 	created map[string]int
+}
+
+// summary renders the report as "zone=failing/created ..." in zone order, or
+// "no VMs" when the window was empty.
+func (r zoneReport) summary() string {
+
+	zones := map[string]bool{}
+	for z := range r.failing {
+		zones[z] = true
+	}
+	for z := range r.created {
+		zones[z] = true
+	}
+	if len(zones) == 0 {
+		return "no VMs"
+	}
+	parts := make([]string, 0, len(zones))
+	for _, z := range sortedKeys(zones) {
+		parts = append(parts, fmt.Sprintf("%s=%d/%d", z, r.failing[z], r.created[z]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // benchedZones applies the thresholds: a zone is benched when at least minVMs of its
@@ -162,13 +186,17 @@ func (s *Autoscaler) benchedZonesCached(ctx context.Context) map[string]bool {
 
 	qctx, cancel := context.WithTimeout(ctx, zoneHealthQueryTimeout)
 	defer cancel()
-	report, err := query(qctx, time.Now().Add(-window))
+	started := time.Now()
+	report, err := query(qctx, started.Add(-window))
 	s.zoneCheckedAt = time.Now()
 	if err != nil {
-		log.Warnf("Zone health query failed - benching no zone until the next check in %s: %s", zoneHealthCacheTTL, err.Error())
+		log.Warnf("Zone health query failed after %s - benching no zone until the next check in %s: %s", time.Since(started).Round(time.Millisecond), zoneHealthCacheTTL, err.Error())
 		s.zoneBenched = map[string]bool{}
 		return s.zoneBenched
 	}
+	// One line per refresh (at most one a minute): what the sensor saw and what it
+	// cost, so the query budget and thresholds can be tuned from the log.
+	log.Infof("Zone health: %s in the last %s, query took %s", report.summary(), window, time.Since(started).Round(time.Millisecond))
 
 	benched := benchedZones(report, s.conf.ZoneBenchMinVMs, s.conf.ZoneBenchMinRatio)
 	s.logBenchChanges(benched, report, window)
