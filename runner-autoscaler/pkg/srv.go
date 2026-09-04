@@ -872,9 +872,12 @@ func (s *Autoscaler) creationPlan(instanceName string, override *string, benched
 	}
 
 	// Family fallback applies only to the default pool (no magic-label override) and
-	// only when a fallback list is configured.
+	// only when a fallback list is configured. Its walk assigns zones round-robin by
+	// attempt index, so with more families than healthy zones a benched-last order
+	// would still land a family on a benched zone mid-incident; the walk therefore
+	// rotates over the healthy zones only (all zones when none or all are benched).
 	if override == nil && len(s.conf.MachineTypeFallbacks) > 0 {
-		return s.familyFallbackPlan(zones, primaryModel)
+		return s.familyFallbackPlan(healthyZones(zones, benched), primaryModel)
 	}
 
 	machineType := ""

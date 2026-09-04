@@ -144,10 +144,25 @@ func TestCreationPlanFamilyFallbackAvoidsBenchedZoneFirst(t *testing.T) {
 	plan := s.creationPlan("runner-7", nil, map[string]bool{"a": true})
 
 	require.Len(t, plan, 5) // 3 spot families + 2 standard
-	// Zones rotate by attempt index over the benched-last order, so the first family
-	// (and the first on-demand retry) land on the healthy zone.
-	assert.Equal(t, "b", plan[0].zone)
-	assert.Equal(t, "b", plan[3].zone)
+	// The family walk rotates zones by attempt index. With more families than healthy
+	// zones a benched-last order would still put family 2 on the benched zone, so the
+	// walk must rotate over the healthy zones only: no attempt may land on "a".
+	for i, attempt := range plan {
+		assert.Equal(t, "b", attempt.zone, "attempt %d", i)
+	}
+}
+
+func TestCreationPlanFamilyFallbackUsesAllZonesWhenAllBenched(t *testing.T) {
+
+	// Nothing to prefer: the plain rotation stands so capacity diversity is kept.
+	s := familyScaler([]string{"a", "b"}, []string{"c4d-standard-2", "n4-standard-2", "c3-standard-4"})
+	plan := s.creationPlan("runner-7", nil, map[string]bool{"a": true, "b": true})
+	require.Len(t, plan, 5)
+	zones := map[string]bool{}
+	for _, attempt := range plan {
+		zones[attempt.zone] = true
+	}
+	assert.Equal(t, map[string]bool{"a": true, "b": true}, zones)
 }
 
 func TestCreationPlanNilBenchedMatchesPlainOrder(t *testing.T) {
@@ -246,13 +261,18 @@ func entry(zone, instanceID, service, message string, fields map[string]interfac
 
 func TestZoneReportFromEntriesCountsDistinctVMs(t *testing.T) {
 
-	// A stuck VM logs the timeout every minute; it must count once.
+	// A stuck VM logs the timeout every minute; it must count once. The syslog line
+	// carries the hostname after the timestamp; only hosts named by this
+	// autoscaler's prefix count, so another workload's VMs in the same project
+	// cannot bench a zone.
 	failing := []*logging.Entry{
-		entry("us-central1-b", "111", "", "Exporting failed ... dial tcp 1.2.3.4:443: i/o timeout", nil),
-		entry("us-central1-b", "111", "", "Exporting failed ... dial tcp 1.2.3.4:443: i/o timeout", nil),
-		entry("us-central1-b", "222", "", "Exporting failed ... i/o timeout", nil),
-		entry("us-central1-a", "333", "", "Exporting failed ... i/o timeout", nil),
-		entry("us-central1-a", "", "", "no instance id - skipped", nil),
+		entry("us-central1-b", "111", "", "Sep  4 03:22:26 runner-111 otelopscol[703]: Exporting failed ... dial tcp 1.2.3.4:443: i/o timeout", nil),
+		entry("us-central1-b", "111", "", "Sep  4 03:23:26 runner-111 otelopscol[703]: Exporting failed ... dial tcp 1.2.3.4:443: i/o timeout", nil),
+		entry("us-central1-b", "222", "", "Sep  4 03:22:27 runner-222 otelopscol[691]: Exporting failed ... i/o timeout", nil),
+		entry("us-central1-a", "333", "", "Sep  4 03:22:28 runner-333 otelopscol[702]: Exporting failed ... i/o timeout", nil),
+		entry("us-central1-a", "444", "", "Sep  4 03:22:29 db-primary otelopscol[702]: Exporting failed ... i/o timeout", nil),
+		entry("us-central1-a", "555", "", "Sep  4 03:22:29 runnerx-555 otelopscol[702]: Exporting failed ... i/o timeout", nil),
+		entry("us-central1-a", "", "", "Sep  4 03:22:30 runner-666 otelopscol[702]: no instance id - skipped", nil),
 		{Resource: nil, Payload: "no resource - skipped, not a panic"},
 	}
 	created := []*logging.Entry{
@@ -264,7 +284,7 @@ func TestZoneReportFromEntriesCountsDistinctVMs(t *testing.T) {
 		{Payload: "text payload - skipped, not a panic"},
 	}
 
-	r := zoneReportFromEntries(failing, created)
+	r := zoneReportFromEntries("runner", failing, created)
 	assert.Equal(t, map[string]int{"us-central1-b": 2, "us-central1-a": 1}, r.failing)
 	assert.Equal(t, map[string]int{"us-central1-b": 2, "us-central1-f": 1}, r.created)
 }
@@ -272,13 +292,16 @@ func TestZoneReportFromEntriesCountsDistinctVMs(t *testing.T) {
 func TestZoneHealthFiltersScopeByTimeProjectAndService(t *testing.T) {
 
 	since := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
-	failF, createdF := zoneHealthFilters("spock-runner", "github-runner-autoscaler", since)
+	failF, createdF := zoneHealthFilters("spock-runner", "runner", "github-runner-autoscaler", since)
 
 	assert.Contains(t, failF, `resource.type="gce_instance"`)
 	assert.Contains(t, failF, `logName="projects/spock-runner/logs/syslog"`)
 	assert.Contains(t, failF, `timestamp>="2026-09-04T00:00:00Z"`)
 	assert.Contains(t, failF, `jsonPayload.message:"Exporting failed"`)
 	assert.Contains(t, failF, `jsonPayload.message:"i/o timeout"`)
+	// Pre-filter on the hostname prefix so other workloads' VMs are not even read;
+	// zoneReportFromEntries re-checks the hostname exactly.
+	assert.Contains(t, failF, `jsonPayload.message:" runner-"`)
 
 	assert.Contains(t, createdF, `resource.type="cloud_run_revision"`)
 	assert.Contains(t, createdF, `resource.labels.service_name="github-runner-autoscaler"`)
@@ -287,7 +310,7 @@ func TestZoneHealthFiltersScopeByTimeProjectAndService(t *testing.T) {
 
 	// Without a service name (running outside Cloud Run) the create filter must
 	// still be valid and simply not scope by service.
-	_, unscoped := zoneHealthFilters("spock-runner", "", since)
+	_, unscoped := zoneHealthFilters("spock-runner", "runner", "", since)
 	assert.NotContains(t, unscoped, "service_name")
 }
 

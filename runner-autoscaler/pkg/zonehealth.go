@@ -113,6 +113,26 @@ func (s *Autoscaler) orderedZonesBenched(seed string, benched map[string]bool) [
 	return append(healthy, bad...)
 }
 
+// healthyZones returns the ordered zones with the benched ones removed, for walks
+// that assign zones by index rather than trying every zone. All zones are returned
+// when none or all are benched, matching orderedZonesBenched.
+func healthyZones(ordered []string, benched map[string]bool) []string {
+
+	if len(benched) == 0 {
+		return ordered
+	}
+	healthy := make([]string, 0, len(ordered))
+	for _, z := range ordered {
+		if !benched[z] {
+			healthy = append(healthy, z)
+		}
+	}
+	if len(healthy) == 0 {
+		return ordered
+	}
+	return healthy
+}
+
 // benchedZonesCached returns the zones to try last, querying the sensor at most
 // once per zoneHealthCacheTTL per process. A failed query benches nothing and is
 // not retried until the TTL passes, so a Logging outage costs one bounded query a
@@ -188,10 +208,14 @@ func sortedKeys(m map[string]bool) []string {
 // autoscaler's own "Created instance" line, scoped to this service when Cloud Run
 // provides its name via K_SERVICE. Substring (":") matches are used instead of
 // regex because they are cheaper for the Logging backend.
-func zoneHealthFilters(project string, service string, since time.Time) (string, string) {
+//
+// The syslog line starts "<Mon> <d> <time> <hostname> <process>[<pid>]: ...", so
+// matching " <prefix>-" keeps other workloads' VMs in the same project from being
+// read at all; syslogHostname then checks the hostname exactly.
+func zoneHealthFilters(project string, runnerPrefix string, service string, since time.Time) (string, string) {
 
 	ts := since.UTC().Format(time.RFC3339)
-	failing := fmt.Sprintf(`resource.type="gce_instance" AND logName="projects/%s/logs/syslog" AND timestamp>="%s" AND jsonPayload.message:"Exporting failed" AND jsonPayload.message:"i/o timeout"`, project, ts)
+	failing := fmt.Sprintf(`resource.type="gce_instance" AND logName="projects/%s/logs/syslog" AND timestamp>="%s" AND jsonPayload.message:"Exporting failed" AND jsonPayload.message:"i/o timeout" AND jsonPayload.message:" %s-"`, project, ts, runnerPrefix)
 	created := fmt.Sprintf(`resource.type="cloud_run_revision" AND timestamp>="%s" AND jsonPayload.message:"Created instance"`, ts)
 	if service != "" {
 		created += fmt.Sprintf(` AND resource.labels.service_name="%s"`, service)
@@ -201,8 +225,10 @@ func zoneHealthFilters(project string, service string, since time.Time) (string,
 
 // zoneReportFromEntries reduces raw entries to VMs per zone. A stuck VM emits the
 // timeout line every minute, so failing VMs are deduplicated by instance id; created
-// VMs are deduplicated by instance name so a retried create counts once.
-func zoneReportFromEntries(failing []*logging.Entry, created []*logging.Entry) zoneReport {
+// VMs are deduplicated by instance name so a retried create counts once. Only VMs
+// whose syslog hostname carries this autoscaler's runner prefix count on the
+// failing side, so another workload sharing the project cannot bench a zone.
+func zoneReportFromEntries(runnerPrefix string, failing []*logging.Entry, created []*logging.Entry) zoneReport {
 
 	r := zoneReport{failing: map[string]int{}, created: map[string]int{}}
 
@@ -213,6 +239,9 @@ func zoneReportFromEntries(failing []*logging.Entry, created []*logging.Entry) z
 		}
 		zone, id := e.Resource.Labels["zone"], e.Resource.Labels["instance_id"]
 		if zone == "" || id == "" || seen[id] {
+			continue
+		}
+		if !IsOwnedRunnerName(runnerPrefix, syslogHostname(e.Payload)) {
 			continue
 		}
 		seen[id] = true
@@ -242,6 +271,23 @@ func zoneReportFromEntries(failing []*logging.Entry, created []*logging.Entry) z
 	return r
 }
 
+// syslogHostname returns the hostname field of an Ops Agent syslog line
+// ("<Mon> <d> <time> <hostname> <process>[<pid>]: ..."), or "" when the payload
+// is not that shape. The Ops Agent does not label the entry with the instance
+// name, so the line itself is the only place the runner's name appears.
+func syslogHostname(payload interface{}) string {
+
+	st, ok := payload.(*structpb.Struct)
+	if !ok {
+		return ""
+	}
+	fields := strings.Fields(st.GetFields()["message"].GetStringValue())
+	if len(fields) < 4 {
+		return ""
+	}
+	return fields[3]
+}
+
 // queryZoneReport is the production sensor: two bounded Cloud Logging reads. The
 // client is built per query, matching how the other GCP clients are used here; at
 // one query a minute the construction cost is noise.
@@ -253,7 +299,7 @@ func (s *Autoscaler) queryZoneReport(ctx context.Context, since time.Time) (zone
 	}
 	defer client.Close()
 
-	failF, createdF := zoneHealthFilters(s.conf.ProjectId, strings.TrimSpace(os.Getenv("K_SERVICE")), since)
+	failF, createdF := zoneHealthFilters(s.conf.ProjectId, s.conf.RunnerPrefix, strings.TrimSpace(os.Getenv("K_SERVICE")), since)
 
 	// The two reads are independent and share one deadline, so run them together:
 	// during a real incident the dial-timeout read is at its largest, and serially
@@ -281,7 +327,7 @@ func (s *Autoscaler) queryZoneReport(ctx context.Context, since time.Time) (zone
 	if crtErr != nil {
 		return zoneReport{}, fmt.Errorf("created-instance entries: %w", crtErr)
 	}
-	return zoneReportFromEntries(failing, created), nil
+	return zoneReportFromEntries(s.conf.RunnerPrefix, failing, created), nil
 }
 
 func listEntries(ctx context.Context, client *logadmin.Client, filter string, max int) ([]*logging.Entry, error) {
