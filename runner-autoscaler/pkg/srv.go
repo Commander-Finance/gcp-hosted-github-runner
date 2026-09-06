@@ -29,6 +29,7 @@ import (
 	"github.com/googleapis/gax-go/v2/apierror"
 	log "github.com/sirupsen/logrus"
 	ginlogrus "github.com/toorop/gin-logrus"
+	"google.golang.org/api/idtoken"
 	"google.golang.org/api/iterator"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -141,7 +142,7 @@ type VmSettings struct {
 func (j Job) hasLabel(label string) bool {
 
 	for _, l := range j.Labels {
-		if l == label {
+		if strings.EqualFold(l, label) {
 			return true
 		}
 	}
@@ -171,7 +172,7 @@ var matchMachineLabel = regexp.MustCompile(`^gce-machine-([a-z0-9]+(?:-[a-z0-9]+
 var matchLegacyMagicLabel = regexp.MustCompile(`^@` + string(MagicLabelMachine) + `:`)
 
 func IsMagicLabel(label string) bool {
-	return matchMachineLabel.MatchString(label)
+	return matchMachineLabel.MatchString(strings.ToLower(label))
 }
 
 func (j Job) GetMagicLabelValue(key MagicLabel) *string {
@@ -180,7 +181,7 @@ func (j Job) GetMagicLabelValue(key MagicLabel) *string {
 		return nil
 	}
 	for _, l := range j.Labels {
-		if matches := matchMachineLabel.FindStringSubmatch(l); len(matches) >= 2 {
+		if matches := matchMachineLabel.FindStringSubmatch(strings.ToLower(l)); len(matches) >= 2 {
 			ret := matches[1]
 			return &ret
 		}
@@ -592,44 +593,30 @@ func boundTaskRPCContext(ctx context.Context) (context.Context, context.CancelFu
 
 // returns http body, "src" query, error
 func (s *Autoscaler) verifySignature(ctx *gin.Context) ([]byte, Source, error) {
-
-	if signature := ctx.GetHeader(SHA_HEADER); len(signature) == 71 {
-		if body, err := io.ReadAll(ctx.Request.Body); err != nil {
-			log.Errorf("Error receiving http body: %s", err.Error())
-			return nil, Source{}, ctx.AbortWithError(http.StatusBadRequest, err)
-		} else {
-			if src, ok := ctx.GetQuery(s.conf.SourceQueryParam); ok {
-				if source, ok := s.conf.RegisteredSources[src]; ok {
-					calcSignature := CalcSigHex([]byte(source.Secret), body)
-					if hmac.Equal([]byte(calcSignature), []byte(signature[7:])) {
-						return body, source, nil
-					} else {
-						log.Warnf("%s signature did not match", ctx.RemoteIP())
-						return nil, Source{}, ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
-					}
-				} else {
-					// Return the same 401 as a bad signature so an unauthenticated
-					// caller cannot distinguish "unknown source" from "wrong signature"
-					// and enumerate which org/repo names are registered.
-					log.Warnf("%s used an unregistered source", ctx.RemoteIP())
-					return nil, Source{}, ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
-				}
-			} else {
-				log.Errorf("Missing %s query parameter", s.conf.SourceQueryParam)
-				return nil, Source{}, ctx.AbortWithError(http.StatusBadRequest, fmt.Errorf("missing %s query parameter", s.conf.SourceQueryParam))
-			}
-		}
-	} else {
-		log.Warnf("%s did not provide a signature", ctx.RemoteIP())
+	signature := ctx.GetHeader(SHA_HEADER)
+	source, ok := s.conf.RegisteredSources[ctx.Query(s.conf.SourceQueryParam)]
+	if !ok || !strings.HasPrefix(signature, SHA_PREFIX) || len(signature) != 71 {
 		return nil, Source{}, ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
 	}
+	if _, err := hex.DecodeString(signature[7:]); err != nil {
+		return nil, Source{}, ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
+	}
+	data, err := s.readBody(ctx)
+	if err != nil {
+		return nil, Source{}, err
+	}
+	expected := CalcSigHex([]byte(source.Secret), data)
+	if !hmac.Equal([]byte(expected), []byte(signature[7:])) {
+		return nil, Source{}, ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
+	}
+	return data, source, nil
 }
 
 /*
 func (s *Autoscaler) GetInstanceState(ctx context.Context, instanceName string) (State, error) {
 
-	client := newComputeClient(ctx)
-	defer client.Close()
+	client, closeClient := s.compute(ctx)
+	defer closeClient()
 	if res, err := client.Get(ctx, &computepb.GetInstanceRequest{
 		Project:  s.conf.ProjectId,
 		Zone:     s.conf.Zone,
@@ -654,8 +641,8 @@ func (s *Autoscaler) StartInstance(ctx context.Context, instanceName string) err
 		log.Infof("(SIMULATE) Started instance: %s", instanceName)
 	} else {
 		log.Infof("About to start instance: %s", instanceName)
-		client := newComputeClient(ctx)
-		defer client.Close()
+		client, closeClient := s.compute(ctx)
+		defer closeClient()
 		if res, err := client.Start(ctx, &computepb.StartInstanceRequest{
 			Project:  s.conf.ProjectId,
 			Zone:     s.conf.Zone,
@@ -679,8 +666,8 @@ func (s *Autoscaler) StartInstance(ctx context.Context, instanceName string) err
 func (s *Autoscaler) StopInstance(ctx context.Context, instanceName string) error {
 
 	log.Debugf("About to stop instance: %s", instanceName)
-	client := newComputeClient(ctx)
-	defer client.Close()
+	client, closeClient := s.compute(ctx)
+	defer closeClient()
 	if res, err := client.Stop(ctx, &computepb.StopInstanceRequest{
 		Project:  s.conf.ProjectId,
 		Zone:     s.conf.Zone,
@@ -743,8 +730,8 @@ func (s *Autoscaler) DeleteInstance(ctx context.Context, instanceName string) er
 
 	deleteInZone := s.deleteInZoneFn
 	if deleteInZone == nil {
-		client := newComputeClient(ctx)
-		defer client.Close()
+		client, closeClient := s.compute(ctx)
+		defer closeClient()
 		deleteInZone = func(ctx context.Context, name string, zone string) (bool, error) {
 			return s.realDeleteInZone(ctx, client, name, zone)
 		}
@@ -789,8 +776,8 @@ func (s *Autoscaler) instanceState(ctx context.Context, instanceName string) (bo
 	if s.conf.Simulate {
 		return false, Unknown, nil
 	}
-	client := newComputeClient(ctx)
-	defer client.Close()
+	client, closeClient := s.compute(ctx)
+	defer closeClient()
 	for _, zone := range s.OrderedZones(instanceName) {
 		if inst, err := client.Get(ctx, &computepb.GetInstanceRequest{
 			Project:  s.conf.ProjectId,
@@ -967,6 +954,7 @@ func (s *Autoscaler) tryInsertInstance(ctx context.Context, client *InstanceClie
 			},
 		},
 		SourceInstanceTemplate: proto.String(attempt.template),
+		RequestId:              proto.String(insertRequestID(instanceName, attempt)),
 	})
 	if err != nil {
 		return err
@@ -1006,8 +994,8 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 	// attempt, so the closure no longer needs a separate parameter.
 	tryInsert := s.tryInsertFn
 	if tryInsert == nil {
-		client := newComputeClient(ctx)
-		defer client.Close()
+		client, closeClient := s.compute(ctx)
+		defer closeClient()
 		tryInsert = func(ctx context.Context, attempt creationAttempt, name string, md []*computepb.Items) error {
 			return s.tryInsertInstance(ctx, client, attempt, name, md)
 		}
@@ -1056,15 +1044,16 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 // sweepOrphans deletes runner VMs that are stopped/terminated (e.g. a runner that
 // shut itself down without ever picking up a job, which produces no completed
 // webhook and would otherwise linger). Best-effort: errors are logged, not returned.
-func (s *Autoscaler) sweepOrphans(ctx context.Context) {
+func (s *Autoscaler) sweepOrphans(ctx context.Context) error {
 
 	if s.conf.Simulate {
-		return
+		return nil
 	}
-	client := newComputeClient(ctx)
-	defer client.Close()
+	client, closeClient := s.compute(ctx)
+	defer closeClient()
 
 	deleted := 0
+	var failures []error
 	for _, zone := range s.conf.Zones {
 		it := client.List(ctx, &computepb.ListInstancesRequest{
 			Project: s.conf.ProjectId,
@@ -1073,13 +1062,14 @@ func (s *Autoscaler) sweepOrphans(ctx context.Context) {
 		})
 		for {
 			if deleted >= maxSweepDeletes {
-				return
+				return errors.Join(failures...)
 			}
 			instance, err := it.Next()
 			if err == iterator.Done {
 				break
 			}
 			if err != nil {
+				failures = append(failures, err)
 				log.Warnf("Orphan sweep: could not list instances in %s: %s", zone, err.Error())
 				break
 			}
@@ -1092,6 +1082,7 @@ func (s *Autoscaler) sweepOrphans(ctx context.Context) {
 				log.Infof("Orphan sweep: reclaiming stopped runner VM %s (%s, status %s)", name, zone, status)
 				// Delete in the zone we just listed it from, reusing this client.
 				if _, err := s.realDeleteInZone(ctx, client, name, zone); err != nil {
+					failures = append(failures, err)
 					log.Warnf("Orphan sweep: failed to delete %s: %s", name, err.Error())
 				} else {
 					deleted++
@@ -1099,6 +1090,7 @@ func (s *Autoscaler) sweepOrphans(ctx context.Context) {
 			}
 		}
 	}
+	return errors.Join(failures...)
 }
 
 // maybeSweepOrphans runs sweepOrphans at most once per sweepInterval. It is called
@@ -1122,8 +1114,8 @@ func (s *Autoscaler) maybeSweepOrphans() {
 func (s *Autoscaler) readPat(ctx context.Context) (string, error) {
 
 	log.Debugf("About to read PAT from secret version: %s", s.conf.SecretVersion)
-	secretAccessClient := newSecretAccessClient(ctx)
-	defer secretAccessClient.Close()
+	secretAccessClient, closeClient := s.secrets(ctx)
+	defer closeClient()
 	if secretResult, err := secretAccessClient.AccessSecretVersion(ctx, &secretmanagerpb.AccessSecretVersionRequest{
 		Name: s.conf.SecretVersion,
 	}); err != nil {
@@ -1189,7 +1181,7 @@ func (s *Autoscaler) deleteRunnerByName(ctx context.Context, jitURL string, name
 		return fmt.Errorf("could not build list-runners request: %w", err)
 	}
 	githubAuthHeaders(listReq, pat)
-	listResp, err := http.DefaultClient.Do(listReq)
+	listResp, err := s.http().Do(listReq)
 	if err != nil {
 		return fmt.Errorf("list runners request failed: %w", err)
 	}
@@ -1236,7 +1228,7 @@ func (s *Autoscaler) deleteRunnerByName(ctx context.Context, jitURL string, name
 		return fmt.Errorf("could not build delete-runner request: %w", err)
 	}
 	githubAuthHeaders(delReq, pat)
-	delResp, err := http.DefaultClient.Do(delReq)
+	delResp, err := s.http().Do(delReq)
 	if err != nil {
 		return fmt.Errorf("delete runner request failed: %w", err)
 	}
@@ -1252,8 +1244,6 @@ func (s *Autoscaler) deleteRunnerByName(ctx context.Context, jitURL string, name
 func (s *Autoscaler) GenerateRunnerJitConfig(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error) {
 
 	log.Debugf("About to request GitHub runner %s jit config from %s (runner group %d) using PAT from secret version: %s", runnerName, url, runnerGroupId, s.conf.SecretVersion)
-	secretAccessClient := newSecretAccessClient(ctx)
-	defer secretAccessClient.Close()
 	if pat, err := s.readPat(ctx); err != nil {
 		return "", err
 	} else {
@@ -1271,7 +1261,7 @@ func (s *Autoscaler) GenerateRunnerJitConfig(ctx context.Context, url string, ru
 			req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", pat))
 			req.Header.Add("X-GitHub-Api-Version", GITHUB_API_VERSION)
 			req.Header.Add("User-Agent", "github-runner-autoscaler")
-			if resp, err := http.DefaultClient.Do(req); err != nil {
+			if resp, err := s.http().Do(req); err != nil {
 				log.Errorf("GitHub runner jit-config request failed: %s", err.Error())
 				return "", fmt.Errorf("failed jit-config response")
 			} else if resp.StatusCode == 409 {
@@ -1338,8 +1328,8 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 	ctx, cancel := boundTaskRPCContext(ctx)
 	defer cancel()
 
-	client := newTaskClient(ctx)
-	defer client.Close()
+	client, closeClient := s.tasks(ctx)
+	defer closeClient()
 
 	var sendAndRetry func(int) error
 	sendAndRetry = func(retryCount int) error {
@@ -1361,7 +1351,7 @@ func (s *Autoscaler) CreateCallbackTaskWithToken(ctx context.Context, kind strin
 			}
 			return fmt.Errorf("cloudtasks.CreateTask failed for job Id %d: %v", job.Id, err)
 		} else {
-			log.Infof("Created cloud task callback for workflow job Id %d with url \"%s\" and payload \"%s\"", job.Id, url, data)
+			log.Infof("Created callback for job %d", job.Id)
 			return nil
 		}
 	}
@@ -1382,8 +1372,8 @@ func (s *Autoscaler) DeleteCallbackTask(ctx context.Context, job Job) error {
 	ctx, cancel := boundTaskRPCContext(ctx)
 	defer cancel()
 
-	client := newTaskClient(ctx)
-	defer client.Close()
+	client, closeClient := s.tasks(ctx)
+	defer closeClient()
 
 	var lastErr error
 	deletedAny := false
@@ -1628,7 +1618,7 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 			// acknowledge so the task isn't retried, and let the sweep handle cleanup.
 			log.Infof("Delete-vm callback runner name %q is empty or not one of our runners (job %d) - skipping delete", job.RunnerName, job.Id)
 			ctx.Status(http.StatusOK)
-			go s.maybeSweepOrphans()
+			// Cleanup is performed by the scheduled /sweep request.
 			return
 		}
 		opCtx, cancel := s.opContext()
@@ -1641,7 +1631,7 @@ func (s *Autoscaler) handleDeleteVm(ctx *gin.Context) {
 		// Run the orphan sweep detached so it can't hold the callback open past the
 		// Cloud Tasks dispatch deadline (which would trigger a retry). It uses its own
 		// background context and is throttled + mutex-guarded.
-		go s.maybeSweepOrphans()
+		// Cleanup is performed by the scheduled /sweep request.
 	}
 }
 
@@ -1684,7 +1674,7 @@ func (s *Autoscaler) handleWebhook(ctx *gin.Context) {
 	log.Info("Received webhook")
 	if data, src, err := s.verifySignature(ctx); err == nil {
 		event := ctx.GetHeader(EVENT_HEADER)
-		log.Info(string(data))
+		log.WithField("event", event).Debug("Verified webhook")
 		if event == WEBHOOK_PING_EVENT {
 			log.Info("Webhook ping acknowledged")
 			ctx.Status(http.StatusOK)
@@ -1776,15 +1766,27 @@ func (p Pair) IsIValid() bool {
 }
 
 type AutoscalerConfig struct {
-	RouteWebhook     string
-	RouteCreateVm    string
-	RouteDeleteVm    string
-	RouteRecreateVm  string
-	ProjectId        string
-	Zones            []string
-	TaskQueue        string
-	TaskTimeout      int64
-	InstanceTemplate string
+	StateDatabase          string
+	CallbackBaseURL        string
+	CallbackServiceAccount string
+	DeleteTaskQueue        string
+	MaintenanceTaskQueue   string
+	MaxRunners             int
+	MaxOnDemandRunners     int
+	AllowOnDemand          bool
+	AllowedMachineTypes    []string
+	MachineTimeout         int64
+	DiscoveryRepositories  []string
+	MaxRequestBytes        int64
+	RouteWebhook           string
+	RouteCreateVm          string
+	RouteDeleteVm          string
+	RouteRecreateVm        string
+	ProjectId              string
+	Zones                  []string
+	TaskQueue              string
+	TaskTimeout            int64
+	InstanceTemplate       string
 	// FallbackInstanceTemplate is the on-demand (STANDARD) template tried when the
 	// primary (SPOT) template is capacity-exhausted in every zone. Empty when the
 	// primary is already on-demand (no fallback needed).
@@ -1826,6 +1828,27 @@ func (c AutoscalerConfig) Validate() error {
 	if c.RunnerPrefix == "" {
 		return fmt.Errorf("RunnerPrefix must not be empty")
 	}
+	if c.StateDatabase != "" {
+		u, err := url.Parse(c.CallbackBaseURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.Path != "" {
+			return fmt.Errorf("CallbackBaseURL must be an HTTPS origin")
+		}
+		if c.FallbackInstanceTemplate == "" && (!c.AllowOnDemand || c.MaxOnDemandRunners == 0) {
+			return fmt.Errorf("a STANDARD-only fleet requires on-demand provisioning and a positive on-demand limit")
+		}
+		if c.MaxRunners < 1 || c.MaxOnDemandRunners < 0 || c.MaxOnDemandRunners > c.MaxRunners {
+			return fmt.Errorf("invalid fleet limits")
+		}
+		if c.CallbackServiceAccount == "" || c.DeleteTaskQueue == "" || c.MaintenanceTaskQueue == "" {
+			return fmt.Errorf("worker identity and queues are required")
+		}
+		if len(c.RunnerPrefix) > 20 || !regexp.MustCompile(`^[a-z][a-z0-9-]*$`).MatchString(c.RunnerPrefix) {
+			return fmt.Errorf("runner prefix must be a GCE-safe prefix of at most 20 characters")
+		}
+		if c.TaskTimeout < 30 || c.TaskTimeout > 1700 || c.MachineTimeout < 60 || c.MaxRequestBytes < 1 {
+			return fmt.Errorf("invalid deadlines or body limit")
+		}
+	}
 	// The bench ratio is compared against failing/created, which lies in (0, 1]
 	// because the denominator floors at the failing count. A ratio <= 0 benches on
 	// the VM count alone and a ratio > 1 can never be met; both silently change
@@ -1837,8 +1860,17 @@ func (c AutoscalerConfig) Validate() error {
 }
 
 type Autoscaler struct {
-	engine *gin.Engine
-	conf   AutoscalerConfig
+	operationsClient *compute.ZoneOperationsClient
+	engine           *gin.Engine
+	conf             AutoscalerConfig
+	store            lifecycleStore
+	computeClient    *compute.InstancesClient
+	taskClient       *cloudtasks.Client
+	secretClient     *secretmanager.Client
+	httpClient       *http.Client
+	tokenValidator   *idtoken.Validator
+	jobStatusFn      func(context.Context, Job) (string, error)
+	queueFn          func(context.Context, string, string, interface{}, time.Duration) error
 
 	sweepMu   sync.Mutex
 	lastSweep time.Time
@@ -1874,7 +1906,18 @@ func NewAutoscaler(config AutoscalerConfig) *Autoscaler {
 		engine: engine,
 		conf:   config,
 	}
-	engine.Use(ginlogrus.Logger(log.WithFields(log.Fields{})))
+	engine.Use(gin.Recovery(), ginlogrus.Logger(log.WithFields(log.Fields{})))
+	if config.StateDatabase != "" {
+		engine.POST(config.RouteWebhook, scaler.durableWebhook)
+		engine.POST(config.RouteCreateVm, scaler.durableCreate)
+		engine.POST(config.RouteDeleteVm, scaler.durableDelete)
+		engine.POST(config.RouteRecreateVm, scaler.durableRecreate)
+		engine.POST("/reconcile", scaler.reconcile)
+		engine.POST("/sweep", scaler.durableSweep)
+		engine.POST("/discover", scaler.discover)
+		engine.GET("/healthcheck", func(ctx *gin.Context) { ctx.Status(http.StatusOK) })
+		return &scaler
+	}
 	engine.POST(config.RouteCreateVm, scaler.handleCreateVm)
 	engine.POST(config.RouteDeleteVm, scaler.handleDeleteVm)
 	engine.POST(config.RouteWebhook, scaler.handleWebhook)
@@ -1889,5 +1932,10 @@ func NewAutoscaler(config AutoscalerConfig) *Autoscaler {
 
 func (s *Autoscaler) Srv(port int) {
 
-	s.engine.Run(fmt.Sprintf("0.0.0.0:%d", port))
+	server := &http.Server{Addr: fmt.Sprintf("0.0.0.0:%d", port), Handler: s.engine,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
+		WriteTimeout: time.Duration(s.conf.TaskTimeout+10) * time.Second, IdleTimeout: 60 * time.Second}
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }

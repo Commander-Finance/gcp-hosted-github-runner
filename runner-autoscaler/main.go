@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"os"
 	"strconv"
@@ -74,6 +75,18 @@ func main() {
 	}
 
 	config := pkg.AutoscalerConfig{
+		StateDatabase:            mustGetEnv("STATE_DATABASE"),
+		CallbackBaseURL:          mustGetEnv("CALLBACK_BASE_URL"),
+		CallbackServiceAccount:   mustGetEnv("CALLBACK_SERVICE_ACCOUNT"),
+		DeleteTaskQueue:          mustGetEnv("DELETE_TASK_QUEUE"),
+		MaintenanceTaskQueue:     mustGetEnv("MAINTENANCE_TASK_QUEUE"),
+		MaxRunners:               int(getEnvDefaultInt64("MAX_RUNNERS", 100)),
+		MaxOnDemandRunners:       int(getEnvDefaultInt64("MAX_ON_DEMAND_RUNNERS", 10)),
+		AllowOnDemand:            getEnvDefaultInt64("ALLOW_ON_DEMAND", 1) == 1,
+		AllowedMachineTypes:      strings.Fields(getEnvDefault("ALLOWED_MACHINE_TYPES", "")),
+		DiscoveryRepositories:    strings.Fields(getEnvDefault("DISCOVERY_REPOSITORIES", "")),
+		MachineTimeout:           getEnvDefaultInt64("MACHINE_TIMEOUT", 3600),
+		MaxRequestBytes:          getEnvDefaultInt64("MAX_REQUEST_BYTES", 1048576),
 		RouteWebhook:             getEnvDefault("ROUTE_WEBHOOK", "/webhook"),
 		RouteDeleteVm:            getEnvDefault("ROUTE_DELETE_VM", "/delete_vm"),
 		RouteCreateVm:            getEnvDefault("ROUTE_CREATE_VM", "/create_vm"),
@@ -160,5 +173,10 @@ func main() {
 
 	port, _ := strconv.Atoi(getEnvDefault("PORT", "8080"))
 	log.Infof("Starting autoscaler on port %d observing workflow jobs matching label groups: %s", port, pkg.FormatLabelGroups(config.RunnerLabelGroups))
-	pkg.NewAutoscaler(config).Srv(port)
+	scaler := pkg.NewAutoscaler(config)
+	if err := scaler.Initialize(context.Background()); err != nil {
+		log.Fatalf("Initialize autoscaler: %v", err)
+	}
+	defer scaler.Close()
+	scaler.Srv(port)
 }

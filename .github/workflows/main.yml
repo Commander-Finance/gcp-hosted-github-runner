@@ -23,7 +23,7 @@ jobs:
         # ./pkg/... holds the white-box unit tests (fallback planning, task
         # deadlines, the zone breaker); ./test/... the HTTP-level ones.
         run: |
-          go test -v -count=1 ./pkg/... ./test/... \
+          go test -race -v -count=1 ./pkg/... ./test/... \
             -skip '^(TestCreateCallbackTask|TestGenerateRunnerJitConfig|TestDeleteNotExistingVM)$'
 
   ghcr_digest_smoke:

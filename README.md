@@ -1,3 +1,5 @@
+> Lifecycle and migration details for the durable autoscaler: [ENG-2345 implementation](AUDIT-FIXES.md). The lifecycle described there supersedes the historical flow below.
+
 # gcp-hosted-github-runner
 
 [![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/Privatehive/gcp-hosted-github-runner/main.yml?branch=master&style=flat&logo=github&label=Docker+build)](https://github.com/Privatehive/gcp-hosted-github-runner/actions?query=branch%3Amaster)

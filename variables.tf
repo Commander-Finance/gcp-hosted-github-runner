@@ -68,7 +68,7 @@ variable "machine_creation_delay" {
 
 variable "max_concurrency" {
   type        = number
-  description = "The estimated maximum number of concurrent workflow jobs"
+  description = "Deprecated compatibility input; use max_runners for live capacity and create_concurrency for callback concurrency."
   default     = 500
   validation {
     condition     = var.max_concurrency <= 1000 && var.max_concurrency > 0
@@ -309,4 +309,69 @@ variable "run_setup_on_runner_machines" {
   type        = bool
   description = "If true, the startup script will install required dependencies (docker.io, docker-buildx, curl, sed, jq, and any github_runner_packages), add the 'agent' user with required permissions, and run the runner's installdependencies.sh at boot. Set to false when using a prebuilt image that already has these baked in: installdependencies.sh is then skipped at boot, because re-running apt races background dpkg activity and a transient failure would shut the VM down, orphaning its queued job. The systemd template patching and svc.sh install/start always run at boot regardless of this setting - they are local-only, idempotent, and required to register the unit."
   default     = true
+}
+variable "max_runners" {
+  type        = number
+  default     = 100
+  description = "Hard admission limit for managed VM generations, including pending inserts and stopped VMs awaiting reconciliation."
+  validation {
+    condition     = var.max_runners >= 1 && var.max_runners <= 1000 && floor(var.max_runners) == var.max_runners
+    error_message = "max_runners must be an integer from 1 to 1000."
+  }
+}
+variable "max_on_demand_runners" {
+  type        = number
+  default     = 10
+  description = "Hard STANDARD reservation limit, including ambiguous inserts."
+  validation {
+    condition     = var.max_on_demand_runners >= 0 && var.max_on_demand_runners <= var.max_runners && floor(var.max_on_demand_runners) == var.max_on_demand_runners
+    error_message = "On-demand limit must be an integer between zero and max_runners."
+  }
+}
+variable "allow_on_demand" {
+  type        = bool
+  default     = true
+  description = "Allow STANDARD provisioning subject to max_on_demand_runners. Required for non-preemptible fleets."
+  validation {
+    condition     = var.machine_preemtible || (var.allow_on_demand && var.max_on_demand_runners > 0)
+    error_message = "A non-preemptible fleet requires allow_on_demand=true and max_on_demand_runners greater than zero."
+  }
+}
+variable "allowed_machine_types" {
+  type        = list(string)
+  default     = []
+  description = "Explicit allowed gce-machine-* overrides. Empty disables overrides; the default template/fallback pool is separate."
+}
+variable "discovery_repositories" {
+  type        = list(string)
+  default     = []
+  description = "owner/repo names to discover missed queued webhooks. Empty lists org repositories visible to the PAT; required for enterprise sources."
+}
+variable "create_concurrency" {
+  type        = number
+  default     = 4
+  description = "Concurrent slow creates, independent of live fleet size and HTTP concurrency."
+  validation {
+    condition     = var.create_concurrency >= 1 && var.create_concurrency <= 16 && floor(var.create_concurrency) == var.create_concurrency
+    error_message = "create_concurrency must be an integer between 1 and 16 to reserve HTTP capacity for intake and cleanup."
+  }
+}
+variable "create_dispatches_per_second" {
+  type        = number
+  default     = 2
+  description = "Create callback dispatch rate; tune against Compute write quotas."
+  validation {
+    condition     = var.create_dispatches_per_second > 0 && var.create_dispatches_per_second <= 10
+    error_message = "Create dispatch rate must be in (0, 10]."
+  }
+}
+
+variable "firestore_location" {
+  type        = string
+  default     = null
+  description = "Firestore database location. Null uses the runtime region; set a supported Firestore region or multi-region when the runtime region is unavailable. Changing an existing database location requires migration."
+  validation {
+    condition     = var.firestore_location == null ? true : can(regex("^([a-z]+-[a-z]+[0-9]+|nam5|nam7|eur3)$", var.firestore_location))
+    error_message = "Use a Firestore regional location ID (for example us-central1) or multi-region nam5, nam7, eur3. Confirm availability in the Firestore locations documentation."
+  }
 }
