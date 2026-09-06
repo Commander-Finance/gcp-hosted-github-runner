@@ -32,3 +32,8 @@ Discovery pages visible organization repositories and unfinished workflow runs e
 Run `go test -race ./pkg/... ./test/... -skip '^(TestCreateCallbackTask|TestGenerateRunnerJitConfig|TestDeleteNotExistingVM)$'` from `runner-autoscaler`. The skipped cases require live credentials and can create tasks or registrations. Regression cases cover concurrent workers, cancellation/reordering, fleet admission, API outages, expired leases, ambiguous inserts, JIT refresh, pending deletion, request bounds and callback scope.
 
 Terraform validation uses a consuming-root fixture with a local module source and dummy Google provider settings; it does not plan or apply live infrastructure. Before deployment, validate real IAM/OIDC, Firestore transaction behavior and Scheduler delivery in staging, then observe a full create/run/delete cycle. Unit tests use an in-memory transactional store and cannot establish production IAM correctness or throughput.
+
+
+## Consumer configuration requirements
+
+Terraform 1.9 or newer is required for cross-variable validation. Non-preemptible fleets require on-demand provisioning and a positive on-demand admission limit; both Terraform and application startup reject an impossible configuration. `firestore_location` can override the runtime region with a supported Firestore region or multi-region. The default remains the runtime region for compatibility with this rollout; consult [Firestore locations](https://cloud.google.com/firestore/native/docs/locations) before deploying outside it. An existing database location cannot be changed in place.

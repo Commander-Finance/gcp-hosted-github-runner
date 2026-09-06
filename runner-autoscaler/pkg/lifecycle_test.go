@@ -374,3 +374,37 @@ func TestWorkerOIDCSignatureAudienceAndIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestStandardOnlyFleetRejectsImpossibleAdmission(t *testing.T) {
+	s, _, _, _ := lifecycleTestScaler()
+	c := s.conf
+	c.CallbackServiceAccount = "callback@example.com"
+	c.DeleteTaskQueue = "delete"
+	c.MaintenanceTaskQueue = "maintenance"
+	c.MachineTimeout = 3600
+	c.MaxRequestBytes = 1 << 20
+	for _, tc := range []struct {
+		name     string
+		fallback string
+		allow    bool
+		limit    int
+		valid    bool
+	}{
+		{"standard disabled", "", false, 1, false},
+		{"standard zero budget", "", true, 0, false},
+		{"standard allowed", "", true, 1, true},
+		{"spot without standard", "standard", false, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := c
+			config.FallbackInstanceTemplate = tc.fallback
+			config.AllowOnDemand = tc.allow
+			config.MaxOnDemandRunners = tc.limit
+			if tc.valid {
+				require.NoError(t, config.Validate())
+			} else {
+				require.ErrorContains(t, config.Validate(), "STANDARD-only")
+			}
+		})
+	}
+}

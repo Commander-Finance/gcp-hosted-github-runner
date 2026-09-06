@@ -331,7 +331,11 @@ variable "max_on_demand_runners" {
 variable "allow_on_demand" {
   type        = bool
   default     = true
-  description = "Allow STANDARD provisioning subject to max_on_demand_runners."
+  description = "Allow STANDARD provisioning subject to max_on_demand_runners. Required for non-preemptible fleets."
+  validation {
+    condition     = var.machine_preemtible || (var.allow_on_demand && var.max_on_demand_runners > 0)
+    error_message = "A non-preemptible fleet requires allow_on_demand=true and max_on_demand_runners greater than zero."
+  }
 }
 variable "allowed_machine_types" {
   type        = list(string)
@@ -359,5 +363,15 @@ variable "create_dispatches_per_second" {
   validation {
     condition     = var.create_dispatches_per_second > 0 && var.create_dispatches_per_second <= 10
     error_message = "Create dispatch rate must be in (0, 10]."
+  }
+}
+
+variable "firestore_location" {
+  type        = string
+  default     = null
+  description = "Firestore database location. Null uses the runtime region; set a supported Firestore region or multi-region when the runtime region is unavailable. Changing an existing database location requires migration."
+  validation {
+    condition     = var.firestore_location == null ? true : can(regex("^([a-z]+-[a-z]+[0-9]+|nam5|nam7|eur3)$", var.firestore_location))
+    error_message = "Use a Firestore regional location ID (for example us-central1) or multi-region nam5, nam7, eur3. Confirm availability in the Firestore locations documentation."
   }
 }

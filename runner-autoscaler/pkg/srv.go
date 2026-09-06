@@ -1833,6 +1833,9 @@ func (c AutoscalerConfig) Validate() error {
 		if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.Path != "" {
 			return fmt.Errorf("CallbackBaseURL must be an HTTPS origin")
 		}
+		if c.FallbackInstanceTemplate == "" && (!c.AllowOnDemand || c.MaxOnDemandRunners == 0) {
+			return fmt.Errorf("a STANDARD-only fleet requires on-demand provisioning and a positive on-demand limit")
+		}
 		if c.MaxRunners < 1 || c.MaxOnDemandRunners < 0 || c.MaxOnDemandRunners > c.MaxRunners {
 			return fmt.Errorf("invalid fleet limits")
 		}

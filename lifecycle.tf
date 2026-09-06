@@ -10,7 +10,7 @@ resource "google_project_service" "scheduler_api" {
 resource "google_firestore_database" "runner" {
   project         = local.projectId
   name            = "github-runners"
-  location_id     = local.region
+  location_id     = coalesce(var.firestore_location, local.region)
   type            = "FIRESTORE_NATIVE"
   deletion_policy = "ABANDON"
   depends_on      = [google_project_service.firestore_api]
