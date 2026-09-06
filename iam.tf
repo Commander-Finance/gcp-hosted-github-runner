@@ -217,3 +217,14 @@ resource "google_cloud_run_service_iam_binding" "public_access" {
     //"serviceAccount:${google_service_account.webhook_scheduler_sa.email}"
   ]
 }
+
+resource "google_project_iam_custom_role" "read_runner_operations" {
+  role_id     = "ReadRunnerOperations"
+  title       = "Resolve uncertain runner VM inserts"
+  permissions = ["compute.zoneOperations.get", "compute.zoneOperations.list"]
+}
+resource "google_project_iam_member" "read_runner_operations" {
+  project = local.projectId
+  member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
+  role    = google_project_iam_custom_role.read_runner_operations.id
+}

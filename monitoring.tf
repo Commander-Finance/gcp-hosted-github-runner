@@ -47,7 +47,7 @@ resource "google_logging_metric" "runner_vm_created" {
 // non-retryable create error).
 resource "google_logging_metric" "runner_vm_create_failed" {
   name   = "github_runner/vm_create_failed"
-  filter = "${local.autoscaler_log_filter} severity=ERROR (${format(local.msg_re, "^Could not create instance")} OR ${format(local.msg_re, "^Exhausted all zones")})"
+  filter = "${local.autoscaler_log_filter} severity=ERROR (${format(local.msg_re, "^Could not create instance")} OR ${format(local.msg_re, "^Exhausted all zones")} OR ${format(local.msg_re, "^Lifecycle create failed")})"
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -216,4 +216,35 @@ resource "google_monitoring_alert_policy" "runner_zone_benched" {
   }
 
   notification_channels = var.alert_notification_channels
+}
+
+// These signals include durable callback failures and prolonged pending demand.
+resource "google_logging_metric" "lifecycle_attention" {
+  name   = "github_runner/lifecycle_attention"
+  filter = "${local.autoscaler_log_filter} ((${format(local.msg_re, "^Lifecycle (delete|sweep|discovery).*failed")} severity>=ERROR) OR (jsonPayload.message=\"Reconcile pending job\" jsonPayload.age_seconds>900))"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+resource "google_monitoring_alert_policy" "lifecycle_attention" {
+  display_name          = "GitHub runner: lifecycle failure or pending job over 15 minutes"
+  combiner              = "OR"
+  depends_on            = [google_project_service.monitoring_api]
+  notification_channels = var.alert_notification_channels
+  conditions {
+    display_name = "Lifecycle attention required"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.lifecycle_attention.name}\" resource.type=\"cloud_run_revision\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+      aggregations {
+        alignment_period     = "300s"
+        per_series_aligner   = "ALIGN_SUM"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+    }
+  }
 }

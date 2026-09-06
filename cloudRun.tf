@@ -23,18 +23,38 @@ resource "google_cloud_run_v2_service" "autoscaler" {
   location   = local.region
   name       = "github-runner-autoscaler"
   ingress    = "INGRESS_TRAFFIC_ALL"
-  depends_on = [google_artifact_registry_repository.ghcr, google_project_service.cloud_run_api]
+  depends_on = [google_artifact_registry_repository.ghcr, google_project_service.cloud_run_api, google_project_iam_member.runner_state, google_service_account_iam_member.enqueue_callback_identity]
 
   template {
     service_account                  = google_service_account.autoscaler_sa.email
-    max_instance_request_concurrency = var.max_concurrency
+    max_instance_request_concurrency = 32
     timeout                          = format("%ds", var.autoscaler_timeout)
     scaling {
-      min_instance_count = 0
-      max_instance_count = 1
+      min_instance_count = 1
+      max_instance_count = 3
     }
     containers {
       image = local.autoscaler_image_ref
+      dynamic "env" {
+        for_each = {
+          STATE_DATABASE           = google_firestore_database.runner.name
+          CALLBACK_BASE_URL        = local.callback_base_url
+          CALLBACK_SERVICE_ACCOUNT = google_service_account.callback.email
+          DELETE_TASK_QUEUE        = google_cloud_tasks_queue.delete_tasks.id
+          MAINTENANCE_TASK_QUEUE   = google_cloud_tasks_queue.maintenance_tasks.id
+          MAX_RUNNERS              = tostring(var.max_runners)
+          MAX_ON_DEMAND_RUNNERS    = tostring(var.max_on_demand_runners)
+          ALLOW_ON_DEMAND          = var.allow_on_demand ? "1" : "0"
+          ALLOWED_MACHINE_TYPES    = join(" ", var.allowed_machine_types)
+          DISCOVERY_REPOSITORIES   = join(" ", var.discovery_repositories)
+          MACHINE_TIMEOUT          = tostring(var.machine_timeout)
+          MAX_REQUEST_BYTES        = "1048576"
+        }
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
       env {
         name  = "ROUTE_WEBHOOK"
         value = local.webhookUrl
@@ -165,11 +185,11 @@ resource "google_cloud_run_v2_service" "autoscaler" {
         }
       }
       resources {
-        startup_cpu_boost = false
+        startup_cpu_boost = true
         cpu_idle          = true
         limits = {
           cpu    = "1"
-          memory = "128Mi"
+          memory = "512Mi"
         }
       }
     }

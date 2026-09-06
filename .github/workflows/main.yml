@@ -2,7 +2,7 @@ name: "CI: test and build github-runner-autoscaler"
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [master, "codex/**"]
 
 jobs:
   test:
@@ -23,7 +23,7 @@ jobs:
         # ./pkg/... holds the white-box unit tests (fallback planning, task
         # deadlines, the zone breaker); ./test/... the HTTP-level ones.
         run: |
-          go test -v -count=1 ./pkg/... ./test/... \
+          go test -race -v -count=1 ./pkg/... ./test/... \
             -skip '^(TestCreateCallbackTask|TestGenerateRunnerJitConfig|TestDeleteNotExistingVM)$'
 
   ghcr_digest_smoke:
@@ -102,7 +102,7 @@ jobs:
           HOME=$(mktemp -d) terraform validate
 
   build_docker_image:
-    name: "Build (and push on master) autoscaler image"
+    name: "Build and publish commit-pinned autoscaler image"
     needs: [test, ghcr_digest_smoke, module_validate]
     runs-on: ubuntu-latest
     permissions:
