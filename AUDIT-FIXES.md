@@ -20,7 +20,7 @@ Discovery pages visible organization repositories and unfinished workflow runs e
 
 ## Operations and rollout
 
-- The consuming repo must pin both this module's commit and its matching `sha-<commit>` container tag. Branch CI publishes only that immutable commit tag; master alone advances release tags.
+- Spock intentionally tracks this repository’s default branch, `master`, and its `master` image tag. The next Spock deployment resolves the updated module and image digest without a Spock PR. Publish the image before deploying the consumer; separate module and image lookups are not an atomic release. Immutable commit tags remain available for rollback.
 - Drain existing runner generations before migration, or explicitly budget for them. The new admission counters cover durable reservations, not VMs created by older releases. Existing HMAC worker callbacks are rejected after migration; scheduled discovery reconstructs queued demand. Running old VMs retain their runtime limit and are swept when stopped.
 - Completed records expire after seven days only after reservations and pending deletion have cleared. Active demand has no TTL. The named database is abandoned rather than deleted on Terraform destroy. Reimport it before recreating infrastructure; never reset counters independently of reservations.
 - Fleet saturation and transient API failures return retryable failures; durable reconciliation outlives the Cloud Tasks retry window. Operators should check queue age, lifecycle errors, stopped VMs and Firestore reservations before changing limits.

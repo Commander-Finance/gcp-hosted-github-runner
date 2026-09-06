@@ -2,7 +2,7 @@ name: "CI: test and build github-runner-autoscaler"
 on:
   pull_request:
   push:
-    branches: [master, "codex/**"]
+    branches: [master]
 
 jobs:
   test:
@@ -102,7 +102,7 @@ jobs:
           HOME=$(mktemp -d) terraform validate
 
   build_docker_image:
-    name: "Build and publish commit-pinned autoscaler image"
+    name: "Build (and push on master) autoscaler image"
     needs: [test, ghcr_digest_smoke, module_validate]
     runs-on: ubuntu-latest
     permissions:
