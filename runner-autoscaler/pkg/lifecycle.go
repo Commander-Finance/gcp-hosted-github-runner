@@ -182,7 +182,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			if e != nil {
 				return e
 			}
-			if registration == runnerGone || (r.Terminal && registration == runnerIdle) {
+			if registration == runnerGone || (r.Terminal && registration != runnerBusy) || (registration == runnerOffline && s.offlineExpired(r)) {
 				if e = s.DeleteInstance(ctx, r.VMName); e != nil {
 					return e
 				}
@@ -197,7 +197,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			if currentStatus != "queued" || busy {
 				// Keep the actual running VM accounted independently. In particular,
 				// busy RA cannot suppress A when it accepted B and RB was preempted.
-				return s.store.Detach(ctx, key, token, !busy && !r.Terminal, time.Now().Add(2*time.Minute))
+				return s.store.Detach(ctx, key, token, registration == runnerIdle && !r.Terminal, time.Now().Add(2*time.Minute))
 			}
 			return s.mutateJob(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
 				if current.CreatedAt.IsZero() {

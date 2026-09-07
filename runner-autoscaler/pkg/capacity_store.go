@@ -53,7 +53,7 @@ func prepareRecord(r *lifecycleRecord) {
 		}
 	}
 }
-func (f *firestoreStore) DeferRunner(ctx context.Context, name string, due time.Time) error {
+func (f *firestoreStore) DeferRunner(ctx context.Context, name string, due time.Time, available bool) error {
 	return f.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
 		ref := f.client.Collection("runners").Doc(name)
 		doc, err := tx.Get(ref)
@@ -74,6 +74,7 @@ func (f *firestoreStore) DeferRunner(ctx context.Context, name string, due time.
 			return nil
 		}
 		r.NextActionAt = due
+		r.Available = available && !r.Record.Terminal
 		return tx.Set(ref, r)
 	})
 }

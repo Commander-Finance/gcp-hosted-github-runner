@@ -94,12 +94,13 @@ func (m *memoryStore) ReleaseRunner(_ context.Context, name string) error {
 	m.fleet.Revision++
 	return nil
 }
-func (m *memoryStore) DeferRunner(_ context.Context, name string, due time.Time) error {
+func (m *memoryStore) DeferRunner(_ context.Context, name string, due time.Time, available bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.runners[name]
 	if ok && r.Owner == "" {
 		r.NextActionAt = due
+		r.Available = available && !r.Record.Terminal
 		m.runners[name] = r
 	}
 	return nil

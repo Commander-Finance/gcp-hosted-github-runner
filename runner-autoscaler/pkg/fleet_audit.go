@@ -30,6 +30,8 @@ func (s *Autoscaler) reconcileRunners(ctx context.Context) error {
 			return e
 		}
 		remove := found && state.isStopped()
+		available := false
+		next := time.Now().Add(10 * time.Minute)
 		if found && !remove {
 			src, ok := s.conf.RegisteredSources[r.Record.Source]
 			if !ok {
@@ -43,7 +45,11 @@ func (s *Autoscaler) reconcileRunners(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			remove = registration == runnerGone || (r.Record.Terminal && registration == runnerIdle)
+			remove = registration == runnerGone || (r.Record.Terminal && registration != runnerBusy) || (registration == runnerOffline && s.offlineExpired(r.Record))
+			available = registration == runnerIdle
+			if registration == runnerOffline {
+				next = time.Now().Add(2 * time.Minute)
+			}
 		}
 		if remove {
 			if e = s.DeleteInstance(ctx, r.Name); e != nil {
@@ -56,7 +62,7 @@ func (s *Autoscaler) reconcileRunners(ctx context.Context) error {
 				return e
 			}
 		} else {
-			if e = s.store.DeferRunner(ctx, r.Name, time.Now().Add(10*time.Minute)); e != nil {
+			if e = s.store.DeferRunner(ctx, r.Name, next, available); e != nil {
 				return e
 			}
 		}

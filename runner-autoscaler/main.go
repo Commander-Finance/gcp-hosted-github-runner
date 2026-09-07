@@ -86,6 +86,7 @@ func main() {
 		AllowedMachineTypes:      strings.Fields(getEnvDefault("ALLOWED_MACHINE_TYPES", "")),
 		DiscoveryRepositories:    strings.Fields(getEnvDefault("DISCOVERY_REPOSITORIES", "")),
 		MachineTimeout:           getEnvDefaultInt64("MACHINE_TIMEOUT", 3600),
+		RunnerRegisterTimeout:    getEnvDefaultInt64("RUNNER_REGISTER_TIMEOUT", 120),
 		MaxRequestBytes:          getEnvDefaultInt64("MAX_REQUEST_BYTES", 1048576),
 		RouteWebhook:             getEnvDefault("ROUTE_WEBHOOK", "/webhook"),
 		RouteDeleteVm:            getEnvDefault("ROUTE_DELETE_VM", "/delete_vm"),

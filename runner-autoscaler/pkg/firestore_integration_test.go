@@ -44,6 +44,11 @@ func TestFirestoreCapacityTransferAndVersionContract(t *testing.T) {
 		return nil
 	}))
 	require.NoError(t, f.Detach(ctx, ak, "a", true, time.Now()))
+	require.NoError(t, f.DeferRunner(ctx, "runner-transfer", time.Now(), false))
+	spare, err := f.Runner(ctx, "runner-transfer")
+	require.NoError(t, err)
+	require.False(t, spare.Available)
+	require.NoError(t, f.DeferRunner(ctx, "runner-transfer", time.Now(), true))
 	_, err = s.claim(ctx, bk, "b")
 	require.NoError(t, err)
 	adopted, err := f.Adopt(ctx, bk, "b", poolKey(src.Name, b))

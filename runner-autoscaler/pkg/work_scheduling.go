@@ -134,7 +134,33 @@ const (
 	runnerIdle runnerRegistration = iota
 	runnerBusy
 	runnerGone
+	runnerOffline
 )
+
+func registrationState(status string, busy bool) runnerRegistration {
+	if !strings.EqualFold(status, "online") {
+		return runnerOffline
+	}
+	if busy {
+		return runnerBusy
+	}
+	return runnerIdle
+}
+
+func (s *Autoscaler) offlineExpired(r lifecycleRecord) bool {
+	started := r.CreatedAt
+	if started.IsZero() {
+		started = r.AttemptedAt
+	}
+	if started.IsZero() {
+		started = r.JITIssuedAt
+	}
+	timeout := s.conf.RunnerRegisterTimeout
+	if timeout <= 0 {
+		timeout = 120
+	}
+	return started.IsZero() || !time.Now().Before(started.Add(time.Duration(timeout)*time.Second))
+}
 
 var errRunnerLookupMissing = errors.New("runner lookup requires inventory verification")
 
@@ -157,13 +183,11 @@ func (s *Autoscaler) runnerStateWithPAT(ctx context.Context, src Source, name, p
 		}
 		if r.Record.RunnerID > 0 {
 			var result struct {
-				Busy bool `json:"busy"`
+				Busy   bool   `json:"busy"`
+				Status string `json:"status"`
 			}
 			if err = s.githubGetWithRunner404(ctx, pat, fmt.Sprintf("%s/%d", endpoint, r.Record.RunnerID), &result, true); err == nil {
-				if result.Busy {
-					return runnerBusy, nil
-				}
-				return runnerIdle, nil
+				return registrationState(result.Status, result.Busy), nil
 			} else if !errors.Is(err, errRunnerLookupMissing) {
 				return runnerIdle, err
 			}
@@ -172,9 +196,10 @@ func (s *Autoscaler) runnerStateWithPAT(ctx context.Context, src Source, name, p
 	for page := 1; page <= 100; page++ {
 		var result struct {
 			Runners []struct {
-				ID   int64  `json:"id"`
-				Name string `json:"name"`
-				Busy bool   `json:"busy"`
+				ID     int64  `json:"id"`
+				Name   string `json:"name"`
+				Busy   bool   `json:"busy"`
+				Status string `json:"status"`
 			} `json:"runners"`
 		}
 		if err := s.githubGet(ctx, pat, fmt.Sprintf("%s?per_page=100&page=%d", endpoint, page), &result); err != nil {
@@ -187,10 +212,7 @@ func (s *Autoscaler) runnerStateWithPAT(ctx context.Context, src Source, name, p
 						return runnerIdle, err
 					}
 				}
-				if runner.Busy {
-					return runnerBusy, nil
-				}
-				return runnerIdle, nil
+				return registrationState(runner.Status, runner.Busy), nil
 			}
 		}
 		if len(result.Runners) < 100 {

@@ -1791,6 +1791,7 @@ type AutoscalerConfig struct {
 	AllowOnDemand          bool
 	AllowedMachineTypes    []string
 	MachineTimeout         int64
+	RunnerRegisterTimeout  int64
 	DiscoveryRepositories  []string
 	MaxRequestBytes        int64
 	RouteWebhook           string

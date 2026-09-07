@@ -54,7 +54,7 @@ type lifecycleStore interface {
 	Runner(context.Context, string) (runnerRecord, error)
 	RememberRunnerID(context.Context, string, int64) error
 	ReleaseRunner(context.Context, string) error
-	DeferRunner(context.Context, string, time.Time) error
+	DeferRunner(context.Context, string, time.Time, bool) error
 	RunnerPage(context.Context, time.Time) ([]runnerRecord, error)
 	AuditSnapshot(context.Context) (fleetState, []runnerRecord, error)
 	Backoff(context.Context, string, time.Time) (time.Time, error)

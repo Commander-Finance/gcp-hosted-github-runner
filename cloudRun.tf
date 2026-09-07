@@ -48,6 +48,7 @@ resource "google_cloud_run_v2_service" "autoscaler" {
           ALLOWED_MACHINE_TYPES    = join(" ", var.allowed_machine_types)
           DISCOVERY_REPOSITORIES   = join(" ", var.discovery_repositories)
           MACHINE_TIMEOUT          = tostring(var.machine_timeout)
+          RUNNER_REGISTER_TIMEOUT  = tostring(var.runner_register_timeout)
           MAX_REQUEST_BYTES        = "1048576"
         }
         content {
