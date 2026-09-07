@@ -23,8 +23,26 @@ jobs:
         # ./pkg/... holds the white-box unit tests (fallback planning, task
         # deadlines, the zone breaker); ./test/... the HTTP-level ones.
         run: |
-          go test -v -count=1 ./pkg/... ./test/... \
+          go test -race -v -count=1 ./pkg/... ./test/... \
             -skip '^(TestCreateCallbackTask|TestGenerateRunnerJitConfig|TestDeleteNotExistingVM)$'
+
+      - name: "Start isolated Firestore emulator"
+        run: |
+          docker run --detach --rm --name runner-firestore-test \
+            --publish 127.0.0.1:8080:8080 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:07e4b8c3075ca793552fcfaf4808f104ef155d7805d87ade8e01b440463be262 \
+            gcloud emulators firestore start --host-port=0.0.0.0:8080 --project=runner-test
+          for _ in {1..60}; do
+            if curl --silent --output /dev/null http://127.0.0.1:8080; then exit 0; fi
+            sleep 1
+          done
+          docker logs runner-firestore-test
+          exit 1
+      - name: "Test Firestore transactions and due queries"
+        working-directory: runner-autoscaler
+        env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
+        run: go test -race -v -count=1 ./pkg -run '^TestFirestore'
 
   ghcr_digest_smoke:
     name: "ghcr.io digest resolution smoke test"

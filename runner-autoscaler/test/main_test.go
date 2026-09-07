@@ -108,6 +108,7 @@ func TestHasLegacyMagicLabel(t *testing.T) {
 func TestIsMagicLabel(t *testing.T) {
 
 	positive := []string{
+		"GCE-MACHINE-c2d-standard-16",
 		"gce-machine-c2d-standard-16",
 		"gce-machine-e2-highmem-8",
 		"gce-machine-t2d-standard-1",
@@ -123,11 +124,11 @@ func TestIsMagicLabel(t *testing.T) {
 	}
 
 	negative := []string{
-		"gce-machine-foo",                // only 1 segment after prefix, not shape-valid
-		"gce-machine-learning",           // same: 1 segment
-		"self-hosted",                    // not a magic label at all
-		"@machine:c2d-standard-16",       // legacy syntax — deliberately rejected
-		"GCE-MACHINE-c2d-standard-16",    // wrong case
+		"gce-machine-foo",          // only 1 segment after prefix, not shape-valid
+		"gce-machine-learning",     // same: 1 segment
+		"self-hosted",              // not a magic label at all
+		"@machine:c2d-standard-16", // legacy syntax — deliberately rejected
+
 		"foogce-machine-c2d-standard-16", // full-label-anchored: prefix not at start
 	}
 	for _, label := range negative {

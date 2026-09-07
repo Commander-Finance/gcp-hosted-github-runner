@@ -1,3 +1,5 @@
+> Lifecycle and migration details for the durable autoscaler: [ENG-2345 implementation](AUDIT-FIXES.md). The lifecycle described there supersedes the historical flow below.
+
 # gcp-hosted-github-runner
 
 [![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/Privatehive/gcp-hosted-github-runner/main.yml?branch=master&style=flat&logo=github&label=Docker+build)](https://github.com/Privatehive/gcp-hosted-github-runner/actions?query=branch%3Amaster)
@@ -117,7 +119,7 @@ Have a look at the [variables.tf](./variables.tf) file how to further configure 
 
 This are the most common variables you may want to change:
 
-`max_concurrency`: Select a maximum number of parallel workflow jobs to be expected (add 10% overhead).
+`max_runners`: The fleet ceiling, counted from durable reservations. `max_concurrency` is deprecated and ignored.
 
 `github_runner_label_groups`: One or more label groups the autoscaler matches against incoming workflow jobs (OR-of-ANDs — a job matches if it carries ALL non-magic labels of ANY one group; `gce-machine-*` labels are ignored for group matching). Examples: `[["self-hosted"]]` (default single-pool), `[["self-hosted", "linux"]]` (single pool, two required labels), `[["spock"], ["spock-prime"]]` (two disjoint pools served by one autoscaler).
 
