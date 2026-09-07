@@ -174,14 +174,26 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			if statusErr != nil {
 				return statusErr
 			}
-			busyFn := s.runnerBusyFn
-			if busyFn == nil {
-				busyFn = s.runnerBusy
+			registrationFn := s.runnerStateFn
+			if registrationFn == nil {
+				registrationFn = s.runnerState
 			}
-			busy, e := busyFn(ctx, src, r.VMName)
+			registration, e := registrationFn(ctx, src, r.VMName)
 			if e != nil {
 				return e
 			}
+			if registration == runnerGone || (r.Terminal && registration == runnerIdle) {
+				if e = s.DeleteInstance(ctx, r.VMName); e != nil {
+					return e
+				}
+				// Deletion must succeed before capacity can be released. A queued
+				// job remains due and receives replacement on the next dispatch.
+				return s.mutate(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
+					releaseReservation(current, f)
+					return nil
+				})
+			}
+			busy := registration == runnerBusy
 			if currentStatus != "queued" || busy {
 				// Keep the actual running VM accounted independently. In particular,
 				// busy RA cannot suppress A when it accepted B and RB was preempted.
@@ -480,6 +492,11 @@ func (s *Autoscaler) currentJobStatus(ctx context.Context, job Job) (string, err
 	return result.Status, nil
 }
 func (s *Autoscaler) githubGet(ctx context.Context, pat, endpoint string, result interface{}) error {
+	return s.githubGetWithRunner404(ctx, pat, endpoint, result, false)
+}
+
+// Only runner-by-ID lookups may defer classification of a 404 to inventory.
+func (s *Autoscaler) githubGetWithRunner404(ctx context.Context, pat, endpoint string, result interface{}, allowRunner404 bool) error {
 	if s.store != nil {
 		for _, key := range []string{"github", githubEndpointKey(endpoint)} {
 			until, err := s.store.Backoff(ctx, key, time.Time{})
@@ -501,6 +518,9 @@ func (s *Autoscaler) githubGet(ctx context.Context, pat, endpoint string, result
 		return err
 	}
 	defer resp.Body.Close()
+	if allowRunner404 && resp.StatusCode == http.StatusNotFound {
+		return errRunnerLookupMissing
+	}
 	// GitHub masks missing permissions with 404: never interpret it as completion.
 	if resp.StatusCode != 200 {
 		return s.githubFailure(ctx, endpoint, resp)

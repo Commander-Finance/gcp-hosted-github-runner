@@ -1885,7 +1885,7 @@ type Autoscaler struct {
 	httpClient       *http.Client
 	tokenValidator   *idtoken.Validator
 	jobStatusFn      func(context.Context, Job) (string, error)
-	runnerBusyFn     func(context.Context, Source, string) (bool, error)
+	runnerStateFn    func(context.Context, Source, string) (runnerRegistration, error)
 	queueFn          func(context.Context, string, string, interface{}, time.Duration) error
 
 	sweepMu   sync.Mutex

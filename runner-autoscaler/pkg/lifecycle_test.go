@@ -132,7 +132,7 @@ func lifecycleTestScaler() (*Autoscaler, *memoryStore, Source, Job) {
 	s.jitConfigFn = func(context.Context, string, string, int64, []string) (string, error) { return "jit", nil }
 	s.tryInsertFn = func(context.Context, creationAttempt, string, []*computepb.Items) error { return nil }
 	s.queueFn = func(context.Context, string, string, interface{}, time.Duration) error { return nil }
-	s.runnerBusyFn = func(context.Context, Source, string) (bool, error) { return false, nil }
+	s.runnerStateFn = func(context.Context, Source, string) (runnerRegistration, error) { return runnerIdle, nil }
 	return s, m, src, job
 }
 func TestConcurrentCreateLeaseAcrossWorkers(t *testing.T) {

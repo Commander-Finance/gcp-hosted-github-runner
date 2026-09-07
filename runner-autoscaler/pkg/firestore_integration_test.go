@@ -108,3 +108,15 @@ func TestFirestoreDuePaginationAndJobOnlyTransactions(t *testing.T) {
 	require.NoError(t, err)
 	require.ErrorIs(t, f.UpdateJob(ctx, first[0].Key, func(*lifecycleRecord, *fleetState) error { return nil }), errSchema)
 }
+
+func TestFirestoreRejectsUnversionedFleet(t *testing.T) {
+	f := emulatorStore(t)
+	ctx := context.Background()
+	_, err := f.client.Collection("control").Doc("schema").Delete(ctx)
+	require.NoError(t, err)
+	_, err = f.client.Collection("control").Doc("fleet").Set(ctx, fleetState{Runners: 3})
+	require.NoError(t, err)
+	require.ErrorIs(t, f.ensureSchema(ctx), errSchema)
+	_, err = f.client.Collection("control").Doc("schema").Get(ctx)
+	require.Error(t, err)
+}

@@ -29,7 +29,23 @@ func (s *Autoscaler) reconcileRunners(ctx context.Context) error {
 		if e != nil {
 			return e
 		}
-		if found && state.isStopped() {
+		remove := found && state.isStopped()
+		if found && !remove {
+			src, ok := s.conf.RegisteredSources[r.Record.Source]
+			if !ok {
+				return fmt.Errorf("unknown source for detached runner %s", r.Name)
+			}
+			registrationFn := s.runnerStateFn
+			if registrationFn == nil {
+				registrationFn = s.runnerState
+			}
+			registration, err := registrationFn(ctx, src, r.Name)
+			if err != nil {
+				return err
+			}
+			remove = registration == runnerGone || (r.Record.Terminal && registration == runnerIdle)
+		}
+		if remove {
 			if e = s.DeleteInstance(ctx, r.Name); e != nil {
 				return e
 			}

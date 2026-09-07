@@ -31,7 +31,12 @@ func TestCrossAssignmentAndPreemptionDoNotStrandDemand(t *testing.T) {
 		return "queued", nil
 	}
 	s.instanceStateFn = func(_ context.Context, name string) (bool, State, error) { return name != rb, RUNNING, nil }
-	s.runnerBusyFn = func(_ context.Context, _ Source, name string) (bool, error) { return name == ra, nil }
+	s.runnerStateFn = func(_ context.Context, _ Source, name string) (runnerRegistration, error) {
+		if name == ra {
+			return runnerBusy, nil
+		}
+		return runnerIdle, nil
+	}
 	// B is served by RA; its own RB was lost. Free RB's reservation first.
 	require.NoError(t, s.processJob(ctx, src, b))
 	require.NoError(t, s.processJob(ctx, src, a))
@@ -64,7 +69,12 @@ func TestSpareRunnerIsAdoptedWithoutNewCapacity(t *testing.T) {
 		return "queued", nil
 	}
 	s.instanceStateFn = func(context.Context, string) (bool, State, error) { return true, RUNNING, nil }
-	s.runnerBusyFn = func(_ context.Context, _ Source, name string) (bool, error) { return name == ra, nil }
+	s.runnerStateFn = func(_ context.Context, _ Source, name string) (runnerRegistration, error) {
+		if name == ra {
+			return runnerBusy, nil
+		}
+		return runnerIdle, nil
+	}
 	require.NoError(t, s.processJob(ctx, src, b)) // RB is idle, B is on RA.
 	require.NoError(t, s.processJob(ctx, src, a)) // RA is busy, detach it from A.
 	s.tryInsertFn = func(context.Context, creationAttempt, string, []*computepb.Items) error {

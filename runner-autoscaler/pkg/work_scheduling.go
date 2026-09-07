@@ -128,27 +128,45 @@ func (s *Autoscaler) finishTask(ctx context.Context, src Source, job Job, workEr
 	return status, nil
 }
 
-// Busy is an observed property from GitHub, independent of the VM's origin job.
-func (s *Autoscaler) runnerBusy(ctx context.Context, src Source, name string) (bool, error) {
+type runnerRegistration int
+
+const (
+	runnerIdle runnerRegistration = iota
+	runnerBusy
+	runnerGone
+)
+
+var errRunnerLookupMissing = errors.New("runner lookup requires inventory verification")
+
+// Registration is observed independently of the VM's originating demand.
+func (s *Autoscaler) runnerState(ctx context.Context, src Source, name string) (runnerRegistration, error) {
 	pat, err := s.readPat(ctx)
 	if err != nil {
-		return false, err
+		return runnerIdle, err
 	}
+	return s.runnerStateWithPAT(ctx, src, name, pat)
+}
+
+func (s *Autoscaler) runnerStateWithPAT(ctx context.Context, src Source, name, pat string) (runnerRegistration, error) {
 	endpoint := jitEndpoint(src)
 	endpoint = strings.TrimSuffix(endpoint, "/generate-jitconfig")
 	if s.store != nil {
 		r, err := s.store.Runner(ctx, name)
 		if err != nil {
-			return false, err
+			return runnerIdle, err
 		}
 		if r.Record.RunnerID > 0 {
 			var result struct {
 				Busy bool `json:"busy"`
 			}
-			if err = s.githubGet(ctx, pat, fmt.Sprintf("%s/%d", endpoint, r.Record.RunnerID), &result); err != nil {
-				return false, err
+			if err = s.githubGetWithRunner404(ctx, pat, fmt.Sprintf("%s/%d", endpoint, r.Record.RunnerID), &result, true); err == nil {
+				if result.Busy {
+					return runnerBusy, nil
+				}
+				return runnerIdle, nil
+			} else if !errors.Is(err, errRunnerLookupMissing) {
+				return runnerIdle, err
 			}
-			return result.Busy, nil
 		}
 	}
 	for page := 1; page <= 100; page++ {
@@ -159,22 +177,25 @@ func (s *Autoscaler) runnerBusy(ctx context.Context, src Source, name string) (b
 				Busy bool   `json:"busy"`
 			} `json:"runners"`
 		}
-		if err = s.githubGet(ctx, pat, fmt.Sprintf("%s?per_page=100&page=%d", endpoint, page), &result); err != nil {
-			return false, err
+		if err := s.githubGet(ctx, pat, fmt.Sprintf("%s?per_page=100&page=%d", endpoint, page), &result); err != nil {
+			return runnerIdle, err
 		}
 		for _, runner := range result.Runners {
 			if runner.Name == name {
 				if s.store != nil && runner.ID > 0 {
-					if err = s.store.RememberRunnerID(ctx, name, runner.ID); err != nil {
-						return false, err
+					if err := s.store.RememberRunnerID(ctx, name, runner.ID); err != nil {
+						return runnerIdle, err
 					}
 				}
-				return runner.Busy, nil
+				if runner.Busy {
+					return runnerBusy, nil
+				}
+				return runnerIdle, nil
 			}
 		}
 		if len(result.Runners) < 100 {
-			return false, nil
-		} // Booting/unregistered capacity remains claimed.
+			return runnerGone, nil
+		}
 	}
-	return false, fmt.Errorf("runner registration inventory exceeds page bound")
+	return runnerIdle, fmt.Errorf("runner registration inventory exceeds page bound")
 }

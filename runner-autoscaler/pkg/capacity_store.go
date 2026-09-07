@@ -125,6 +125,11 @@ func (f *firestoreStore) ensureSchema(ctx context.Context) error {
 			return err
 		}
 		// Never silently reinterpret pre-versioned state or overwrite a newer schema.
+		if _, err = tx.Get(f.client.Collection("control").Doc("fleet")); err == nil {
+			return errSchema
+		} else if status.Code(err) != codes.NotFound {
+			return err
+		}
 		for _, collection := range []string{"jobs", "runners"} {
 			it := tx.Documents(f.client.Collection(collection).Limit(1))
 			_, err = it.Next()
