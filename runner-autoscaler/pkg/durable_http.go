@@ -222,7 +222,7 @@ func (s *Autoscaler) deleteRunner(ctx context.Context, src Source, job Job) (int
 	if err := s.store.ReleaseRunner(ctx, job.RunnerName); err != nil {
 		return 503, err
 	}
-	if err := s.store.Update(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, f *fleetState) error {
+	if err := s.store.Update(ctx, jobKey(job), func(r *lifecycleRecord, f *fleetState) error {
 		if r.PendingDelete == job.RunnerName {
 			r.PendingDelete = ""
 		}
@@ -271,7 +271,7 @@ func (s *Autoscaler) durableRecreate(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
 	defer cancel()
 	valid := false
-	err = s.store.UpdateJob(ctx, jobKey(src.Name, cap.Job), func(r *lifecycleRecord, _ *fleetState) error {
+	err = s.store.UpdateJob(ctx, jobKey(cap.Job), func(r *lifecycleRecord, _ *fleetState) error {
 		valid = !r.Terminal && r.VMName == cap.Runner && r.VMName != ""
 		// The record's ordinary due time is minutes out; without pulling it
 		// forward, enqueueJob's due-time gate would drop the replacement and

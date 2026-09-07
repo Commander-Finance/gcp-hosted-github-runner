@@ -23,7 +23,7 @@ func TestCrossAssignmentAndPreemptionDoNotStrandDemand(t *testing.T) {
 		require.NoError(t, s.observe(ctx, src, j, false))
 		require.NoError(t, s.processJob(ctx, src, j))
 	}
-	ra, rb := m.get(jobKey(src.Name, a)).VMName, m.get(jobKey(src.Name, b)).VMName
+	ra, rb := m.get(jobKey(a)).VMName, m.get(jobKey(b)).VMName
 	s.jobStatusFn = func(_ context.Context, j Job) (string, error) {
 		if j.Id == b.Id {
 			return "in_progress", nil
@@ -40,10 +40,10 @@ func TestCrossAssignmentAndPreemptionDoNotStrandDemand(t *testing.T) {
 	// B is served by RA; its own RB was lost. Free RB's reservation first.
 	require.NoError(t, s.processJob(ctx, src, b))
 	require.NoError(t, s.processJob(ctx, src, a))
-	require.Empty(t, m.get(jobKey(src.Name, a)).VMName)
+	require.Empty(t, m.get(jobKey(a)).VMName)
 	require.Equal(t, 1, m.fleet.Runners) // RA still accounted while it serves B.
 	require.NoError(t, s.processJob(ctx, src, a))
-	replacement := m.get(jobKey(src.Name, a)).VMName
+	replacement := m.get(jobKey(a)).VMName
 	require.NotEmpty(t, replacement)
 	require.NotEqual(t, ra, replacement)
 	require.Equal(t, 2, m.fleet.Runners)
@@ -61,7 +61,7 @@ func TestSpareRunnerIsAdoptedWithoutNewCapacity(t *testing.T) {
 		require.NoError(t, s.observe(ctx, src, j, false))
 		require.NoError(t, s.processJob(ctx, src, j))
 	}
-	ra, rb := m.get(jobKey(src.Name, a)).VMName, m.get(jobKey(src.Name, b)).VMName
+	ra, rb := m.get(jobKey(a)).VMName, m.get(jobKey(b)).VMName
 	s.jobStatusFn = func(_ context.Context, j Job) (string, error) {
 		if j.Id == b.Id {
 			return "in_progress", nil
@@ -82,7 +82,7 @@ func TestSpareRunnerIsAdoptedWithoutNewCapacity(t *testing.T) {
 		return nil
 	}
 	require.NoError(t, s.processJob(ctx, src, a))
-	require.Equal(t, rb, m.get(jobKey(src.Name, a)).VMName)
+	require.Equal(t, rb, m.get(jobKey(a)).VMName)
 	require.Equal(t, 2, m.fleet.Runners)
 	require.NoError(t, m.ReleaseRunner(ctx, ra))
 	require.NoError(t, m.ReleaseRunner(ctx, ra))
@@ -101,7 +101,7 @@ func TestDueQueryExcludesTombstonesAndStableJobs(t *testing.T) {
 	future := j
 	future.Id++
 	require.NoError(t, s.observe(ctx, src, future, false))
-	require.NoError(t, m.UpdateJob(ctx, jobKey(src.Name, future), func(r *lifecycleRecord, _ *fleetState) error { r.NextActionAt = time.Now().Add(time.Hour); return nil }))
+	require.NoError(t, m.UpdateJob(ctx, jobKey(future), func(r *lifecycleRecord, _ *fleetState) error { r.NextActionAt = time.Now().Add(time.Hour); return nil }))
 	cleanup := j
 	cleanup.Id += 2
 	cleanup.RunnerName = "runner-1-0123456789abcdef"
@@ -110,7 +110,7 @@ func TestDueQueryExcludesTombstonesAndStableJobs(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, next)
 	require.Len(t, rows, 2)
-	require.True(t, m.get(jobKey(src.Name, cleanup)).NeedsReconcile)
+	require.True(t, m.get(jobKey(cleanup)).NeedsReconcile)
 }
 func TestOneRetryChainSurvivesRepeatedReconciliation(t *testing.T) {
 	s, m, src, j := lifecycleTestScaler()
@@ -134,8 +134,8 @@ func TestOneRetryChainSurvivesRepeatedReconciliation(t *testing.T) {
 	code, err = s.finishTask(ctx, src, task, errFleetFull)
 	require.NoError(t, err)
 	require.Equal(t, 200, code)
-	require.True(t, m.get(jobKey(src.Name, j)).NextActionAt.After(time.Now()))
-	require.True(t, m.get(jobKey(src.Name, j)).EnqueuedUntil.IsZero())
+	require.True(t, m.get(jobKey(j)).NextActionAt.After(time.Now()))
+	require.True(t, m.get(jobKey(j)).EnqueuedUntil.IsZero())
 	require.ErrorIs(t, s.activeTask(ctx, src, task), errTaskObsolete)
 }
 func TestLeaseAndPermanentFailuresDoNotHotRetry(t *testing.T) {
@@ -143,18 +143,18 @@ func TestLeaseAndPermanentFailuresDoNotHotRetry(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, j, false))
 	before := m.capacityWrites
-	_, err := s.claim(ctx, jobKey(src.Name, j), "owner")
+	_, err := s.claim(ctx, jobKey(j), "owner")
 	require.NoError(t, err)
 	code, err := s.finishTask(ctx, src, j, errLeaseBusy)
 	require.NoError(t, err)
 	require.Equal(t, 200, code)
 	require.Equal(t, before, m.capacityWrites)
-	require.NoError(t, m.Update(ctx, jobKey(src.Name, j), func(r *lifecycleRecord, f *fleetState) error { r.VMName = "unsubmitted"; f.Runners++; return nil }))
+	require.NoError(t, m.Update(ctx, jobKey(j), func(r *lifecycleRecord, f *fleetState) error { r.VMName = "unsubmitted"; f.Runners++; return nil }))
 	code, err = s.finishTask(ctx, src, j, permanentError{"invalid machine"})
 	require.NoError(t, err)
 	require.Equal(t, 200, code)
 	require.Zero(t, m.fleet.Runners)
-	require.False(t, m.get(jobKey(src.Name, j)).NeedsReconcile)
+	require.False(t, m.get(jobKey(j)).NeedsReconcile)
 }
 
 type replayedEnqueueStore struct{ lifecycleStore }

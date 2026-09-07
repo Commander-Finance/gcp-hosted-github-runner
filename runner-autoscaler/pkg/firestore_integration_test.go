@@ -32,7 +32,7 @@ func TestFirestoreCapacityTransferAndVersionContract(t *testing.T) {
 	for _, j := range []Job{a, b} {
 		require.NoError(t, s.observe(ctx, src, j, false))
 	}
-	ak, bk := jobKey(src.Name, a), jobKey(src.Name, b)
+	ak, bk := jobKey(a), jobKey(b)
 	_, err := s.claim(ctx, ak, "a")
 	require.NoError(t, err)
 	require.NoError(t, s.mutate(ctx, ak, "a", func(r *lifecycleRecord, c *fleetState) error {
@@ -133,7 +133,7 @@ func TestFirestoreAssignmentSurvivesCapacityWritesAndReordering(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, a, false))
 	require.NoError(t, s.processJob(ctx, src, a))
-	ak := jobKey(src.Name, a)
+	ak := jobKey(a)
 	var name string
 	require.NoError(t, f.UpdateJob(ctx, ak, func(r *lifecycleRecord, _ *fleetState) error { name = r.VMName; return nil }))
 	b := a
@@ -177,11 +177,11 @@ func TestFirestoreAdoptSkipsAssignedCandidate(t *testing.T) {
 	busy.Id++
 	busy.Status = "in_progress"
 	require.NoError(t, s.observe(ctx, src, busy, false))
-	require.NoError(t, f.RecordAssignment(ctx, jobKey(src.Name, busy), "runner-a", busy))
+	require.NoError(t, f.RecordAssignment(ctx, jobKey(busy), "runner-a", busy))
 	_, err := f.client.Collection("runners").Doc("runner-a").Update(ctx, []firestore.Update{{Path: "Available", Value: true}})
 	require.NoError(t, err)
 	require.NoError(t, s.observe(ctx, src, j, false))
-	key := jobKey(src.Name, j)
+	key := jobKey(j)
 	_, err = s.claim(ctx, key, "lease")
 	require.NoError(t, err)
 	adopted, err := f.Adopt(ctx, key, "lease", pool)

@@ -31,10 +31,15 @@ func nonce() string {
 }
 func (s *Autoscaler) observe(ctx context.Context, src Source, job Job, terminal bool) error {
 	job.TaskToken = ""
-	err := s.store.UpdateJob(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
+	err := s.store.UpdateJob(ctx, jobKey(job), func(r *lifecycleRecord, _ *fleetState) error {
 		changed := r.Job.Status != job.Status || (!r.Terminal && terminal)
 		if !r.Terminal || terminal {
-			r.Job, r.Source = job, src.Name
+			r.Job = job
+		}
+		// The first delivering source owns the record so its JIT scope stays
+		// stable; a later source takes over only if the first was unregistered.
+		if _, registered := s.conf.RegisteredSources[r.Source]; r.Source == "" || !registered {
+			r.Source = src.Name
 		}
 		if terminal && IsOwnedRunnerName(s.conf.RunnerPrefix, job.RunnerName) {
 			r.PendingDelete = job.RunnerName
@@ -61,7 +66,7 @@ func (s *Autoscaler) observe(ctx context.Context, src Source, job Job, terminal 
 		if terminal {
 			job.Status = "completed"
 		}
-		return s.store.RecordAssignment(ctx, jobKey(src.Name, job), job.RunnerName, job)
+		return s.store.RecordAssignment(ctx, jobKey(job), job.RunnerName, job)
 	}
 	return nil
 }
@@ -118,6 +123,13 @@ func releaseReservation(r *lifecycleRecord, f *fleetState) {
 	}
 }
 
+// operationError reports an insert whose zonal operation Compute has settled
+// with an error: the attempt is over and no VM will appear for it.
+type operationError struct{ err error }
+
+func (e operationError) Error() string { return e.err.Error() }
+func (e operationError) Unwrap() error { return e.err }
+
 // processJob retains a durable record through deletion, API outages and enqueue
 // failures. There is intentionally no boolean idle-runner gate: each queued job
 // has at most one reservation and is rechecked until GitHub serves it, regardless
@@ -126,7 +138,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 	if s.conf.Simulate {
 		return nil
 	}
-	key, token := jobKey(src.Name, job), nonce()
+	key, token := jobKey(job), nonce()
 	r, err := s.claim(ctx, key, token)
 	if err != nil {
 		return err
@@ -138,6 +150,9 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			log.Warnf("Lifecycle lease release failed for job %d: %v", job.Id, e)
 		}
 	}()
+	// A settled insert failure found during reconciliation; the creation plan
+	// resumes after it instead of restarting from the first attempt.
+	var failedAttempt *creationAttempt
 	// GitHub assignment, not VM ownership, determines whether demand is served.
 	statusFn := s.jobStatusFn
 	if statusFn == nil {
@@ -219,7 +234,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			}
 		}
 		if !found && r.CreatedAt.IsZero() && r.Zone != "" && s.canResolveAttempt() {
-			done, e := s.resolveAttempt(ctx, r)
+			done, settled, e := s.resolveAttempt(ctx, r)
 			if e != nil {
 				return e
 			}
@@ -232,9 +247,25 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 				if stillPresent {
 					return nil
 				}
-				// A completed operation and no VM: it either failed or the VM was
-				// already removed by a delete/sweep before creation could be recorded.
-				if e = s.mutate(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
+				if settled != nil && IsCapacityError(settled) {
+					// Compute settled the insert with a stockout. Keep the generation
+					// and its JIT credential; the plan continues after this attempt.
+					pinned := creationAttempt{template: r.Template, zone: r.Zone, provisioningModel: r.Model, machineType: rMachine(r)}
+					failedAttempt = &pinned
+					change := s.mutateJob
+					if r.Model == "standard" {
+						change = s.mutate
+					}
+					if e = change(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
+						clearAttempt(current, f)
+						r = *current
+						return nil
+					}); e != nil {
+						return e
+					}
+				} else if e = s.mutate(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
+					// A completed operation and no VM: it either failed or the VM was
+					// already removed by a delete/sweep before creation could be recorded.
 					releaseReservation(current, f)
 					r = *current
 					return nil
@@ -354,11 +385,16 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			return e
 		}
 	}
-	plan := s.creationPlan(r.VMName, override, s.benchedZonesCached(ctx))
+	full := s.creationPlan(r.VMName, override, s.benchedZonesCached(ctx))
+	plan := full
 	if r.Zone != "" {
-		template := r.Template
-		// Persist the selected machine alongside the attempt, not the job override.
-		plan = []creationAttempt{{template: template, zone: r.Zone, provisioningModel: r.Model, machineType: rMachine(r)}}
+		// Retry the saved attempt first; the persisted machine, not the job
+		// override, is what was inserted. A settled failure then continues
+		// through the rest of the plan.
+		pinned := creationAttempt{template: r.Template, zone: r.Zone, provisioningModel: r.Model, machineType: rMachine(r)}
+		plan = append([]creationAttempt{pinned}, attemptsAfter(full, pinned)...)
+	} else if failedAttempt != nil {
+		plan = attemptsAfter(full, *failedAttempt)
 	}
 	insert := s.tryInsertFn
 	if insert == nil {
@@ -380,7 +416,10 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			}); e != nil {
 				return e
 			}
-			return op.Wait(ctx)
+			if e = op.Wait(ctx); e != nil && op.Done() {
+				return operationError{e}
+			}
+			return e
 		}
 	}
 	for _, attempt := range plan {
@@ -425,21 +464,20 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			})
 		}
 		var apiErr *apierror.APIError
+		var settled operationError
 		definite := IsCapacityError(err) || IsRateLimitError(err) || (errors.As(err, &apiErr) && apiErr.HTTPCode() >= 400 && apiErr.HTTPCode() < 500)
-		if !definite || r.Operation != "" {
+		// Only a definite capacity error permits a different zone. An accepted
+		// insert stays ambiguous until Compute settles its operation, so a timeout
+		// retains the saved attempt and no second zonal VM can appear on a retry.
+		if !definite || (r.Operation != "" && !errors.As(err, &settled)) {
 			return err
 		}
-		// Only a definite capacity error permits a different zone; timeouts retain
-		// the saved attempt so no second zonal VM can be created on a retry.
-		clearAttempt := s.mutateJob
+		change := s.mutateJob
 		if r.Model == "standard" {
-			clearAttempt = s.mutate
+			change = s.mutate
 		}
-		if e := clearAttempt(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
-			if current.Model == "standard" {
-				f.Standard--
-			}
-			current.Zone, current.Model, current.Operation, current.Template = "", "", "", ""
+		if e := change(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
+			clearAttempt(current, f)
 			r = *current
 			return nil
 		}); e != nil {
@@ -458,6 +496,28 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 	return err
 }
 func rMachine(r lifecycleRecord) string { return r.Machine }
+
+// clearAttempt drops the saved zone, model, operation and template so the next
+// attempt can differ. Callers holding a STANDARD reservation must use the
+// capacity-aware mutate so the counter decrement is persisted.
+func clearAttempt(r *lifecycleRecord, f *fleetState) {
+	if r.Model == "standard" {
+		f.Standard--
+	}
+	r.Zone, r.Model, r.Operation, r.Template = "", "", "", ""
+}
+
+// attemptsAfter returns the attempts following the first one equal to failed,
+// or the whole plan when failed is not part of it (an attempt saved under an
+// earlier configuration).
+func attemptsAfter(plan []creationAttempt, failed creationAttempt) []creationAttempt {
+	for i, a := range plan {
+		if a == failed {
+			return plan[i+1:]
+		}
+	}
+	return plan
+}
 func (s *Autoscaler) allowedMachine(machine string) bool {
 	for _, allowed := range s.conf.AllowedMachineTypes {
 		if strings.EqualFold(machine, allowed) {
@@ -558,18 +618,24 @@ func insertRequestID(name string, a creationAttempt) string {
 // Resolve accepted inserts even if the worker died before recording success.
 // Pending operations keep their reservation. Missing operations are considered
 // absent only after the old worker's lease/deadline and a propagation margin.
-func (s *Autoscaler) resolveAttempt(ctx context.Context, r lifecycleRecord) (bool, error) {
+// settled carries the operation's own error when Compute finished it
+// unsuccessfully, so the caller can classify the failure.
+func (s *Autoscaler) resolveAttempt(ctx context.Context, r lifecycleRecord) (done bool, settled error, err error) {
 	op, err := s.lookupOperation(ctx, r)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if op == nil {
 		if r.Operation != "" {
-			return true, nil // only completed operations expire
+			return true, nil, nil // only completed operations expire
 		}
-		return !r.AttemptedAt.IsZero() && time.Since(r.AttemptedAt) > time.Duration(s.conf.TaskTimeout+120)*time.Second, nil
+		return !r.AttemptedAt.IsZero() && time.Since(r.AttemptedAt) > time.Duration(s.conf.TaskTimeout+120)*time.Second, nil, nil
 	}
-	return op.GetStatus() == computepb.Operation_DONE, nil
+	done = op.GetStatus() == computepb.Operation_DONE
+	if code := op.GetHttpErrorStatusCode(); done && op.HttpErrorStatusCode != nil && (code < 200 || code > 299) {
+		settled = operationError{fmt.Errorf("%s: %v", op.GetHttpErrorMessage(), op.GetError())}
+	}
+	return done, settled, nil
 }
 func (s *Autoscaler) canResolveAttempt() bool {
 	return s.operationLookupFn != nil || s.operationsClient != nil

@@ -155,7 +155,7 @@ func TestConcurrentCreateLeaseAcrossWorkers(t *testing.T) {
 	close(unblock)
 	require.NoError(t, <-done)
 	require.Equal(t, 1, m.fleet.Runners)
-	require.Equal(t, "only-config", m.get(jobKey(src.Name, j)).JIT)
+	require.Equal(t, "only-config", m.get(jobKey(j)).JIT)
 }
 func TestCancelledUnassignedAndReorderedWebhook(t *testing.T) {
 	s, m, src, j := lifecycleTestScaler()
@@ -171,7 +171,7 @@ func TestCancelledUnassignedAndReorderedWebhook(t *testing.T) {
 		s.engine.ServeHTTP(w, req)
 		require.Equal(t, 200, w.Code)
 	}
-	require.True(t, m.get(jobKey(src.Name, j)).Terminal)
+	require.True(t, m.get(jobKey(j)).Terminal)
 	require.NoError(t, s.processJob(context.Background(), src, j))
 	require.Zero(t, m.fleet.Runners)
 }
@@ -196,17 +196,17 @@ func TestRecoveryRetainsOriginAfterDeletionAndGitHubFailure(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, j, false))
 	require.NoError(t, s.processJob(ctx, src, j))
-	old := m.get(jobKey(src.Name, j)).VMName
+	old := m.get(jobKey(j)).VMName
 	s.instanceStateFn = func(context.Context, string) (bool, State, error) { return false, Unknown, nil } // VM already deleted after serving another job
 	s.jobStatusFn = func(context.Context, Job) (string, error) { return "", errors.New("GitHub unavailable") }
 	require.Error(t, s.processJob(ctx, src, j))
-	require.Equal(t, j, m.get(jobKey(src.Name, j)).Job)
+	require.Equal(t, j, m.get(jobKey(j)).Job)
 	require.Zero(t, m.fleet.Runners)
 	// A different process recovers without reading deleted VM metadata.
 	other, _, _, _ := lifecycleTestScaler()
 	other.store = m
 	require.NoError(t, other.processJob(ctx, src, j))
-	require.NotEqual(t, old, m.get(jobKey(src.Name, j)).VMName)
+	require.NotEqual(t, old, m.get(jobKey(j)).VMName)
 	require.Equal(t, 1, m.fleet.Runners)
 }
 func TestAmbiguousInsertKeepsNameZoneAndCredentials(t *testing.T) {
@@ -258,7 +258,7 @@ func TestStandardReservationLimit(t *testing.T) {
 func TestExpiredLeaseCannotChangeReplacement(t *testing.T) {
 	s, m, src, j := lifecycleTestScaler()
 	ctx := context.Background()
-	key := jobKey(src.Name, j)
+	key := jobKey(j)
 	require.NoError(t, s.observe(ctx, src, j, false))
 	_, err := s.claim(ctx, key, "old")
 	require.NoError(t, err)
@@ -309,7 +309,7 @@ func TestRecreateRejectsExpiredOrOldGeneration(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, j, false))
 	require.NoError(t, s.processJob(ctx, src, j))
-	name := m.get(jobKey(src.Name, j)).VMName
+	name := m.get(jobKey(j)).VMName
 	for _, cap := range []recreateCapability{{Job: j, Runner: name, Purpose: "recreate", Expires: time.Now().Add(-time.Second).Unix()}, {Job: j, Runner: "runner-old", Purpose: "recreate", Expires: time.Now().Add(time.Hour).Unix()}} {
 		body, _ := json.Marshal(cap)
 		req := httptest.NewRequest("POST", "/recreate_vm?src=acme", bytes.NewReader(body))
@@ -333,7 +333,7 @@ func TestCompletionDeletionIntentSurvivesReorderedQueue(t *testing.T) {
 	completed.RunnerName = "runner-20-0123456789abcdef"
 	require.NoError(t, s.observe(context.Background(), src, completed, true))
 	require.NoError(t, s.observe(context.Background(), src, job, false))
-	r := m.get(jobKey(src.Name, job))
+	r := m.get(jobKey(job))
 	require.True(t, r.Terminal)
 	require.Equal(t, completed.RunnerName, r.PendingDelete)
 	require.Equal(t, completed.RunnerName, r.Job.RunnerName)
@@ -343,7 +343,7 @@ func TestExpiredUnsubmittedJITGetsNewGeneration(t *testing.T) {
 	s, m, src, job := lifecycleTestScaler()
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, job, false))
-	require.NoError(t, m.Update(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, f *fleetState) error {
+	require.NoError(t, m.Update(ctx, jobKey(job), func(r *lifecycleRecord, f *fleetState) error {
 		r.VMName = "runner-10-old"
 		r.JIT = "expired"
 		r.JITIssuedAt = time.Now().Add(-time.Hour)
@@ -351,7 +351,7 @@ func TestExpiredUnsubmittedJITGetsNewGeneration(t *testing.T) {
 		return nil
 	}))
 	require.NoError(t, s.processJob(ctx, src, job))
-	r := m.get(jobKey(src.Name, job))
+	r := m.get(jobKey(job))
 	require.NotEqual(t, "runner-10-old", r.VMName)
 	require.Equal(t, "jit", r.JIT)
 	require.Equal(t, 1, m.fleet.Runners)
@@ -360,9 +360,9 @@ func TestCancelledUnsubmittedReservationIsReleased(t *testing.T) {
 	s, m, src, job := lifecycleTestScaler()
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, job, true))
-	require.NoError(t, m.Update(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, f *fleetState) error { r.VMName = "runner-10-old"; f.Runners = 1; return nil }))
+	require.NoError(t, m.Update(ctx, jobKey(job), func(r *lifecycleRecord, f *fleetState) error { r.VMName = "runner-10-old"; f.Runners = 1; return nil }))
 	require.NoError(t, s.processJob(ctx, src, job))
-	require.Empty(t, m.get(jobKey(src.Name, job)).VMName)
+	require.Empty(t, m.get(jobKey(job)).VMName)
 	require.Zero(t, m.fleet.Runners)
 }
 func TestAmbiguousRetryPreservesTemplateAndOriginalAttemptTime(t *testing.T) {
@@ -373,14 +373,14 @@ func TestAmbiguousRetryPreservesTemplateAndOriginalAttemptTime(t *testing.T) {
 		return context.DeadlineExceeded
 	}
 	require.Error(t, s.processJob(ctx, src, job))
-	before := m.get(jobKey(src.Name, job))
+	before := m.get(jobKey(job))
 	s.conf.InstanceTemplate = "new-deployment-template"
 	s.tryInsertFn = func(_ context.Context, a creationAttempt, _ string, _ []*computepb.Items) error {
 		require.Equal(t, before.Template, a.template)
 		return context.DeadlineExceeded
 	}
 	require.Error(t, s.processJob(ctx, src, job))
-	after := m.get(jobKey(src.Name, job))
+	after := m.get(jobKey(job))
 	require.Equal(t, before.AttemptedAt, after.AttemptedAt)
 	require.Equal(t, before.VMName, after.VMName)
 }

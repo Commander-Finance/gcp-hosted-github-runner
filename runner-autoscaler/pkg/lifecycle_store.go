@@ -69,8 +69,11 @@ type storedRecord struct {
 }
 type firestoreStore struct{ client *firestore.Client }
 
-func jobKey(source string, job Job) string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", source, job.RepositoryFullName, job.Id))))
+// jobKey identifies demand by the GitHub job alone. Overlapping webhook scopes
+// (an organization webhook plus a repository webhook) deliver the same job
+// under different sources and must converge on one record.
+func jobKey(job Job) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s:%d", job.RepositoryFullName, job.Id))))
 }
 func (f *firestoreStore) Update(ctx context.Context, key string, change func(*lifecycleRecord, *fleetState) error) error {
 	return f.update(ctx, key, true, change)

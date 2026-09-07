@@ -19,7 +19,7 @@ func TestPositiveAssignmentOverridesFalseIdle(t *testing.T) {
 				require.NoError(t, s.observe(ctx, src, job, false))
 				require.NoError(t, s.processJob(ctx, src, job))
 			}
-			ra, rb := m.get(jobKey(src.Name, a)).VMName, m.get(jobKey(src.Name, b)).VMName
+			ra, rb := m.get(jobKey(a)).VMName, m.get(jobKey(b)).VMName
 			b.Status, b.RunnerName = "in_progress", ra
 			// Discovery reconstructs assignment even when the webhook was missed.
 			require.NoError(t, s.observeDiscoveredJobs(ctx, src, b.RepositoryFullName, []Job{b}))
@@ -40,7 +40,7 @@ func TestPositiveAssignmentOverridesFalseIdle(t *testing.T) {
 			}
 			require.NoError(t, s.processJob(ctx, src, b))
 			require.NoError(t, s.processJob(ctx, src, a))
-			require.Empty(t, m.get(jobKey(src.Name, a)).VMName)
+			require.Empty(t, m.get(jobKey(a)).VMName)
 			require.Equal(t, 1, m.fleet.Runners)
 			require.NoError(t, m.DeferRunner(ctx, ra, time.Now(), true))
 			require.NoError(t, s.reconcileRunners(ctx))
@@ -49,8 +49,8 @@ func TestPositiveAssignmentOverridesFalseIdle(t *testing.T) {
 			require.False(t, r.Available)
 			if !terminal {
 				require.NoError(t, s.processJob(ctx, src, a))
-				require.NotEmpty(t, m.get(jobKey(src.Name, a)).VMName)
-				require.NotEqual(t, ra, m.get(jobKey(src.Name, a)).VMName)
+				require.NotEmpty(t, m.get(jobKey(a)).VMName)
+				require.NotEqual(t, ra, m.get(jobKey(a)).VMName)
 			}
 		})
 	}

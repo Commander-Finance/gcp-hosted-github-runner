@@ -66,7 +66,7 @@ func TestReconcileHandlerSkipsSettledLeasedAndUnknownSourceRows(t *testing.T) {
 		r.Job = job
 		r.SchemaVersion = stateVersion
 		prepareRecord(&r)
-		m.rows[jobKey(r.Source, job)] = r
+		m.rows[jobKey(job)] = r
 	}
 	// Settled terminal tombstone: NeedsReconcile computes false, so Page never
 	// surfaces it to the handler at all.
@@ -204,7 +204,7 @@ func TestDurableRecreateAcceptsCapabilityMatchingCurrentRunner(t *testing.T) {
 	require.NoError(t, s.processJob(ctx, src, j))
 	s.instanceStateFn = func(context.Context, string) (bool, State, error) { return true, RUNNING, nil }
 	require.NoError(t, s.processJob(ctx, src, j))
-	key := jobKey(src.Name, j)
+	key := jobKey(j)
 	name := m.get(key).VMName
 	require.NotEmpty(t, name)
 	require.True(t, m.get(key).NextActionAt.After(time.Now().Add(recreateVmDelay)))

@@ -45,7 +45,7 @@ func dispatchWindow(taskTimeout, attempts, maxBackoff, maxRetryDuration int64) t
 // One durable outbox marker covers a complete bounded Cloud Tasks retry chain.
 // Write before enqueue: if a worker dies here, the marker expires and redrives.
 func (s *Autoscaler) enqueueJob(ctx context.Context, src Source, job Job, delay time.Duration) error {
-	key := jobKey(src.Name, job)
+	key := jobKey(job)
 	token := nonce()
 	route := s.conf.RouteCreateVm
 	send := false
@@ -85,7 +85,7 @@ func (s *Autoscaler) enqueueJob(ctx context.Context, src Source, job Job, delay 
 	return err
 }
 func (s *Autoscaler) activeTask(ctx context.Context, src Source, job Job) error {
-	return s.store.UpdateJob(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
+	return s.store.UpdateJob(ctx, jobKey(job), func(r *lifecycleRecord, _ *fleetState) error {
 		if job.TaskToken == "" || r.EnqueueToken != job.TaskToken {
 			return errTaskObsolete
 		}
@@ -110,7 +110,7 @@ func (s *Autoscaler) finishTask(ctx context.Context, src Source, job Job, workEr
 	if errors.As(workErr, &permanent) {
 		update = s.store.Update
 	}
-	err := update(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, f *fleetState) error {
+	err := update(ctx, jobKey(job), func(r *lifecycleRecord, f *fleetState) error {
 		if job.TaskToken != "" && job.TaskToken != r.EnqueueToken {
 			return nil
 		}

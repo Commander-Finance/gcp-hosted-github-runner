@@ -11,6 +11,7 @@ import (
 
 	"cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestGithubBackoffIsScopedToTheDeniedEndpoint(t *testing.T) {
@@ -41,7 +42,7 @@ func TestDeleteCallbackReleasesFleetReservation(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, j, false))
 	require.NoError(t, s.processJob(ctx, src, j))
-	key := jobKey(src.Name, j)
+	key := jobKey(j)
 	name := m.get(key).VMName
 	require.NotEmpty(t, name)
 	require.Equal(t, 1, m.fleet.Runners)
@@ -133,7 +134,7 @@ func TestAmbiguousInsertResolvesFromOperationState(t *testing.T) {
 				return nil
 			}
 			require.Error(t, s.processJob(ctx, src, j))
-			key := jobKey(src.Name, j)
+			key := jobKey(j)
 			if !c.attemptedAt.IsZero() {
 				require.NoError(t, m.UpdateJob(ctx, key, func(r *lifecycleRecord, _ *fleetState) error { r.AttemptedAt = c.attemptedAt; return nil }))
 			}
@@ -165,7 +166,7 @@ func TestDispatchWindowFollowsConfiguredRetryPolicy(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, j, false))
 	require.NoError(t, s.enqueueJob(ctx, src, j, 0))
-	until := m.get(jobKey(src.Name, j)).EnqueuedUntil
+	until := m.get(jobKey(j)).EnqueuedUntil
 	require.WithinDuration(t, time.Now().Add(dispatchWindow(30, 16, 600, 7200)), until, 5*time.Second)
 }
 
@@ -242,4 +243,100 @@ func TestDiscoveryPagesRepositoriesAndRunJobs(t *testing.T) {
 	require.Equal(t, 2, queued[0].Page)
 	require.NoError(t, s.discoverWithPAT(ctx, src, "test", discoveryPage{Source: src.Name, Repository: "acme/repo", RunID: 7, Page: 2}))
 	require.Len(t, m.rows, 2)
+}
+
+func TestOverlappingWebhookScopesShareOneDemandRecord(t *testing.T) {
+	s, m, org, j := lifecycleTestScaler()
+	ctx := context.Background()
+	repo := Source{Name: j.RepositoryFullName, SourceType: TypeRepository, Secret: "repo-secret"}
+	s.conf.RegisteredSources[repo.Name] = repo
+	require.NoError(t, s.observe(ctx, org, j, false))
+	require.NoError(t, s.observe(ctx, repo, j, false))
+	require.Len(t, m.rows, 1)
+	for _, r := range m.rows {
+		require.Equal(t, org.Name, r.Source)
+	}
+	require.NoError(t, s.processJob(ctx, repo, j))
+	require.NoError(t, s.processJob(ctx, org, j))
+	require.Equal(t, 1, m.fleet.Runners)
+	delete(s.conf.RegisteredSources, org.Name)
+	require.NoError(t, s.observe(ctx, repo, j, false))
+	for _, r := range m.rows {
+		require.Equal(t, repo.Name, r.Source)
+	}
+}
+
+// A retry after an ambiguous insert learns from Compute that the operation
+// settled with a stockout; the plan must continue past that attempt instead of
+// returning the same error until reconciliation restarts from the first zone.
+func TestSettledStockoutAdvancesPastPinnedAttempt(t *testing.T) {
+	s, m, src, j := lifecycleTestScaler()
+	ctx := context.Background()
+	require.NoError(t, s.observe(ctx, src, j, false))
+	key := jobKey(j)
+	var attempts []creationAttempt
+	s.tryInsertFn = func(_ context.Context, a creationAttempt, _ string, _ []*computepb.Items) error {
+		attempts = append(attempts, a)
+		if len(attempts) == 1 {
+			return context.DeadlineExceeded
+		}
+		if a.provisioningModel == "spot" {
+			return operationError{fmt.Errorf("ZONE_RESOURCE_POOL_EXHAUSTED")}
+		}
+		return nil
+	}
+	require.Error(t, s.processJob(ctx, src, j))
+	first := m.get(key)
+	require.NoError(t, m.UpdateJob(ctx, key, func(r *lifecycleRecord, _ *fleetState) error { r.Operation = "insert-op"; return nil }))
+	require.NoError(t, s.processJob(ctx, src, j))
+	after := m.get(key)
+	require.Equal(t, first.VMName, after.VMName)
+	require.Equal(t, "standard", after.Model)
+	require.Equal(t, 1, m.fleet.Runners)
+	require.Equal(t, 1, m.fleet.Standard)
+	var models []string
+	for _, a := range attempts {
+		models = append(models, a.provisioningModel+"/"+a.zone)
+	}
+	require.Equal(t, []string{"spot/" + first.Zone, "spot/" + first.Zone}, models[:2])
+	require.Equal(t, "standard", attempts[len(attempts)-1].provisioningModel)
+	require.Len(t, attempts, 4)
+}
+
+// Reconciliation that finds the recorded operation settled with a stockout
+// keeps the generation and its JIT credential and continues the plan after the
+// failed attempt rather than releasing and restarting from the first zone.
+func TestResolvedStockoutKeepsGenerationAndSkipsFailedAttempt(t *testing.T) {
+	s, m, src, j := lifecycleTestScaler()
+	ctx := context.Background()
+	require.NoError(t, s.observe(ctx, src, j, false))
+	key := jobKey(j)
+	jitCalls := 0
+	s.jitConfigFn = func(context.Context, string, string, int64, []string) (string, error) { jitCalls++; return "jit", nil }
+	var attempts []creationAttempt
+	s.tryInsertFn = func(_ context.Context, a creationAttempt, _ string, _ []*computepb.Items) error {
+		attempts = append(attempts, a)
+		if len(attempts) == 1 {
+			return context.DeadlineExceeded
+		}
+		if a.provisioningModel == "spot" {
+			return operationError{fmt.Errorf("ZONE_RESOURCE_POOL_EXHAUSTED")}
+		}
+		return nil
+	}
+	require.Error(t, s.processJob(ctx, src, j))
+	first := m.get(key)
+	s.operationLookupFn = func(context.Context, lifecycleRecord) (*computepb.Operation, error) {
+		return &computepb.Operation{Status: computepb.Operation_DONE.Enum(), HttpErrorStatusCode: proto.Int32(403), HttpErrorMessage: proto.String("Forbidden"), Error: &computepb.Error{Errors: []*computepb.Errors{{Code: proto.String("ZONE_RESOURCE_POOL_EXHAUSTED")}}}}, nil
+	}
+	require.NoError(t, s.processJob(ctx, src, j))
+	after := m.get(key)
+	require.Equal(t, first.VMName, after.VMName)
+	require.Equal(t, 1, jitCalls)
+	require.Equal(t, "standard", after.Model)
+	require.Equal(t, 1, m.fleet.Runners)
+	require.Equal(t, 1, m.fleet.Standard)
+	require.NotEqual(t, first.Zone, attempts[1].zone)
+	require.Equal(t, "spot", attempts[1].provisioningModel)
+	require.Len(t, attempts, 3)
 }

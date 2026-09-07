@@ -18,7 +18,7 @@ func TestRunner404InventoryFindsRegistrationOnLaterPage(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, j, false))
 	require.NoError(t, s.processJob(ctx, src, j))
-	name := m.get(jobKey(src.Name, j)).VMName
+	name := m.get(jobKey(j)).VMName
 	require.NoError(t, m.RememberRunnerID(ctx, name, 42))
 	requests := 0
 	s.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -49,13 +49,13 @@ func TestRegistrationCleanupRetainsCapacityWhenDeletionFails(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, j, false))
 	require.NoError(t, s.processJob(ctx, src, j))
-	old := m.get(jobKey(src.Name, j)).VMName
+	old := m.get(jobKey(j)).VMName
 	s.instanceStateFn = func(context.Context, string) (bool, State, error) { return true, RUNNING, nil }
 	s.runnerStateFn = func(context.Context, Source, string) (runnerRegistration, error) { return runnerGone, nil }
 	s.deleteInZoneFn = func(context.Context, string, string) (bool, error) { return true, errors.New("delete unavailable") }
 	require.Error(t, s.processJob(ctx, src, j))
 	require.Equal(t, 1, m.fleet.Runners)
-	require.Equal(t, old, m.get(jobKey(src.Name, j)).VMName)
+	require.Equal(t, old, m.get(jobKey(j)).VMName)
 }
 
 func TestRunner404RequiresSuccessfulInventory(t *testing.T) {
@@ -65,7 +65,7 @@ func TestRunner404RequiresSuccessfulInventory(t *testing.T) {
 			ctx := context.Background()
 			require.NoError(t, s.observe(ctx, src, j, false))
 			require.NoError(t, s.processJob(ctx, src, j))
-			name := m.get(jobKey(src.Name, j)).VMName
+			name := m.get(jobKey(j)).VMName
 			require.NoError(t, m.RememberRunnerID(ctx, name, 42))
 			requests := 0
 			s.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -112,7 +112,7 @@ func TestRegistrationLifecycleCleanup(t *testing.T) {
 			ctx := context.Background()
 			require.NoError(t, s.observe(ctx, src, j, false))
 			require.NoError(t, s.processJob(ctx, src, j))
-			old := m.get(jobKey(src.Name, j)).VMName
+			old := m.get(jobKey(j)).VMName
 			s.jobStatusFn = func(context.Context, Job) (string, error) { return tc.status, nil }
 			s.instanceStateFn = func(context.Context, string) (bool, State, error) { return true, RUNNING, nil }
 			s.runnerStateFn = func(context.Context, Source, string) (runnerRegistration, error) { return tc.registration, nil }
@@ -128,14 +128,14 @@ func TestRegistrationLifecycleCleanup(t *testing.T) {
 				require.Zero(t, m.fleet.Runners)
 				if tc.status == "queued" {
 					require.NoError(t, s.processJob(ctx, src, j))
-					require.NotEmpty(t, m.get(jobKey(src.Name, j)).VMName)
-					require.NotEqual(t, old, m.get(jobKey(src.Name, j)).VMName)
+					require.NotEmpty(t, m.get(jobKey(j)).VMName)
+					require.NotEqual(t, old, m.get(jobKey(j)).VMName)
 				}
 			} else {
 				require.Zero(t, deleted)
 				require.Equal(t, 1, m.fleet.Runners)
 				if tc.detach {
-					require.Empty(t, m.get(jobKey(src.Name, j)).VMName)
+					require.Empty(t, m.get(jobKey(j)).VMName)
 					// A detached runner that later loses registration must also be reclaimed.
 					require.NoError(t, m.DeferRunner(ctx, old, time.Now().Add(-time.Minute), false))
 					s.runnerStateFn = func(context.Context, Source, string) (runnerRegistration, error) { return runnerGone, nil }
@@ -143,7 +143,7 @@ func TestRegistrationLifecycleCleanup(t *testing.T) {
 					require.Equal(t, 1, deleted)
 					require.Zero(t, m.fleet.Runners)
 				} else {
-					require.Equal(t, old, m.get(jobKey(src.Name, j)).VMName)
+					require.Equal(t, old, m.get(jobKey(j)).VMName)
 				}
 			}
 		})
@@ -158,7 +158,7 @@ func TestOfflineRunnerGraceAndDetachedAvailability(t *testing.T) {
 			ctx := context.Background()
 			require.NoError(t, s.observe(ctx, src, j, false))
 			require.NoError(t, s.processJob(ctx, src, j))
-			key := jobKey(src.Name, j)
+			key := jobKey(j)
 			name := m.get(key).VMName
 			s.instanceStateFn = func(context.Context, string) (bool, State, error) { return true, RUNNING, nil }
 			s.runnerStateFn = func(context.Context, Source, string) (runnerRegistration, error) { return runnerOffline, nil }
@@ -219,7 +219,7 @@ func TestRegistrationStatusFromDirectAndInventoryResponses(t *testing.T) {
 				ctx := context.Background()
 				require.NoError(t, s.observe(ctx, src, j, false))
 				require.NoError(t, s.processJob(ctx, src, j))
-				name := m.get(jobKey(src.Name, j)).VMName
+				name := m.get(jobKey(j)).VMName
 				if direct {
 					require.NoError(t, m.RememberRunnerID(ctx, name, 42))
 				}
