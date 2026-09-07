@@ -68,7 +68,7 @@ variable "machine_creation_delay" {
 
 variable "max_concurrency" {
   type        = number
-  description = "Deprecated compatibility input; use max_runners for live capacity and create_concurrency for callback concurrency."
+  description = "Deprecated and ignored: Cloud Run request concurrency is fixed at 32. The input remains so existing module callers keep applying; use max_runners for live capacity and create_concurrency for callback concurrency."
   default     = 500
   validation {
     condition     = var.max_concurrency <= 1000 && var.max_concurrency > 0

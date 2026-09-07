@@ -162,3 +162,36 @@ func TestFirestoreAssignmentSurvivesCapacityWritesAndReordering(t *testing.T) {
 	require.Equal(t, "completed", after.Job.Status)
 	require.False(t, after.ExpiresAt.IsZero())
 }
+
+func TestFirestoreAdoptSkipsAssignedCandidate(t *testing.T) {
+	f := emulatorStore(t)
+	ctx := context.Background()
+	s, _, src, j := lifecycleTestScaler()
+	s.store = f
+	pool := poolKey(src.Name, j)
+	for _, name := range []string{"runner-a", "runner-b"} {
+		_, err := f.client.Collection("runners").Doc(name).Set(ctx, runnerRecord{SchemaVersion: stateVersion, Name: name, Pool: pool, Available: true, NextActionAt: time.Now(), Record: lifecycleRecord{SchemaVersion: stateVersion, Source: src.Name, Job: j, VMName: name}})
+		require.NoError(t, err)
+	}
+	busy := j
+	busy.Id++
+	busy.Status = "in_progress"
+	require.NoError(t, s.observe(ctx, src, busy, false))
+	require.NoError(t, f.RecordAssignment(ctx, jobKey(src.Name, busy), "runner-a", busy))
+	_, err := f.client.Collection("runners").Doc("runner-a").Update(ctx, []firestore.Update{{Path: "Available", Value: true}})
+	require.NoError(t, err)
+	require.NoError(t, s.observe(ctx, src, j, false))
+	key := jobKey(src.Name, j)
+	_, err = s.claim(ctx, key, "lease")
+	require.NoError(t, err)
+	adopted, err := f.Adopt(ctx, key, "lease", pool)
+	require.NoError(t, err)
+	require.True(t, adopted)
+	spare, err := f.Runner(ctx, "runner-b")
+	require.NoError(t, err)
+	require.Equal(t, key, spare.Owner)
+	skipped, err := f.Runner(ctx, "runner-a")
+	require.NoError(t, err)
+	require.False(t, skipped.Available)
+	require.Empty(t, skipped.Owner)
+}

@@ -12,14 +12,13 @@ import (
 	"time"
 )
 
+// githubEndpointKey scopes a permission backoff to one resource path. The query
+// string is dropped so every page of a denied listing shares the backoff, while
+// sibling endpoints under the same repository (job status versus runner
+// registration) stay independent.
 func githubEndpointKey(endpoint string) string {
-	// Ignore pagination: a denied repository/endpoint must not retry every page.
 	u, _ := url.Parse(endpoint)
-	path := u.Path
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if len(parts) >= 3 && parts[0] == "repos" {
-		path = strings.Join(parts[:3], "/")
-	}
+	path := strings.Trim(u.Path, "/")
 	return fmt.Sprintf("permission-%x", sha256.Sum256([]byte(path)))
 }
 func githubRetryAt(header http.Header, now time.Time) time.Time {

@@ -218,7 +218,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 				return e
 			}
 		}
-		if !found && r.CreatedAt.IsZero() && r.Zone != "" && s.operationsClient != nil {
+		if !found && r.CreatedAt.IsZero() && r.Zone != "" && s.canResolveAttempt() {
 			done, e := s.resolveAttempt(ctx, r)
 			if e != nil {
 				return e
@@ -559,23 +559,41 @@ func insertRequestID(name string, a creationAttempt) string {
 // Pending operations keep their reservation. Missing operations are considered
 // absent only after the old worker's lease/deadline and a propagation margin.
 func (s *Autoscaler) resolveAttempt(ctx context.Context, r lifecycleRecord) (bool, error) {
-	var op *computepb.Operation
-	var err error
-	if r.Operation != "" {
-		op, err = s.operationsClient.Get(ctx, &computepb.GetZoneOperationRequest{Project: s.conf.ProjectId, Zone: r.Zone, Operation: r.Operation})
-		if IsNotFound(err) {
-			return true, nil
-		} // only completed operations expire
-	} else {
-		a := creationAttempt{zone: r.Zone, provisioningModel: r.Model, machineType: r.Machine}
-		it := s.operationsClient.List(ctx, &computepb.ListZoneOperationsRequest{Project: s.conf.ProjectId, Zone: r.Zone, Filter: proto.String(fmt.Sprintf("clientOperationId = %q", insertRequestID(r.VMName, a)))})
-		op, err = it.Next()
-		if err == iterator.Done {
-			return !r.AttemptedAt.IsZero() && time.Since(r.AttemptedAt) > time.Duration(s.conf.TaskTimeout+120)*time.Second, nil
-		}
-	}
+	op, err := s.lookupOperation(ctx, r)
 	if err != nil {
 		return false, err
 	}
+	if op == nil {
+		if r.Operation != "" {
+			return true, nil // only completed operations expire
+		}
+		return !r.AttemptedAt.IsZero() && time.Since(r.AttemptedAt) > time.Duration(s.conf.TaskTimeout+120)*time.Second, nil
+	}
 	return op.GetStatus() == computepb.Operation_DONE, nil
+}
+func (s *Autoscaler) canResolveAttempt() bool {
+	return s.operationLookupFn != nil || s.operationsClient != nil
+}
+
+// lookupOperation finds the insert operation for the record's generation by
+// operation name when one was recorded, else by the deterministic request id.
+// A nil operation means Compute has no record of the insert.
+func (s *Autoscaler) lookupOperation(ctx context.Context, r lifecycleRecord) (*computepb.Operation, error) {
+	if s.operationLookupFn != nil {
+		return s.operationLookupFn(ctx, r)
+	}
+	if r.Operation != "" {
+		op, err := s.operationsClient.Get(ctx, &computepb.GetZoneOperationRequest{Project: s.conf.ProjectId, Zone: r.Zone, Operation: r.Operation})
+		if IsNotFound(err) {
+			return nil, nil
+		}
+		return op, err
+	}
+	a := creationAttempt{zone: r.Zone, provisioningModel: r.Model, machineType: r.Machine}
+	it := s.operationsClient.List(ctx, &computepb.ListZoneOperationsRequest{Project: s.conf.ProjectId, Zone: r.Zone, Filter: proto.String(fmt.Sprintf("clientOperationId = %q", insertRequestID(r.VMName, a)))})
+	op, err := it.Next()
+	if err == iterator.Done {
+		return nil, nil
+	}
+	return op, err
 }

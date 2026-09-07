@@ -13,14 +13,22 @@ import (
 )
 
 // Every page is its own retryable task, so a large organization does not exceed
-// one Cloud Run deadline. Both queued and in_progress runs can hold queued jobs.
+// one Cloud Run deadline.
 type discoveryPage struct {
 	Source     string `json:"source,omitempty"`
 	Repository string `json:"repository,omitempty"`
 	RunID      int64  `json:"run_id,omitempty"`
-	Status     string `json:"status,omitempty"`
 	Page       int    `json:"page,omitempty"`
 }
+
+// discoveryRunWindow bounds the run listing per repository. GitHub cancels a
+// job queued for more than a day, so a run created earlier than this cannot
+// hold demand the autoscaler still needs to serve.
+const discoveryRunWindow = 3 * 24 * time.Hour
+
+// Active run statuses are filtered client-side: one unfiltered listing per
+// repository costs a single request, where a per-status listing costs four.
+var activeRunStatuses = map[string]bool{"queued": true, "in_progress": true, "waiting": true, "pending": true}
 
 func (s *Autoscaler) discover(c *gin.Context) {
 	if !s.privateRequest(c) {
@@ -59,9 +67,6 @@ func (s *Autoscaler) discover(c *gin.Context) {
 	c.Status(200)
 }
 func (s *Autoscaler) discoverPage(ctx context.Context, p discoveryPage) error {
-	if p.Page < 1 {
-		p.Page = 1
-	}
 	if p.Source == "" {
 		for _, src := range s.conf.RegisteredSources {
 			if src.SourceType == TypeRepository {
@@ -92,6 +97,13 @@ func (s *Autoscaler) discoverPage(ctx context.Context, p discoveryPage) error {
 	if err != nil {
 		return err
 	}
+	return s.discoverWithPAT(ctx, src, pat, p)
+}
+func (s *Autoscaler) discoverWithPAT(ctx context.Context, src Source, pat string, p discoveryPage) error {
+	var err error
+	if p.Page < 1 {
+		p.Page = 1
+	}
 	if p.Repository == "" {
 		var repos []struct {
 			FullName string `json:"full_name"`
@@ -114,27 +126,22 @@ func (s *Autoscaler) discoverPage(ctx context.Context, p discoveryPage) error {
 		}
 		return nil
 	}
-	if p.RunID == 0 && p.Status == "" {
-		for _, status := range []string{"queued", "in_progress", "waiting", "pending"} {
-			next := p
-			next.Status = status
-			if err = s.queue(ctx, "/discover", "", next, 0); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
 	if p.RunID == 0 {
 		var runs struct {
 			Runs []struct {
-				ID int64 `json:"id"`
+				ID     int64  `json:"id"`
+				Status string `json:"status"`
 			} `json:"workflow_runs"`
 		}
-		endpoint := fmt.Sprintf("https://api.github.com/repos/%s/actions/runs?status=%s&per_page=100&page=%d", p.Repository, p.Status, p.Page)
+		since := time.Now().Add(-discoveryRunWindow).UTC().Format("2006-01-02")
+		endpoint := fmt.Sprintf("https://api.github.com/repos/%s/actions/runs?created=%s&per_page=100&page=%d", p.Repository, url.QueryEscape(">="+since), p.Page)
 		if err = s.githubGet(ctx, pat, endpoint, &runs); err != nil {
 			return err
 		}
 		for _, run := range runs.Runs {
+			if !activeRunStatuses[run.Status] {
+				continue
+			}
 			if err = s.queue(ctx, "/discover", "", discoveryPage{Source: src.Name, Repository: p.Repository, RunID: run.ID}, 0); err != nil {
 				return err
 			}
@@ -167,6 +174,11 @@ func (s *Autoscaler) observeDiscoveredJobs(ctx context.Context, src Source, repo
 			continue
 		}
 		if ok, _ := job.HasAnyLabelGroup(s.conf.RunnerLabelGroups); !ok {
+			continue
+		}
+		// Same intake rule as durableWebhook: the deprecated @machine: syntax can
+		// never match a registered runner label, so provisioning for it is waste.
+		if job.HasLegacyMagicLabel() {
 			continue
 		}
 		job.RepositoryFullName = repository

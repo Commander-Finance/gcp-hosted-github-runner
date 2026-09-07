@@ -23,6 +23,25 @@ func (e retryAtError) Error() string { return e.Message }
 
 var errTaskObsolete = errors.New("task is no longer the active dispatch")
 
+// dispatchWindow bounds one Cloud Tasks retry chain. Cloud Tasks keeps retrying
+// until both max_attempts and max_retry_duration are exhausted, so the chain is
+// the longer of the attempt-bound and duration-bound spans, plus a margin for
+// the final attempt and propagation. Each attempt may run for the dispatch
+// deadline (TaskTimeout plus five seconds).
+func dispatchWindow(taskTimeout, attempts, maxBackoff, maxRetryDuration int64) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	attempt := taskTimeout + 5
+	byAttempts := attempts*attempt + (attempts-1)*maxBackoff
+	byDuration := maxRetryDuration + attempt
+	chain := byAttempts
+	if byDuration > chain {
+		chain = byDuration
+	}
+	return time.Duration(chain+60) * time.Second
+}
+
 // One durable outbox marker covers a complete bounded Cloud Tasks retry chain.
 // Write before enqueue: if a worker dies here, the marker expires and redrives.
 func (s *Autoscaler) enqueueJob(ctx context.Context, src Source, job Job, delay time.Duration) error {
@@ -41,9 +60,7 @@ func (s *Autoscaler) enqueueJob(ctx context.Context, src Source, job Job, delay 
 			return nil
 		}
 		r.EnqueueToken = token
-		// Four attempts, three maximum backoffs, and a propagation margin. Keep
-		// this bound aligned with the create/delete retry policies in tasks.tf.
-		r.EnqueuedUntil = time.Now().Add(delay + time.Duration(4*(s.conf.TaskTimeout+5)+3*30+60)*time.Second)
+		r.EnqueuedUntil = time.Now().Add(delay + dispatchWindow(s.conf.TaskTimeout, s.conf.TaskRetryAttempts, s.conf.TaskRetryMaxBackoff, s.conf.TaskRetryMaxDuration))
 		job = r.Job
 		job.TaskToken = token
 		if r.PendingDelete != "" {

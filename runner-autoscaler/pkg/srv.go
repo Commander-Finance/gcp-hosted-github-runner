@@ -193,7 +193,7 @@ func (j Job) GetMagicLabelValue(key MagicLabel) *string {
 func (j Job) HasLegacyMagicLabel() bool {
 
 	for _, l := range j.Labels {
-		if matchLegacyMagicLabel.MatchString(l) {
+		if matchLegacyMagicLabel.MatchString(strings.ToLower(l)) {
 			return true
 		}
 	}
@@ -1802,7 +1802,12 @@ type AutoscalerConfig struct {
 	Zones                  []string
 	TaskQueue              string
 	TaskTimeout            int64
-	InstanceTemplate       string
+	// TaskRetry* mirror the create/delete queue retry_config in tasks.tf so the
+	// dispatch marker in enqueueJob covers one complete Cloud Tasks retry chain.
+	TaskRetryAttempts    int64
+	TaskRetryMaxBackoff  int64
+	TaskRetryMaxDuration int64
+	InstanceTemplate     string
 	// FallbackInstanceTemplate is the on-demand (STANDARD) template tried when the
 	// primary (SPOT) template is capacity-exhausted in every zone. Empty when the
 	// primary is already on-demand (no fallback needed).
@@ -1864,6 +1869,9 @@ func (c AutoscalerConfig) Validate() error {
 		if c.TaskTimeout < 30 || c.TaskTimeout > 1700 || c.MachineTimeout < 60 || c.MaxRequestBytes < 1 {
 			return fmt.Errorf("invalid deadlines or body limit")
 		}
+		if c.TaskRetryAttempts < 1 || c.TaskRetryMaxBackoff < 0 || c.TaskRetryMaxDuration < 0 {
+			return fmt.Errorf("invalid task retry policy")
+		}
 	}
 	// The bench ratio is compared against failing/created, which lies in (0, 1]
 	// because the denominator floors at the failing count. A ratio <= 0 benches on
@@ -1904,6 +1912,9 @@ type Autoscaler struct {
 	jitConfigFn     func(ctx context.Context, url string, runnerName string, runnerGroupId int64, labels []string) (string, error)
 	deleteRunnerFn  func(ctx context.Context, jitURL string, name string) error
 	instanceStateFn func(ctx context.Context, instanceName string) (bool, State, error)
+	// operationLookupFn is a test seam for the zone-operation lookup behind
+	// resolveAttempt; it returns nil when no matching operation exists.
+	operationLookupFn func(ctx context.Context, r lifecycleRecord) (*computepb.Operation, error)
 
 	// Zone circuit breaker state (see zonehealth.go). zoneReportFn is the test seam
 	// for the Cloud Logging sensor; nil in production. The cache fields are guarded

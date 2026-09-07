@@ -186,6 +186,12 @@ func (f *firestoreStore) Detach(ctx context.Context, key, token string, availabl
 		return tx.Set(ref, r)
 	})
 }
+
+// adoptCandidateLimit bounds the available generations one adoption inspects,
+// so a candidate that was assigned between the query and the check does not
+// cost the job a new VM while other spare capacity sits idle.
+const adoptCandidateLimit = 8
+
 func (f *firestoreStore) Adopt(ctx context.Context, key, token, pool string) (bool, error) {
 	adopted := false
 	err := f.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
@@ -208,29 +214,56 @@ func (f *firestoreStore) Adopt(ctx context.Context, key, token, pool string) (bo
 		if r.Terminal || r.VMName != "" {
 			return nil
 		}
-		it := tx.Documents(f.client.Collection("runners").Where("Available", "==", true).Where("Pool", "==", pool).Limit(1))
+		it := tx.Documents(f.client.Collection("runners").Where("Available", "==", true).Where("Pool", "==", pool).Limit(adoptCandidateLimit))
 		defer it.Stop()
-		candidate, err := it.Next()
-		if err == iterator.Done {
+		type adoptCandidate struct {
+			doc      *firestore.DocumentSnapshot
+			record   runnerRecord
+			assigned bool
+		}
+		var candidates []adoptCandidate
+		for {
+			doc, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			var rr runnerRecord
+			if err = doc.DataTo(&rr); err != nil {
+				return err
+			}
+			if rr.SchemaVersion != stateVersion {
+				return errSchema
+			}
+			candidates = append(candidates, adoptCandidate{doc: doc, record: rr})
+		}
+		// Firestore rejects reads after the first write in a transaction, so
+		// every assignment lookup precedes the availability updates below.
+		for i := range candidates {
+			assigned, err := f.hasAssignment(tx, candidates[i].record.Name)
+			if err != nil {
+				return err
+			}
+			candidates[i].assigned = assigned
+		}
+		var chosen *adoptCandidate
+		for i := range candidates {
+			c := &candidates[i]
+			if c.assigned {
+				// A concurrently assigned generation leaves the pool; keep looking.
+				if err := tx.Update(c.doc.Ref, []firestore.Update{{Path: "Available", Value: false}}); err != nil {
+					return err
+				}
+			} else if chosen == nil {
+				chosen = c
+			}
+		}
+		if chosen == nil {
 			return nil
 		}
-		if err != nil {
-			return err
-		}
-		var rr runnerRecord
-		if err = candidate.DataTo(&rr); err != nil {
-			return err
-		}
-		if rr.SchemaVersion != stateVersion {
-			return errSchema
-		}
-		assigned, err := f.hasAssignment(tx, rr.Name)
-		if err != nil {
-			return err
-		}
-		if assigned {
-			return tx.Update(candidate.Ref, []firestore.Update{{Path: "Available", Value: false}})
-		}
+		candidate, rr := chosen.doc, chosen.record
 		job, source, lease, until, seen, dispatch, enqueued := r.Job, r.Source, r.Lease, r.LeaseUntil, r.UpdatedAt, r.EnqueueToken, r.EnqueuedUntil
 		r = rr.Record
 		r.Job = job
@@ -362,8 +395,12 @@ func (f *firestoreStore) ReleaseRunner(ctx context.Context, name string) error {
 		return tx.Set(countRef, count)
 	})
 }
+
+// runnerPageSize bounds one RunnerPage read; reconcileRunners drains further pages.
+const runnerPageSize = 100
+
 func (f *firestoreStore) RunnerPage(ctx context.Context, due time.Time) ([]runnerRecord, error) {
-	it := f.client.Collection("runners").Where("Owner", "==", "").Where("NextActionAt", "<=", due).Limit(100).Documents(ctx)
+	it := f.client.Collection("runners").Where("Owner", "==", "").Where("NextActionAt", "<=", due).Limit(runnerPageSize).Documents(ctx)
 	defer it.Stop()
 	var out []runnerRecord
 	for {

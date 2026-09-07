@@ -141,6 +141,9 @@ func (m *memoryStore) RunnerPage(_ context.Context, due time.Time) ([]runnerReco
 		if r.Owner == "" && !r.NextActionAt.After(due) {
 			rows = append(rows, r)
 		}
+		if len(rows) == runnerPageSize {
+			break
+		}
 	}
 	return rows, nil
 }

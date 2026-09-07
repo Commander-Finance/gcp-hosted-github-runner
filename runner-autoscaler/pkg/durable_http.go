@@ -185,55 +185,63 @@ func (s *Autoscaler) durableDelete(c *gin.Context) {
 	}
 	ctx, cancel := s.opContext()
 	defer cancel()
+	code, err := s.deleteRunner(ctx, src, job)
+	if err != nil {
+		c.AbortWithError(code, err)
+		return
+	}
+	c.Status(code)
+}
+
+// deleteRunner returns the HTTP status for the delete task; a non-nil error
+// carries the status to abort with.
+func (s *Autoscaler) deleteRunner(ctx context.Context, src Source, job Job) (int, error) {
 	if err := s.activeTask(ctx, src, job); err != nil {
 		if errors.Is(err, errTaskObsolete) {
-			c.Status(200)
-		} else {
-			c.AbortWithError(503, err)
+			return 200, nil
 		}
-		return
+		return 503, err
 	}
 	assigned, err := s.assignmentActive(ctx, job.RunnerName)
 	if err != nil {
-		c.AbortWithError(503, err)
-		return
+		return 503, err
 	}
 	if assigned {
 		if _, err := s.finishTask(ctx, src, job, nil); err != nil {
-			c.AbortWithError(503, err)
-			return
+			return 503, err
 		}
-		c.Status(200)
-		return
+		return 200, nil
 	}
 	if err := s.DeleteInstance(ctx, job.RunnerName); err != nil {
 		log.Errorf("Lifecycle delete failed: %v", err)
-		c.AbortWithError(503, err)
-		return
+		return 503, err
 	}
+	// A detached generation is released here; one still owned by the job is
+	// released with the job's fleet reservation below, so the counters drop as
+	// soon as the VM is gone rather than on the next reconcile pass.
 	if err := s.store.ReleaseRunner(ctx, job.RunnerName); err != nil {
-		c.AbortWithError(503, err)
-		return
+		return 503, err
 	}
-	if err := s.store.UpdateJob(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
+	if err := s.store.Update(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, f *fleetState) error {
 		if r.PendingDelete == job.RunnerName {
 			r.PendingDelete = ""
+		}
+		if r.VMName == job.RunnerName {
+			releaseReservation(r, f)
 		}
 		if r.Terminal && r.VMName == "" && r.PendingDelete == "" {
 			r.ExpiresAt = time.Now().Add(7 * 24 * time.Hour)
 		}
 		return nil
 	}); err != nil {
-		c.AbortWithError(503, err)
-		return
+		return 503, err
 	}
 	if _, err := s.finishTask(ctx, src, job, nil); err != nil {
-		c.AbortWithError(503, err)
-		return
+		return 503, err
 	}
 	// The originating job remains in Firestore. No metadata read or top-up enqueue
 	// is needed here; a crash after deletion cannot lose replacement intent.
-	c.Status(200)
+	return 200, nil
 }
 
 type recreateCapability struct {

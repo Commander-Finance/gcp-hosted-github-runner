@@ -50,6 +50,9 @@ resource "google_cloud_run_v2_service" "autoscaler" {
           MACHINE_TIMEOUT          = tostring(var.machine_timeout)
           RUNNER_REGISTER_TIMEOUT  = tostring(var.runner_register_timeout)
           MAX_REQUEST_BYTES        = "1048576"
+          TASK_RETRY_ATTEMPTS      = tostring(local.task_retry.max_attempts)
+          TASK_RETRY_MAX_BACKOFF   = tostring(local.task_retry.max_backoff_seconds)
+          TASK_RETRY_MAX_DURATION  = tostring(local.task_retry.max_retry_seconds)
         }
         content {
           name  = env.key

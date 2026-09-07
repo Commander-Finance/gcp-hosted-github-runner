@@ -12,14 +12,31 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Every processed runner leaves the due set (deferred or released), so
+// re-reading the page with the same cutoff yields the next batch. The page
+// bound keeps one sweep within its deadline; later sweeps drain the remainder.
+const maxRunnerPagesPerSweep = 10
+
 func (s *Autoscaler) reconcileRunners(ctx context.Context) error {
 	if s.conf.Simulate {
 		return nil
 	}
-	rows, err := s.store.RunnerPage(ctx, time.Now())
-	if err != nil {
-		return err
+	due := time.Now()
+	for page := 0; page < maxRunnerPagesPerSweep; page++ {
+		rows, err := s.store.RunnerPage(ctx, due)
+		if err != nil {
+			return err
+		}
+		if err = s.reconcileRunnerRows(ctx, rows); err != nil {
+			return err
+		}
+		if len(rows) < runnerPageSize {
+			return nil
+		}
 	}
+	return nil
+}
+func (s *Autoscaler) reconcileRunnerRows(ctx context.Context, rows []runnerRecord) error {
 	for _, r := range rows {
 		stateFn := s.instanceStateFn
 		if stateFn == nil {
@@ -35,7 +52,14 @@ func (s *Autoscaler) reconcileRunners(ctx context.Context) error {
 		if found && !remove {
 			src, ok := s.conf.RegisteredSources[r.Record.Source]
 			if !ok {
-				return fmt.Errorf("unknown source for detached runner %s", r.Name)
+				// A permanent condition, not a transient error: failing the sweep
+				// would re-sort this record to the front of every later page and
+				// stall reclamation fleet-wide. Defer it and keep sweeping.
+				log.Errorf("Lifecycle sweep skipped detached runner %s: unknown source %s", r.Name, r.Record.Source)
+				if e = s.store.DeferRunner(ctx, r.Name, next, false); e != nil {
+					return e
+				}
+				continue
 			}
 			registration, err := s.capacityRegistration(ctx, src, r.Name)
 			if err != nil {
