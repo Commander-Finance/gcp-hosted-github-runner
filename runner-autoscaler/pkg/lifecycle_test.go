@@ -36,6 +36,7 @@ type memoryStore struct {
 	backoffs       map[string]time.Time
 	jobWrites      int
 	capacityWrites int
+	assignments    map[string]runnerAssignment
 }
 
 func (m *memoryStore) Update(_ context.Context, key string, fn func(*lifecycleRecord, *fleetState) error) error {

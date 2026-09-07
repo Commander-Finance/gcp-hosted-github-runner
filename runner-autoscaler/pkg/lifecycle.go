@@ -31,7 +31,7 @@ func nonce() string {
 }
 func (s *Autoscaler) observe(ctx context.Context, src Source, job Job, terminal bool) error {
 	job.TaskToken = ""
-	return s.store.UpdateJob(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
+	err := s.store.UpdateJob(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
 		changed := r.Job.Status != job.Status || (!r.Terminal && terminal)
 		if !r.Terminal || terminal {
 			r.Job, r.Source = job, src.Name
@@ -54,6 +54,16 @@ func (s *Autoscaler) observe(ctx context.Context, src Source, job Job, terminal 
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if IsOwnedRunnerName(s.conf.RunnerPrefix, job.RunnerName) && (job.Status == "in_progress" || terminal) {
+		if terminal {
+			job.Status = "completed"
+		}
+		return s.store.RecordAssignment(ctx, jobKey(src.Name, job), job.RunnerName, job)
+	}
+	return nil
 }
 
 // claim does NOT reserve a VM. Demand must be checked before admission. The lease
@@ -174,11 +184,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			if statusErr != nil {
 				return statusErr
 			}
-			registrationFn := s.runnerStateFn
-			if registrationFn == nil {
-				registrationFn = s.runnerState
-			}
-			registration, e := registrationFn(ctx, src, r.VMName)
+			registration, e := s.capacityRegistration(ctx, src, r.VMName)
 			if e != nil {
 				return e
 			}

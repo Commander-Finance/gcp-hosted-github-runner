@@ -23,6 +23,14 @@ resource "google_firestore_field" "job_expiry" {
   ttl_config {}
   index_config {}
 }
+resource "google_firestore_field" "assignment_expiry" {
+  project    = local.projectId
+  database   = google_firestore_database.runner.name
+  collection = "assignments"
+  field      = "expires_at"
+  ttl_config {}
+  index_config {}
+}
 resource "google_firestore_field" "unqueried_payloads" {
   for_each   = { jobs = "JIT", runners = "Record" }
   project    = local.projectId

@@ -151,24 +151,31 @@ func (s *Autoscaler) discoverPage(ctx context.Context, p discoveryPage) error {
 	if err = s.githubGet(ctx, pat, fmt.Sprintf("https://api.github.com/repos/%s/actions/runs/%d/jobs?filter=latest&per_page=100&page=%d", p.Repository, p.RunID, p.Page), &jobs); err != nil {
 		return err
 	}
-	for _, job := range jobs.Jobs {
-		if job.Status != "queued" {
+	if err = s.observeDiscoveredJobs(ctx, src, p.Repository, jobs.Jobs); err != nil {
+		return err
+	}
+	if len(jobs.Jobs) == 100 {
+		p.Page++
+		return s.queue(ctx, "/discover", "", p, 0)
+	}
+	return nil
+}
+
+func (s *Autoscaler) observeDiscoveredJobs(ctx context.Context, src Source, repository string, jobs []Job) error {
+	for _, job := range jobs {
+		if job.Status != "queued" && job.Status != "in_progress" {
 			continue
 		}
 		if ok, _ := job.HasAnyLabelGroup(s.conf.RunnerLabelGroups); !ok {
 			continue
 		}
-		job.RepositoryFullName = p.Repository
-		if err = s.observe(ctx, src, job, false); err != nil {
+		job.RepositoryFullName = repository
+		if err := s.observe(ctx, src, job, false); err != nil {
 			return err
 		}
-		if err = s.enqueueJob(ctx, src, job, 0); err != nil {
+		if err := s.enqueueJob(ctx, src, job, 0); err != nil {
 			return err
 		}
-	}
-	if len(jobs.Jobs) == 100 {
-		p.Page++
-		return s.queue(ctx, "/discover", "", p, 0)
 	}
 	return nil
 }

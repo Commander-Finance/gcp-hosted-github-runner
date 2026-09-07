@@ -52,6 +52,8 @@ type lifecycleStore interface {
 	Detach(context.Context, string, string, bool, time.Time) error
 	Adopt(context.Context, string, string, string) (bool, error)
 	Runner(context.Context, string) (runnerRecord, error)
+	RecordAssignment(context.Context, string, string, Job) error
+	Assignment(context.Context, string) (runnerAssignment, error)
 	RememberRunnerID(context.Context, string, int64) error
 	ReleaseRunner(context.Context, string) error
 	DeferRunner(context.Context, string, time.Time, bool) error

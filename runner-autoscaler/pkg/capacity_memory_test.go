@@ -2,8 +2,36 @@ package pkg
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
+
+func (m *memoryStore) RecordAssignment(_ context.Context, key, name string, job Job) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.assignments == nil {
+		m.assignments = map[string]runnerAssignment{}
+	}
+	old := m.assignments[name]
+	if old.JobKey != "" && old.JobKey != key {
+		return fmt.Errorf("conflicting assignment")
+	}
+	if m.rows[key].Terminal || old.Job.Status == "completed" {
+		job.Status = "completed"
+	}
+	m.assignments[name] = runnerAssignment{SchemaVersion: stateVersion, JobKey: key, Job: job}
+	if r, ok := m.runners[name]; ok {
+		r.Available = false
+		m.runners[name] = r
+	}
+	return nil
+}
+
+func (m *memoryStore) Assignment(_ context.Context, name string) (runnerAssignment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.assignments[name], nil
+}
 
 func (m *memoryStore) RememberRunnerID(_ context.Context, name string, id int64) error {
 	m.mu.Lock()
@@ -29,7 +57,7 @@ func (m *memoryStore) Detach(_ context.Context, key, token string, available boo
 	if r.Lease != token || time.Now().After(r.LeaseUntil) {
 		return errLeaseBusy
 	}
-	m.runners[r.VMName] = runnerRecord{SchemaVersion: stateVersion, Name: r.VMName, Pool: poolKey(r.Source, r.Job), Available: available, NextActionAt: due, Record: r}
+	m.runners[r.VMName] = runnerRecord{SchemaVersion: stateVersion, Name: r.VMName, Pool: poolKey(r.Source, r.Job), Available: available && m.assignments[r.VMName].Job.Id == 0, NextActionAt: due, Record: r}
 	discard := fleetState{}
 	releaseReservation(&r, &discard)
 	r.NextActionAt = time.Now().Add(30 * time.Second)
@@ -48,7 +76,7 @@ func (m *memoryStore) Adopt(_ context.Context, key, token, pool string) (bool, e
 		return false, nil
 	}
 	for name, rr := range m.runners {
-		if !rr.Available || rr.Pool != pool {
+		if !rr.Available || rr.Pool != pool || m.assignments[rr.Name].Job.Id != 0 {
 			continue
 		}
 		job, source, lease, until, seen, dispatch, enqueued := r.Job, r.Source, r.Lease, r.LeaseUntil, r.UpdatedAt, r.EnqueueToken, r.EnqueuedUntil
@@ -100,7 +128,7 @@ func (m *memoryStore) DeferRunner(_ context.Context, name string, due time.Time,
 	r, ok := m.runners[name]
 	if ok && r.Owner == "" {
 		r.NextActionAt = due
-		r.Available = available && !r.Record.Terminal
+		r.Available = available && !r.Record.Terminal && m.assignments[name].Job.Id == 0
 		m.runners[name] = r
 	}
 	return nil

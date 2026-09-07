@@ -74,7 +74,11 @@ func (f *firestoreStore) DeferRunner(ctx context.Context, name string, due time.
 			return nil
 		}
 		r.NextActionAt = due
-		r.Available = available && !r.Record.Terminal
+		assigned, err := f.hasAssignment(tx, name)
+		if err != nil {
+			return err
+		}
+		r.Available = available && !r.Record.Terminal && !assigned
 		return tx.Set(ref, r)
 	})
 }
@@ -166,7 +170,11 @@ func (f *firestoreStore) Detach(ctx context.Context, key, token string, availabl
 		if r.VMName == "" {
 			return nil
 		}
-		rr := runnerRecord{SchemaVersion: stateVersion, Name: r.VMName, Pool: poolKey(r.Source, r.Job), Available: available, NextActionAt: due, Record: r}
+		assigned, err := f.hasAssignment(tx, r.VMName)
+		if err != nil {
+			return err
+		}
+		rr := runnerRecord{SchemaVersion: stateVersion, Name: r.VMName, Pool: poolKey(r.Source, r.Job), Available: available && !assigned, NextActionAt: due, Record: r}
 		if err = tx.Set(f.client.Collection("runners").Doc(r.VMName), rr); err != nil {
 			return err
 		}
@@ -215,6 +223,13 @@ func (f *firestoreStore) Adopt(ctx context.Context, key, token, pool string) (bo
 		}
 		if rr.SchemaVersion != stateVersion {
 			return errSchema
+		}
+		assigned, err := f.hasAssignment(tx, rr.Name)
+		if err != nil {
+			return err
+		}
+		if assigned {
+			return tx.Update(candidate.Ref, []firestore.Update{{Path: "Available", Value: false}})
 		}
 		job, source, lease, until, seen, dispatch, enqueued := r.Job, r.Source, r.Lease, r.LeaseUntil, r.UpdatedAt, r.EnqueueToken, r.EnqueuedUntil
 		r = rr.Record

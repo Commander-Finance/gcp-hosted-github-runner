@@ -109,6 +109,9 @@ func (s *Autoscaler) durableWebhook(c *gin.Context) {
 		return
 	}
 	p.Job.RepositoryFullName = p.Repository.FullName
+	if p.Action == IN_PROGRESS {
+		p.Job.Status = "in_progress"
+	}
 	if ok, _ := p.Job.HasAnyLabelGroup(s.conf.RunnerLabelGroups); !ok {
 		c.Status(200)
 		return
@@ -188,6 +191,19 @@ func (s *Autoscaler) durableDelete(c *gin.Context) {
 		} else {
 			c.AbortWithError(503, err)
 		}
+		return
+	}
+	assigned, err := s.assignmentActive(ctx, job.RunnerName)
+	if err != nil {
+		c.AbortWithError(503, err)
+		return
+	}
+	if assigned {
+		if _, err := s.finishTask(ctx, src, job, nil); err != nil {
+			c.AbortWithError(503, err)
+			return
+		}
+		c.Status(200)
 		return
 	}
 	if err := s.DeleteInstance(ctx, job.RunnerName); err != nil {

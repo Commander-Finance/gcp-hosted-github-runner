@@ -37,11 +37,7 @@ func (s *Autoscaler) reconcileRunners(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("unknown source for detached runner %s", r.Name)
 			}
-			registrationFn := s.runnerStateFn
-			if registrationFn == nil {
-				registrationFn = s.runnerState
-			}
-			registration, err := registrationFn(ctx, src, r.Name)
+			registration, err := s.capacityRegistration(ctx, src, r.Name)
 			if err != nil {
 				return err
 			}

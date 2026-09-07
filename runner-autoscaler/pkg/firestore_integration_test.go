@@ -125,3 +125,40 @@ func TestFirestoreRejectsUnversionedFleet(t *testing.T) {
 	_, err = f.client.Collection("control").Doc("schema").Get(ctx)
 	require.Error(t, err)
 }
+
+func TestFirestoreAssignmentSurvivesCapacityWritesAndReordering(t *testing.T) {
+	f := emulatorStore(t)
+	s, _, src, a := lifecycleTestScaler()
+	s.store = f
+	ctx := context.Background()
+	require.NoError(t, s.observe(ctx, src, a, false))
+	require.NoError(t, s.processJob(ctx, src, a))
+	ak := jobKey(src.Name, a)
+	var name string
+	require.NoError(t, f.UpdateJob(ctx, ak, func(r *lifecycleRecord, _ *fleetState) error { name = r.VMName; return nil }))
+	b := a
+	b.Id++
+	b.Status = "in_progress"
+	b.RunnerName = name
+	require.NoError(t, s.observe(ctx, src, b, false))
+	// Ordinary owner snapshots must not overwrite the observed assignment.
+	require.NoError(t, f.UpdateJob(ctx, ak, func(r *lifecycleRecord, _ *fleetState) error { r.NextActionAt = time.Now(); return nil }))
+	_, err := s.claim(ctx, ak, "detach")
+	require.NoError(t, err)
+	require.NoError(t, f.Detach(ctx, ak, "detach", true, time.Now()))
+	require.NoError(t, f.DeferRunner(ctx, name, time.Now(), true))
+	r, err := f.Runner(ctx, name)
+	require.NoError(t, err)
+	require.False(t, r.Available)
+	after, err := f.Assignment(ctx, name)
+	require.NoError(t, err)
+	require.Equal(t, b.Id, after.Job.Id)
+	// Parent deletion retains the immutable generation's completion tombstone.
+	require.NoError(t, s.observe(ctx, src, b, true))
+	require.NoError(t, f.ReleaseRunner(ctx, name))
+	require.NoError(t, s.observe(ctx, src, b, false))
+	after, err = f.Assignment(ctx, name)
+	require.NoError(t, err)
+	require.Equal(t, "completed", after.Job.Status)
+	require.False(t, after.ExpiresAt.IsZero())
+}
