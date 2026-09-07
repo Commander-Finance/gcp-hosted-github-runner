@@ -29,19 +29,60 @@ import (
 )
 
 type memoryStore struct {
-	mu    sync.Mutex
-	rows  map[string]lifecycleRecord
-	fleet fleetState
+	mu             sync.Mutex
+	rows           map[string]lifecycleRecord
+	fleet          fleetState
+	runners        map[string]runnerRecord
+	backoffs       map[string]time.Time
+	jobWrites      int
+	capacityWrites int
 }
 
 func (m *memoryStore) Update(_ context.Context, key string, fn func(*lifecycleRecord, *fleetState) error) error {
+	return m.update(key, true, fn)
+}
+func (m *memoryStore) UpdateJob(_ context.Context, key string, fn func(*lifecycleRecord, *fleetState) error) error {
+	return m.update(key, false, fn)
+}
+func (m *memoryStore) update(key string, capacity bool, fn func(*lifecycleRecord, *fleetState) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, f := m.rows[key], m.fleet
+	_, exists := m.rows[key]
+	if err := checkRecordVersion(&r, exists); err != nil {
+		return err
+	}
+	old := r.VMName
+	if !capacity {
+		f = fleetState{}
+	}
+	before := f
 	if err := fn(&r, &f); err != nil {
 		return err
 	}
-	m.rows[key], m.fleet = r, f
+	if !capacity && f != before {
+		return fmt.Errorf("job-only update changed capacity")
+	}
+	prepareRecord(&r)
+	if m.runners == nil {
+		m.runners = map[string]runnerRecord{}
+	}
+	if capacity && old != "" && old != r.VMName {
+		delete(m.runners, old)
+	}
+	if r.VMName != "" {
+		m.runners[r.VMName] = runnerRecord{SchemaVersion: stateVersion, Name: r.VMName, Owner: key, Pool: poolKey(r.Source, r.Job), Record: r}
+	}
+	m.rows[key] = r
+	if capacity {
+		if f != before {
+			f.Revision++
+		}
+		m.fleet = f
+		m.capacityWrites++
+	} else {
+		m.jobWrites++
+	}
 	return nil
 }
 func (m *memoryStore) Page(_ context.Context, after string, n int) ([]storedRecord, string, error) {
@@ -49,15 +90,23 @@ func (m *memoryStore) Page(_ context.Context, after string, n int) ([]storedReco
 	defer m.mu.Unlock()
 	keys := []string{}
 	for k := range m.rows {
-		if k > after {
+		r := m.rows[k]
+		cursor, _ := decodeCursor(after)
+		if r.NeedsReconcile && !r.NextActionAt.After(time.Now()) && (after == "" || r.NextActionAt.After(cursor.At) || (r.NextActionAt.Equal(cursor.At) && k > cursor.Key)) {
 			keys = append(keys, k)
 		}
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := m.rows[keys[i]], m.rows[keys[j]]
+		if a.NextActionAt.Equal(b.NextActionAt) {
+			return keys[i] < keys[j]
+		}
+		return a.NextActionAt.Before(b.NextActionAt)
+	})
 	next := ""
 	if len(keys) >= n {
 		keys = keys[:n]
-		next = keys[n-1]
+		next = encodeCursor(keys[n-1], m.rows[keys[n-1]].NextActionAt)
 	}
 	rows := []storedRecord{}
 	for _, k := range keys {
@@ -83,6 +132,7 @@ func lifecycleTestScaler() (*Autoscaler, *memoryStore, Source, Job) {
 	s.jitConfigFn = func(context.Context, string, string, int64, []string) (string, error) { return "jit", nil }
 	s.tryInsertFn = func(context.Context, creationAttempt, string, []*computepb.Items) error { return nil }
 	s.queueFn = func(context.Context, string, string, interface{}, time.Duration) error { return nil }
+	s.runnerBusyFn = func(context.Context, Source, string) (bool, error) { return false, nil }
 	return s, m, src, job
 }
 func TestConcurrentCreateLeaseAcrossWorkers(t *testing.T) {

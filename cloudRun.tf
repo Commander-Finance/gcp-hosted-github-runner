@@ -23,14 +23,14 @@ resource "google_cloud_run_v2_service" "autoscaler" {
   location   = local.region
   name       = "github-runner-autoscaler"
   ingress    = "INGRESS_TRAFFIC_ALL"
-  depends_on = [google_artifact_registry_repository.ghcr, google_project_service.cloud_run_api, google_project_iam_member.runner_state, google_service_account_iam_member.enqueue_callback_identity]
+  depends_on = [google_artifact_registry_repository.ghcr, google_project_service.cloud_run_api, google_project_iam_member.runner_state, google_service_account_iam_member.enqueue_callback_identity, google_firestore_index.due_jobs, google_firestore_index.due_runners, google_firestore_index.available_runners]
 
   template {
     service_account                  = google_service_account.autoscaler_sa.email
     max_instance_request_concurrency = 32
     timeout                          = format("%ds", var.autoscaler_timeout)
     scaling {
-      min_instance_count = 1
+      min_instance_count = 0
       max_instance_count = 3
     }
     containers {

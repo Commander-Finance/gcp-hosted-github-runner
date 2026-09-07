@@ -1,0 +1,180 @@
+package pkg
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+)
+
+type permanentError struct{ message string }
+
+func (e permanentError) Error() string { return e.message }
+
+type retryAtError struct {
+	Until   time.Time
+	Message string
+}
+
+func (e retryAtError) Error() string { return e.Message }
+
+var errTaskObsolete = errors.New("task is no longer the active dispatch")
+
+// One durable outbox marker covers a complete bounded Cloud Tasks retry chain.
+// Write before enqueue: if a worker dies here, the marker expires and redrives.
+func (s *Autoscaler) enqueueJob(ctx context.Context, src Source, job Job, delay time.Duration) error {
+	key := jobKey(src.Name, job)
+	token := nonce()
+	route := s.conf.RouteCreateVm
+	send := false
+	err := s.store.UpdateJob(ctx, key, func(r *lifecycleRecord, _ *fleetState) error {
+		// Firestore may replay this callback after a transaction conflict.
+		send = false
+		route = s.conf.RouteCreateVm
+		if !r.NeedsReconcile || r.EnqueuedUntil.After(time.Now()) || (r.Lease != "" && r.LeaseUntil.After(time.Now())) {
+			return nil
+		}
+		if r.NextActionAt.After(time.Now().Add(delay)) {
+			return nil
+		}
+		r.EnqueueToken = token
+		// Four attempts, three maximum backoffs, and a propagation margin. Keep
+		// this bound aligned with the create/delete retry policies in tasks.tf.
+		r.EnqueuedUntil = time.Now().Add(delay + time.Duration(4*(s.conf.TaskTimeout+5)+3*30+60)*time.Second)
+		job = r.Job
+		job.TaskToken = token
+		if r.PendingDelete != "" {
+			route = s.conf.RouteDeleteVm
+			job.RunnerName = r.PendingDelete
+		}
+		send = true
+		return nil
+	})
+	if err != nil || !send {
+		return err
+	}
+	if err = s.queue(ctx, route, src.Name, job, delay); err != nil {
+		_ = s.store.UpdateJob(ctx, key, func(r *lifecycleRecord, _ *fleetState) error {
+			if r.EnqueueToken == token {
+				r.EnqueuedUntil = time.Time{}
+				r.NextActionAt = time.Now().Add(time.Minute)
+			}
+			return nil
+		})
+	}
+	return err
+}
+func (s *Autoscaler) activeTask(ctx context.Context, src Source, job Job) error {
+	return s.store.UpdateJob(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
+		if job.TaskToken == "" || r.EnqueueToken != job.TaskToken {
+			return errTaskObsolete
+		}
+		return nil
+	})
+}
+
+// Expected contention is acknowledged. Only transient API errors retain the
+// Cloud Tasks retry chain; reconciliation cannot create another during its lease.
+func (s *Autoscaler) finishTask(ctx context.Context, src Source, job Job, workErr error) (int, error) {
+	if errors.Is(workErr, errTaskObsolete) || errors.Is(workErr, errLeaseBusy) {
+		return 200, nil
+	}
+	var permanent permanentError
+	var later retryAtError
+	status := 200
+	transient := workErr != nil && !errors.Is(workErr, errLeaseBusy) && !errors.Is(workErr, errFleetFull) && !errors.As(workErr, &permanent) && !errors.As(workErr, &later)
+	if transient {
+		status = 503
+	}
+	update := s.store.UpdateJob
+	if errors.As(workErr, &permanent) {
+		update = s.store.Update
+	}
+	err := update(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, f *fleetState) error {
+		if job.TaskToken != "" && job.TaskToken != r.EnqueueToken {
+			return nil
+		}
+		if !transient {
+			r.EnqueuedUntil = time.Time{}
+			r.EnqueueToken = ""
+		}
+		if !transient {
+			r.NextActionAt = time.Now().Add(2 * time.Minute)
+		}
+		if workErr == nil && r.Job.Status == "in_progress" {
+			r.NextActionAt = time.Now().Add(10 * time.Minute)
+		}
+		if errors.As(workErr, &later) {
+			r.NextActionAt = later.Until
+		}
+		if errors.As(workErr, &permanent) {
+			if r.Zone == "" && r.VMName != "" {
+				releaseReservation(r, f)
+			}
+			r.Failure = permanent.Error()
+			r.NextActionAt = time.Now().Add(time.Hour)
+		}
+		return nil
+	})
+	if err != nil {
+		return 503, err
+	}
+	if workErr != nil && !errors.Is(workErr, errLeaseBusy) && !errors.Is(workErr, errFleetFull) {
+		log.WithField("job_id", job.Id).Errorf("Lifecycle create failed: %v", workErr)
+	}
+	return status, nil
+}
+
+// Busy is an observed property from GitHub, independent of the VM's origin job.
+func (s *Autoscaler) runnerBusy(ctx context.Context, src Source, name string) (bool, error) {
+	pat, err := s.readPat(ctx)
+	if err != nil {
+		return false, err
+	}
+	endpoint := jitEndpoint(src)
+	endpoint = strings.TrimSuffix(endpoint, "/generate-jitconfig")
+	if s.store != nil {
+		r, err := s.store.Runner(ctx, name)
+		if err != nil {
+			return false, err
+		}
+		if r.Record.RunnerID > 0 {
+			var result struct {
+				Busy bool `json:"busy"`
+			}
+			if err = s.githubGet(ctx, pat, fmt.Sprintf("%s/%d", endpoint, r.Record.RunnerID), &result); err != nil {
+				return false, err
+			}
+			return result.Busy, nil
+		}
+	}
+	for page := 1; page <= 100; page++ {
+		var result struct {
+			Runners []struct {
+				ID   int64  `json:"id"`
+				Name string `json:"name"`
+				Busy bool   `json:"busy"`
+			} `json:"runners"`
+		}
+		if err = s.githubGet(ctx, pat, fmt.Sprintf("%s?per_page=100&page=%d", endpoint, page), &result); err != nil {
+			return false, err
+		}
+		for _, runner := range result.Runners {
+			if runner.Name == name {
+				if s.store != nil && runner.ID > 0 {
+					if err = s.store.RememberRunnerID(ctx, name, runner.ID); err != nil {
+						return false, err
+					}
+				}
+				return runner.Busy, nil
+			}
+		}
+		if len(result.Runners) < 100 {
+			return false, nil
+		} // Booting/unregistered capacity remains claimed.
+	}
+	return false, fmt.Errorf("runner registration inventory exceeds page bound")
+}

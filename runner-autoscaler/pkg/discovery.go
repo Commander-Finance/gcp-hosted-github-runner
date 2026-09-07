@@ -3,8 +3,10 @@ package pkg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
@@ -35,8 +37,22 @@ func (s *Autoscaler) discover(c *gin.Context) {
 	}
 	ctx, cancel := s.opContext()
 	defer cancel()
+	until, err := s.store.Backoff(ctx, "github", time.Time{})
+	if err != nil {
+		c.AbortWithError(503, err)
+		return
+	}
+	if time.Now().Before(until) {
+		c.Status(200)
+		return
+	}
 	if err = s.discoverPage(ctx, p); err != nil {
 		log.Errorf("Lifecycle discovery failed: %v", err)
+		var delayed retryAtError
+		if errors.As(err, &delayed) {
+			c.Status(200)
+			return
+		} // Next scheduled traversal resumes after durable backoff.
 		c.AbortWithError(503, err)
 		return
 	}
@@ -146,7 +162,7 @@ func (s *Autoscaler) discoverPage(ctx context.Context, p discoveryPage) error {
 		if err = s.observe(ctx, src, job, false); err != nil {
 			return err
 		}
-		if err = s.queue(ctx, s.conf.RouteCreateVm, src.Name, job, 0); err != nil {
+		if err = s.enqueueJob(ctx, src, job, 0); err != nil {
 			return err
 		}
 	}

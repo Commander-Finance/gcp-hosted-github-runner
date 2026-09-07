@@ -127,11 +127,9 @@ func (s *Autoscaler) durableWebhook(c *gin.Context) {
 	// optimization. A failed enqueue remains visible to the scheduled reconciler.
 	switch p.Action {
 	case QUEUED:
-		err = s.queue(ctx, s.conf.RouteCreateVm, src.Name, p.Job, time.Duration(s.conf.CreateVmDelay)*time.Second)
-	case COMPLETED:
-		if IsOwnedRunnerName(s.conf.RunnerPrefix, p.Job.RunnerName) {
-			err = s.queue(ctx, s.conf.RouteDeleteVm, src.Name, p.Job, 0)
-		}
+		err = s.enqueueJob(ctx, src, p.Job, time.Duration(s.conf.CreateVmDelay)*time.Second)
+	case COMPLETED, IN_PROGRESS:
+		err = s.enqueueJob(ctx, src, p.Job, 0)
 	}
 	if err != nil {
 		log.WithField("job_id", p.Job.Id).Errorf("Lifecycle enqueue deferred to reconciliation: %v", err)
@@ -162,12 +160,16 @@ func (s *Autoscaler) durableCreate(c *gin.Context) {
 	}
 	ctx, cancel := s.opContext()
 	defer cancel()
-	if err := s.processJob(ctx, src, job); err != nil {
-		log.WithField("job_id", job.Id).Errorf("Lifecycle create failed: %v", err)
-		c.AbortWithError(503, err)
+	err := s.activeTask(ctx, src, job)
+	if err == nil {
+		err = s.processJob(ctx, src, job)
+	}
+	status, finishErr := s.finishTask(ctx, src, job, err)
+	if finishErr != nil {
+		c.AbortWithError(503, finishErr)
 		return
 	}
-	c.Status(200)
+	c.Status(status)
 }
 func (s *Autoscaler) durableDelete(c *gin.Context) {
 	job, src, ok := s.workerJob(c)
@@ -180,12 +182,24 @@ func (s *Autoscaler) durableDelete(c *gin.Context) {
 	}
 	ctx, cancel := s.opContext()
 	defer cancel()
+	if err := s.activeTask(ctx, src, job); err != nil {
+		if errors.Is(err, errTaskObsolete) {
+			c.Status(200)
+		} else {
+			c.AbortWithError(503, err)
+		}
+		return
+	}
 	if err := s.DeleteInstance(ctx, job.RunnerName); err != nil {
 		log.Errorf("Lifecycle delete failed: %v", err)
 		c.AbortWithError(503, err)
 		return
 	}
-	if err := s.store.Update(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
+	if err := s.store.ReleaseRunner(ctx, job.RunnerName); err != nil {
+		c.AbortWithError(503, err)
+		return
+	}
+	if err := s.store.UpdateJob(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
 		if r.PendingDelete == job.RunnerName {
 			r.PendingDelete = ""
 		}
@@ -194,6 +208,10 @@ func (s *Autoscaler) durableDelete(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
+		c.AbortWithError(503, err)
+		return
+	}
+	if _, err := s.finishTask(ctx, src, job, nil); err != nil {
 		c.AbortWithError(503, err)
 		return
 	}
@@ -229,7 +247,7 @@ func (s *Autoscaler) durableRecreate(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
 	defer cancel()
 	valid := false
-	err = s.store.Update(ctx, jobKey(src.Name, cap.Job), func(r *lifecycleRecord, _ *fleetState) error {
+	err = s.store.UpdateJob(ctx, jobKey(src.Name, cap.Job), func(r *lifecycleRecord, _ *fleetState) error {
 		valid = !r.Terminal && r.VMName == cap.Runner && r.VMName != ""
 		return nil
 	})
@@ -241,7 +259,7 @@ func (s *Autoscaler) durableRecreate(c *gin.Context) {
 		c.AbortWithStatus(409)
 		return
 	}
-	if err = s.queue(ctx, s.conf.RouteCreateVm, src.Name, cap.Job, recreateVmDelay); err != nil {
+	if err = s.enqueueJob(ctx, src, cap.Job, recreateVmDelay); err != nil {
 		c.AbortWithError(503, err)
 		return
 	}
@@ -269,26 +287,24 @@ func (s *Autoscaler) reconcile(c *gin.Context) {
 	defer cancel()
 	rows, next, err := s.store.Page(ctx, p.After, 50)
 	if err != nil {
+		log.Errorf("Lifecycle reconciliation failed: %v", err)
 		c.AbortWithError(503, err)
 		return
 	}
 	for _, row := range rows {
 		r := row.Record
-		if r.PendingDelete != "" {
-			deletion := r.Job
-			deletion.RunnerName = r.PendingDelete
-			if err = s.queue(ctx, s.conf.RouteDeleteVm, r.Source, deletion, 0); err != nil {
-				c.AbortWithError(503, err)
-				return
-			}
-		}
-		if r.Terminal && r.VMName == "" {
+		if r.Terminal && r.VMName == "" && r.PendingDelete == "" {
 			continue
 		}
 		if r.Lease != "" && time.Now().Before(r.LeaseUntil) {
 			continue
 		}
-		if err = s.queue(ctx, s.conf.RouteCreateVm, r.Source, r.Job, 0); err != nil {
+		src, ok := s.conf.RegisteredSources[r.Source]
+		if !ok {
+			log.Errorf("Lifecycle reconciliation failed: unknown source %s", r.Source)
+			continue
+		}
+		if err = s.enqueueJob(ctx, src, r.Job, 0); err != nil {
 			c.AbortWithError(503, err)
 			return
 		}
@@ -312,6 +328,11 @@ func (s *Autoscaler) durableSweep(c *gin.Context) {
 	ctx, cancel := s.opContext()
 	defer cancel()
 	if err := s.sweepOrphans(ctx); err != nil {
+		log.Errorf("Lifecycle sweep failed: %v", err)
+		c.AbortWithError(503, err)
+		return
+	}
+	if err := s.reconcileRunners(ctx); err != nil {
 		log.Errorf("Lifecycle sweep failed: %v", err)
 		c.AbortWithError(503, err)
 		return

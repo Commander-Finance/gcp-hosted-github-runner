@@ -221,7 +221,7 @@ resource "google_monitoring_alert_policy" "runner_zone_benched" {
 // These signals include durable callback failures and prolonged pending demand.
 resource "google_logging_metric" "lifecycle_attention" {
   name   = "github_runner/lifecycle_attention"
-  filter = "${local.autoscaler_log_filter} ((${format(local.msg_re, "^Lifecycle (delete|sweep|discovery).*failed")} severity>=ERROR) OR (jsonPayload.message=\"Reconcile pending job\" jsonPayload.age_seconds>900))"
+  filter = "${local.autoscaler_log_filter} (((${format(local.msg_re, "^Lifecycle (delete|sweep|discovery|invariant|reconciliation).*failed")} OR ${format(local.msg_re, "^Initialize autoscaler")}) severity>=ERROR) OR (jsonPayload.message=\"Reconcile pending job\" jsonPayload.age_seconds>900))"
   metric_descriptor {
     metric_kind = "DELTA"
     value_type  = "INT64"

@@ -23,6 +23,14 @@ resource "google_firestore_field" "job_expiry" {
   ttl_config {}
   index_config {}
 }
+resource "google_firestore_field" "unqueried_payloads" {
+  for_each   = { jobs = "JIT", runners = "Record" }
+  project    = local.projectId
+  database   = google_firestore_database.runner.name
+  collection = each.key
+  field      = each.value
+  index_config {}
+}
 resource "google_project_iam_member" "runner_state" {
   project = local.projectId
   role    = "roles/datastore.user"
@@ -45,10 +53,10 @@ locals {
   callback_base_url = "https://github-runner-autoscaler-${local.projectNumber}.${local.region}.run.app"
 }
 resource "google_cloud_scheduler_job" "runner_maintenance" {
-  for_each         = toset(["reconcile", "sweep", "discover"])
+  for_each         = toset(["reconcile", "sweep", "discover", "audit"])
   name             = "github-runner-${each.key}"
   region           = local.region
-  schedule         = each.key == "discover" ? "*/5 * * * *" : "*/2 * * * *"
+  schedule         = each.key == "audit" ? "17 * * * *" : (each.key == "discover" ? "*/5 * * * *" : "*/2 * * * *")
   time_zone        = "Etc/UTC"
   attempt_deadline = "${var.autoscaler_timeout}s"
   http_target {
@@ -63,4 +71,48 @@ resource "google_cloud_scheduler_job" "runner_maintenance" {
   }
   retry_config { retry_count = 3 }
   depends_on = [google_project_service.scheduler_api, google_cloud_run_v2_service.autoscaler]
+}
+
+resource "google_firestore_index" "due_jobs" {
+  project    = local.projectId
+  database   = google_firestore_database.runner.name
+  collection = "jobs"
+  fields {
+    field_path = "NeedsReconcile"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "NextActionAt"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "__name__"
+    order      = "ASCENDING"
+  }
+}
+resource "google_firestore_index" "due_runners" {
+  project    = local.projectId
+  database   = google_firestore_database.runner.name
+  collection = "runners"
+  fields {
+    field_path = "Owner"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "NextActionAt"
+    order      = "ASCENDING"
+  }
+}
+resource "google_firestore_index" "available_runners" {
+  project    = local.projectId
+  database   = google_firestore_database.runner.name
+  collection = "runners"
+  fields {
+    field_path = "Available"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "Pool"
+    order      = "ASCENDING"
+  }
 }

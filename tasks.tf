@@ -13,11 +13,11 @@ resource "google_cloud_tasks_queue" "autoscaler_tasks" {
   // Durable job records and the scheduled reconciler recover tasks that exhaust
   // this queue's retry window. Keep retries bounded to avoid doomed hot loops.
   retry_config {
-    max_attempts       = 16
-    max_retry_duration = "7200s"
-    max_backoff        = "600s"
-    min_backoff        = "60s"
-    max_doublings      = 4
+    max_attempts       = 4
+    max_retry_duration = "120s"
+    max_backoff        = "30s"
+    min_backoff        = "10s"
+    max_doublings      = 2
   }
 
   rate_limits {
@@ -36,11 +36,11 @@ resource "google_cloud_tasks_queue" "delete_tasks" {
     max_dispatches_per_second = 4
   }
   retry_config {
-    max_attempts       = 50
-    max_retry_duration = "86400s"
+    max_attempts       = 4
+    max_retry_duration = "120s"
     min_backoff        = "10s"
-    max_backoff        = "600s"
-    max_doublings      = 5
+    max_backoff        = "30s"
+    max_doublings      = 2
   }
 }
 resource "google_cloud_tasks_queue" "maintenance_tasks" {
@@ -52,9 +52,10 @@ resource "google_cloud_tasks_queue" "maintenance_tasks" {
     max_dispatches_per_second = 2
   }
   retry_config {
-    max_attempts  = 10
-    min_backoff   = "30s"
-    max_backoff   = "300s"
-    max_doublings = 4
+    max_attempts       = 4
+    max_retry_duration = "120s"
+    min_backoff        = "30s"
+    max_backoff        = "300s"
+    max_doublings      = 4
   }
 }

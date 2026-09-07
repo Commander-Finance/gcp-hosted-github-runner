@@ -113,6 +113,7 @@ type Source struct {
 }
 
 type Job struct {
+	TaskToken          string   `json:"task_token,omitempty"`
 	Id                 int64    `json:"id"`
 	Name               string   `json:"name"`
 	Status             string   `json:"status"`
@@ -1086,6 +1087,11 @@ func (s *Autoscaler) sweepOrphans(ctx context.Context) error {
 					log.Warnf("Orphan sweep: failed to delete %s: %s", name, err.Error())
 				} else {
 					deleted++
+					if s.store != nil {
+						if err := s.store.ReleaseRunner(ctx, name); err != nil {
+							failures = append(failures, err)
+						}
+					}
 				}
 			}
 		}
@@ -1275,7 +1281,7 @@ func (s *Autoscaler) GenerateRunnerJitConfig(ctx context.Context, url string, ru
 			} else if resp.StatusCode != 201 {
 				log.Errorf("GitHub runner jit-config request unsuccessful: %s", resp.Status)
 				defer resp.Body.Close()
-				return "", fmt.Errorf("failed jit-config response")
+				return "", s.githubFailure(ctx, url, resp)
 			} else {
 				defer resp.Body.Close()
 				body, _ := io.ReadAll(resp.Body)
@@ -1284,6 +1290,15 @@ func (s *Autoscaler) GenerateRunnerJitConfig(ctx context.Context, url string, ru
 					log.Errorf("GitHub runner jit-config response missing: %s", err.Error())
 					return "", fmt.Errorf("failed jit-config response")
 				} else if jitConfig, ok := payload["encoded_jit_config"].(string); ok && len(jitConfig) > 0 {
+					if s.store != nil {
+						if runner, ok := payload["runner"].(map[string]any); ok {
+							if id, ok := runner["id"].(float64); ok && id > 0 {
+								if err := s.store.RememberRunnerID(ctx, runnerName, int64(id)); err != nil {
+									return "", err
+								}
+							}
+						}
+					}
 					return jitConfig, nil
 				} else {
 					log.Errorf("GitHub runner jit-config is empty")
@@ -1870,6 +1885,7 @@ type Autoscaler struct {
 	httpClient       *http.Client
 	tokenValidator   *idtoken.Validator
 	jobStatusFn      func(context.Context, Job) (string, error)
+	runnerBusyFn     func(context.Context, Source, string) (bool, error)
 	queueFn          func(context.Context, string, string, interface{}, time.Duration) error
 
 	sweepMu   sync.Mutex
@@ -1915,6 +1931,7 @@ func NewAutoscaler(config AutoscalerConfig) *Autoscaler {
 		engine.POST("/reconcile", scaler.reconcile)
 		engine.POST("/sweep", scaler.durableSweep)
 		engine.POST("/discover", scaler.discover)
+		engine.POST("/audit", scaler.auditFleet)
 		engine.GET("/healthcheck", func(ctx *gin.Context) { ctx.Status(http.StatusOK) })
 		return &scaler
 	}

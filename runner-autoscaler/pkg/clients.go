@@ -41,7 +41,11 @@ func (s *Autoscaler) Initialize(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	s.store = &firestoreStore{f}
+	state := &firestoreStore{f}
+	s.store = state
+	if err = state.ensureSchema(ctx); err != nil {
+		return err
+	}
 	s.tokenValidator, err = idtoken.NewValidator(ctx)
 	s.httpClient = &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment, MaxIdleConns: 100, MaxIdleConnsPerHost: 32,

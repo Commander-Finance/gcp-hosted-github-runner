@@ -30,7 +30,9 @@ func nonce() string {
 	return hex.EncodeToString(b[:])
 }
 func (s *Autoscaler) observe(ctx context.Context, src Source, job Job, terminal bool) error {
-	return s.store.Update(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
+	job.TaskToken = ""
+	return s.store.UpdateJob(ctx, jobKey(src.Name, job), func(r *lifecycleRecord, _ *fleetState) error {
+		changed := r.Job.Status != job.Status || (!r.Terminal && terminal)
 		if !r.Terminal || terminal {
 			r.Job, r.Source = job, src.Name
 		}
@@ -39,6 +41,11 @@ func (s *Autoscaler) observe(ctx context.Context, src Source, job Job, terminal 
 			r.ExpiresAt = time.Time{}
 		}
 		r.Terminal = r.Terminal || terminal
+		if changed {
+			r.NextActionAt = time.Now()
+			r.EnqueuedUntil = time.Time{}
+			r.EnqueueToken = ""
+		}
 		if r.UpdatedAt.IsZero() {
 			r.UpdatedAt = time.Now()
 		}
@@ -53,7 +60,7 @@ func (s *Autoscaler) observe(ctx context.Context, src Source, job Job, terminal 
 // outlasts the worker's operation deadline, including time spent waiting on APIs.
 func (s *Autoscaler) claim(ctx context.Context, key, token string) (lifecycleRecord, error) {
 	var record lifecycleRecord
-	err := s.store.Update(ctx, key, func(r *lifecycleRecord, _ *fleetState) error {
+	err := s.store.UpdateJob(ctx, key, func(r *lifecycleRecord, _ *fleetState) error {
 		if r.Job.Id == 0 {
 			return fmt.Errorf("unknown job")
 		}
@@ -65,6 +72,14 @@ func (s *Autoscaler) claim(ctx context.Context, key, token string) (lifecycleRec
 		return nil
 	})
 	return record, err
+}
+func (s *Autoscaler) mutateJob(ctx context.Context, key, token string, change func(*lifecycleRecord, *fleetState) error) error {
+	return s.store.UpdateJob(ctx, key, func(r *lifecycleRecord, f *fleetState) error {
+		if r.Lease != token || !time.Now().Before(r.LeaseUntil) {
+			return errLeaseBusy
+		}
+		return change(r, f)
+	})
 }
 func (s *Autoscaler) mutate(ctx context.Context, key, token string, change func(*lifecycleRecord, *fleetState) error) error {
 	return s.store.Update(ctx, key, func(r *lifecycleRecord, f *fleetState) error {
@@ -86,6 +101,7 @@ func releaseReservation(r *lifecycleRecord, f *fleetState) {
 	r.Operation = ""
 	r.Template = ""
 	r.JITIssuedAt = time.Time{}
+	r.RunnerID = 0
 	r.AttemptedAt = time.Time{}
 	if r.Terminal && r.PendingDelete == "" {
 		r.ExpiresAt = time.Now().Add(7 * 24 * time.Hour)
@@ -108,10 +124,41 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 	defer func() {
 		finish, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if e := s.mutate(finish, key, token, func(r *lifecycleRecord, _ *fleetState) error { r.Lease = ""; return nil }); e != nil {
+		if e := s.mutateJob(finish, key, token, func(r *lifecycleRecord, _ *fleetState) error { r.Lease = ""; return nil }); e != nil {
 			log.Warnf("Lifecycle lease release failed for job %d: %v", job.Id, e)
 		}
 	}()
+	// GitHub assignment, not VM ownership, determines whether demand is served.
+	statusFn := s.jobStatusFn
+	if statusFn == nil {
+		statusFn = s.currentJobStatus
+	}
+	currentStatus := "completed"
+	var statusErr error
+	if !r.Terminal {
+		currentStatus, statusErr = statusFn(ctx, job)
+	}
+	if err = s.mutateJob(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
+		if !current.Terminal && statusErr == nil {
+			current.Job.Status = currentStatus
+			current.Terminal = currentStatus == "completed"
+		}
+		r = *current
+		return nil
+	}); err != nil {
+		return err
+	}
+	if currentStatus == "queued" && r.VMName == "" {
+		adopted, e := s.store.Adopt(ctx, key, token, poolKey(src.Name, job))
+		if e != nil {
+			return e
+		}
+		if adopted {
+			if e = s.mutateJob(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error { r = *current; return nil }); e != nil {
+				return e
+			}
+		}
+	}
 	// A VM's immutable generation name can never target a later replacement.
 	// Reclaim a stopped VM even if GitHub is unavailable, retaining its job record.
 	if r.VMName != "" {
@@ -124,10 +171,29 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			return e
 		}
 		if found && !state.isStopped() {
-			if r.CreatedAt.IsZero() {
-				return s.mutate(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error { current.CreatedAt = time.Now(); return nil })
+			if statusErr != nil {
+				return statusErr
 			}
-			return nil
+			busyFn := s.runnerBusyFn
+			if busyFn == nil {
+				busyFn = s.runnerBusy
+			}
+			busy, e := busyFn(ctx, src, r.VMName)
+			if e != nil {
+				return e
+			}
+			if currentStatus != "queued" || busy {
+				// Keep the actual running VM accounted independently. In particular,
+				// busy RA cannot suppress A when it accepted B and RB was preempted.
+				return s.store.Detach(ctx, key, token, !busy && !r.Terminal, time.Now().Add(2*time.Minute))
+			}
+			return s.mutateJob(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
+				if current.CreatedAt.IsZero() {
+					current.CreatedAt = time.Now()
+				}
+				current.NextActionAt = time.Now().Add(2 * time.Minute)
+				return nil
+			})
 		}
 		if found {
 			if e = s.DeleteInstance(ctx, r.VMName); e != nil {
@@ -171,24 +237,24 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			}
 		}
 	}
+	if statusErr != nil {
+		return statusErr
+	}
 	if r.Terminal {
 		if r.VMName != "" && r.Zone == "" {
 			return s.mutate(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error { releaseReservation(current, f); return nil })
 		}
 		return nil
 	}
-	statusFn := s.jobStatusFn
-	if statusFn == nil {
-		statusFn = s.currentJobStatus
+	if r.Failure != "" {
+		return permanentError{r.Failure}
 	}
-	status, err := statusFn(ctx, job)
-	if err != nil {
-		return err
-	}
-	if err = s.mutate(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
+	status := currentStatus
+	if err = s.mutateJob(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
 		if !current.Terminal {
 			current.Job.Status = status
 		}
+		current.NextActionAt = time.Now().Add(10 * time.Minute)
 		return nil
 	}); err != nil {
 		return err
@@ -219,7 +285,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 	}
 	override := job.GetMagicLabelValue(MagicLabelMachine)
 	if override != nil && !s.allowedMachine(*override) {
-		return fmt.Errorf("machine type %q is not allowed", *override)
+		return permanentError{fmt.Sprintf("machine type %q is not allowed", *override)}
 	}
 	if r.VMName == "" {
 		name := fmt.Sprintf("%s-%d-%s", s.conf.RunnerPrefix, job.Id, nonce())
@@ -261,7 +327,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 		if e != nil {
 			return e
 		}
-		if e = s.mutate(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
+		if e = s.mutateJob(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
 			current.JIT = jit
 			current.JITIssuedAt = time.Now()
 			r = *current
@@ -289,7 +355,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			if e != nil {
 				return e
 			}
-			if e = s.mutate(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
+			if e = s.mutateJob(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
 				current.Operation = op.Name()
 				r = *current
 				return nil
@@ -303,7 +369,11 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 		if attempt.provisioningModel == "standard" && !s.conf.AllowOnDemand {
 			continue
 		}
-		err = s.mutate(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
+		changeAttempt := s.mutateJob
+		if (r.Model == "standard") != (attempt.provisioningModel == "standard") {
+			changeAttempt = s.mutate
+		}
+		err = changeAttempt(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
 			if current.Terminal {
 				return fmt.Errorf("job completed before insert")
 			}
@@ -330,7 +400,11 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 		err = insert(ctx, attempt, r.VMName, s.lifecycleMetadata(r, src))
 		if err == nil || IsAlreadyExists(err) {
 			log.WithFields(log.Fields{"instance": r.VMName, "zone": r.Zone, "provisioning_model": r.Model, "machine_type": attempt.machineType}).Infof("Created instance %s (%s) as %s", r.VMName, r.Zone, r.Model)
-			return s.mutate(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error { current.CreatedAt = time.Now(); return nil })
+			return s.mutateJob(ctx, key, token, func(current *lifecycleRecord, _ *fleetState) error {
+				current.CreatedAt = time.Now()
+				current.NextActionAt = time.Now().Add(2 * time.Minute)
+				return nil
+			})
 		}
 		var apiErr *apierror.APIError
 		definite := IsCapacityError(err) || IsRateLimitError(err) || (errors.As(err, &apiErr) && apiErr.HTTPCode() >= 400 && apiErr.HTTPCode() < 500)
@@ -339,16 +413,24 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 		}
 		// Only a definite capacity error permits a different zone; timeouts retain
 		// the saved attempt so no second zonal VM can be created on a retry.
-		if e := s.mutate(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
+		clearAttempt := s.mutateJob
+		if r.Model == "standard" {
+			clearAttempt = s.mutate
+		}
+		if e := clearAttempt(ctx, key, token, func(current *lifecycleRecord, f *fleetState) error {
 			if current.Model == "standard" {
 				f.Standard--
 			}
 			current.Zone, current.Model, current.Operation, current.Template = "", "", "", ""
+			r = *current
 			return nil
 		}); e != nil {
 			return e
 		}
 		if IsRateLimitError(err) || !IsCapacityError(err) {
+			if !IsRateLimitError(err) && apiErr != nil && apiErr.HTTPCode() >= 400 && apiErr.HTTPCode() < 500 {
+				return permanentError{fmt.Sprintf("Compute rejected runner configuration: %d", apiErr.HTTPCode())}
+			}
 			return err
 		}
 	}
@@ -398,6 +480,17 @@ func (s *Autoscaler) currentJobStatus(ctx context.Context, job Job) (string, err
 	return result.Status, nil
 }
 func (s *Autoscaler) githubGet(ctx context.Context, pat, endpoint string, result interface{}) error {
+	if s.store != nil {
+		for _, key := range []string{"github", githubEndpointKey(endpoint)} {
+			until, err := s.store.Backoff(ctx, key, time.Time{})
+			if err != nil {
+				return err
+			}
+			if until.After(time.Now()) {
+				return retryAtError{until, "GitHub request deferred by durable backoff"}
+			}
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return err
@@ -410,7 +503,7 @@ func (s *Autoscaler) githubGet(ctx context.Context, pat, endpoint string, result
 	defer resp.Body.Close()
 	// GitHub masks missing permissions with 404: never interpret it as completion.
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("GitHub read failed: %s (check Actions-read permission)", resp.Status)
+		return s.githubFailure(ctx, endpoint, resp)
 	}
 	return json.NewDecoder(resp.Body).Decode(result)
 }
