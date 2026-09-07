@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"cloud.google.com/go/compute/apiv1/computepb"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -339,4 +341,12 @@ func TestResolvedStockoutKeepsGenerationAndSkipsFailedAttempt(t *testing.T) {
 	require.NotEqual(t, first.Zone, attempts[1].zone)
 	require.Equal(t, "spot", attempts[1].provisioningModel)
 	require.Len(t, attempts, 3)
+}
+
+func TestDeletionAlreadyGoneCountsAsDeleted(t *testing.T) {
+	gone, err := apierror.FromError(&googleapi.Error{Code: 404, Message: "NOT FOUND: The resource 'runner-1' was not found"})
+	require.True(t, err)
+	require.NoError(t, awaitDeletion(context.Background(), func(context.Context) error { return gone }))
+	require.NoError(t, awaitDeletion(context.Background(), func(context.Context) error { return nil }))
+	require.ErrorIs(t, awaitDeletion(context.Background(), func(context.Context) error { return context.DeadlineExceeded }), context.DeadlineExceeded)
 }

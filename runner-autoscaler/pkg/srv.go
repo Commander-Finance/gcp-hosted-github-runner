@@ -707,10 +707,21 @@ func (s *Autoscaler) realDeleteInZone(ctx context.Context, client *InstanceClien
 		}
 		return false, err // unknown - let the caller try other zones
 	}
-	if err := res.Wait(ctx); err != nil {
+	if err := awaitDeletion(ctx, func(ctx context.Context) error { return res.Wait(ctx) }); err != nil {
 		return true, err // was here, but deletion/confirmation failed
 	}
 	return true, nil
+}
+
+// awaitDeletion waits for a delete operation. A not-found result means the
+// instance finished removing itself first, which is the outcome the caller
+// wanted, so it counts as success instead of failing the sweep.
+func awaitDeletion(ctx context.Context, wait func(context.Context) error) error {
+	err := wait(ctx)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // blocking until the instance is deleted or the deletion fails.
