@@ -195,18 +195,26 @@ func TestAuditFleetMatchesDiscrepancyAndConcurrentCapacityWrite(t *testing.T) {
 	})
 }
 
-// A capability whose runner matches the record's current VMName is accepted.
-// The resulting re-enqueue is deliberately not asserted: enqueueJob's due-time
-// gate compares against the record's existing NextActionAt rather than
-// recreateVmDelay, so the dispatch it produces is not what recreateVmDelay's
-// documented 45s intends.
+// A valid capability re-dispatches the job after recreateVmDelay even though
+// the record's ordinary due time is further out.
 func TestDurableRecreateAcceptsCapabilityMatchingCurrentRunner(t *testing.T) {
 	s, m, src, j := lifecycleTestScaler()
 	ctx := context.Background()
 	require.NoError(t, s.observe(ctx, src, j, false))
 	require.NoError(t, s.processJob(ctx, src, j))
-	name := m.get(jobKey(src.Name, j)).VMName
+	s.instanceStateFn = func(context.Context, string) (bool, State, error) { return true, RUNNING, nil }
+	require.NoError(t, s.processJob(ctx, src, j))
+	key := jobKey(src.Name, j)
+	name := m.get(key).VMName
 	require.NotEmpty(t, name)
+	require.True(t, m.get(key).NextActionAt.After(time.Now().Add(recreateVmDelay)))
+	var routes []string
+	var delays []time.Duration
+	s.queueFn = func(_ context.Context, route, _ string, _ interface{}, delay time.Duration) error {
+		routes = append(routes, route)
+		delays = append(delays, delay)
+		return nil
+	}
 
 	cap := recreateCapability{Job: j, Runner: name, Purpose: "recreate", Expires: time.Now().Add(time.Hour).Unix()}
 	body, _ := json.Marshal(cap)
@@ -216,6 +224,9 @@ func TestDurableRecreateAcceptsCapabilityMatchingCurrentRunner(t *testing.T) {
 	s.engine.ServeHTTP(w, req)
 
 	require.Equal(t, 200, w.Code)
+	require.Equal(t, []string{s.conf.RouteCreateVm}, routes)
+	require.Equal(t, []time.Duration{recreateVmDelay}, delays)
+	require.Equal(t, m.get(key).EnqueuedUntil, m.get(key).NextActionAt)
 }
 
 func TestAutoscalerConfigValidateRejectsEachInvariant(t *testing.T) {

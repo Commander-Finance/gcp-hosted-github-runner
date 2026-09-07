@@ -273,6 +273,12 @@ func (s *Autoscaler) durableRecreate(c *gin.Context) {
 	valid := false
 	err = s.store.UpdateJob(ctx, jobKey(src.Name, cap.Job), func(r *lifecycleRecord, _ *fleetState) error {
 		valid = !r.Terminal && r.VMName == cap.Runner && r.VMName != ""
+		// The record's ordinary due time is minutes out; without pulling it
+		// forward, enqueueJob's due-time gate would drop the replacement and
+		// the dying VM would only be noticed by the next reconcile pass.
+		if due := time.Now().Add(recreateVmDelay); valid && r.NextActionAt.After(due) {
+			r.NextActionAt = due
+		}
 		return nil
 	})
 	if err != nil {
