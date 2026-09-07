@@ -117,6 +117,29 @@ func ledgerDiscrepancy(counts fleetState, rows []runnerRecord, actual map[string
 	}
 	return nil
 }
+
+// listInstances lists the runner-prefixed GCE instances in a zone, using
+// listInstancesFn when set (tests) or the real compute client otherwise.
+func (s *Autoscaler) listInstances(ctx context.Context, zone string) ([]*computepb.Instance, error) {
+	if s.listInstancesFn != nil {
+		return s.listInstancesFn(ctx, zone)
+	}
+	client, closeClient := s.compute(ctx)
+	defer closeClient()
+	it := client.List(ctx, &computepb.ListInstancesRequest{Project: s.conf.ProjectId, Zone: zone, Filter: proto.String(fmt.Sprintf("name eq ^%s-.*", s.conf.RunnerPrefix))})
+	var instances []*computepb.Instance
+	for {
+		vm, e := it.Next()
+		if e == iterator.Done {
+			break
+		}
+		if e != nil {
+			return nil, e
+		}
+		instances = append(instances, vm)
+	}
+	return instances, nil
+}
 func (s *Autoscaler) auditFleet(c *gin.Context) {
 	if !s.privateRequest(c) {
 		return
@@ -130,19 +153,13 @@ func (s *Autoscaler) auditFleet(c *gin.Context) {
 		return
 	}
 	actual := map[string]string{}
-	client, closeClient := s.compute(ctx)
-	defer closeClient()
 	for _, zone := range s.conf.Zones {
-		it := client.List(ctx, &computepb.ListInstancesRequest{Project: s.conf.ProjectId, Zone: zone, Filter: proto.String(fmt.Sprintf("name eq ^%s-.*", s.conf.RunnerPrefix))})
-		for {
-			vm, e := it.Next()
-			if e == iterator.Done {
-				break
-			}
-			if e != nil {
-				c.AbortWithError(503, e)
-				return
-			}
+		instances, e := s.listInstances(ctx, zone)
+		if e != nil {
+			c.AbortWithError(503, e)
+			return
+		}
+		for _, vm := range instances {
 			model := "standard"
 			if vm.GetScheduling().GetProvisioningModel() == "SPOT" || vm.GetScheduling().GetPreemptible() {
 				model = "spot"

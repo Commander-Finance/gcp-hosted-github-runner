@@ -1915,6 +1915,10 @@ type Autoscaler struct {
 	// operationLookupFn is a test seam for the zone-operation lookup behind
 	// resolveAttempt; it returns nil when no matching operation exists.
 	operationLookupFn func(ctx context.Context, r lifecycleRecord) (*computepb.Operation, error)
+	// listInstancesFn is a test seam for the per-zone GCE instance listing behind
+	// auditFleet. nil in production, where the real compute-client-backed listing
+	// is used.
+	listInstancesFn func(ctx context.Context, zone string) ([]*computepb.Instance, error)
 
 	// Zone circuit breaker state (see zonehealth.go). zoneReportFn is the test seam
 	// for the Cloud Logging sensor; nil in production. The cache fields are guarded
