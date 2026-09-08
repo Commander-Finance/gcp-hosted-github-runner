@@ -67,6 +67,12 @@ func (f *firestoreStore) RecordAssignment(ctx context.Context, key, name string,
 				return errSchema
 			}
 			if existing.JobKey != key {
+				// A re-run attempt replays carried-over completed jobs under new IDs
+				// with the runner name from the earlier attempt. The generation
+				// belongs to the job that ran on it; only a live claim conflicts.
+				if job.Status == "completed" {
+					return nil
+				}
 				return fmt.Errorf("conflicting assignment for JIT generation %s", name)
 			}
 		} else if status.Code(err) != codes.NotFound {

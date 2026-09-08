@@ -85,3 +85,26 @@ func TestMissedAssignmentCompletionConsumesGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "completed", a.Job.Status)
 }
+
+// A re-run attempt replays every carried-over completed job under a new job ID
+// but with the runner name from the earlier attempt. That generation belongs to
+// the job that actually ran on it, so the replay is ignored rather than failed,
+// while a live claim on another job's generation is still a conflict.
+func TestRerunReplayDoesNotClaimAnotherJobsGeneration(t *testing.T) {
+	s, m, src, j := lifecycleTestScaler()
+	ctx := context.Background()
+	j.Status, j.RunnerName = "in_progress", "runner-10-0123456789abcdef"
+	require.NoError(t, s.observe(ctx, src, j, false))
+	require.NoError(t, s.observe(ctx, src, j, true))
+	replay := j
+	replay.Id++
+	require.NoError(t, s.observe(ctx, src, replay, true))
+	a, err := m.Assignment(ctx, j.RunnerName)
+	require.NoError(t, err)
+	require.Equal(t, jobKey(j), a.JobKey)
+	require.Equal(t, "completed", a.Job.Status)
+	live := replay
+	live.Id++
+	live.Status = "in_progress"
+	require.Error(t, s.observe(ctx, src, live, false))
+}
