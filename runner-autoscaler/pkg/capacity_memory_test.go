@@ -14,6 +14,9 @@ func (m *memoryStore) RecordAssignment(_ context.Context, key, name string, job 
 	}
 	old := m.assignments[name]
 	if old.JobKey != "" && old.JobKey != key {
+		if job.Status == "completed" {
+			return nil
+		}
 		return fmt.Errorf("conflicting assignment")
 	}
 	if m.rows[key].Terminal || old.Job.Status == "completed" {

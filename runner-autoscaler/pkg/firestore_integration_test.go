@@ -195,3 +195,24 @@ func TestFirestoreAdoptSkipsAssignedCandidate(t *testing.T) {
 	require.False(t, skipped.Available)
 	require.Empty(t, skipped.Owner)
 }
+
+func TestFirestoreReplayedCompletionLeavesAssignmentWithOwner(t *testing.T) {
+	f := emulatorStore(t)
+	ctx := context.Background()
+	s, _, src, j := lifecycleTestScaler()
+	s.store = f
+	j.Status, j.RunnerName = "in_progress", "runner-10-0123456789abcdef"
+	require.NoError(t, s.observe(ctx, src, j, false))
+	require.NoError(t, s.observe(ctx, src, j, true))
+	replay := j
+	replay.Id++
+	require.NoError(t, s.observe(ctx, src, replay, true))
+	a, err := f.Assignment(ctx, j.RunnerName)
+	require.NoError(t, err)
+	require.Equal(t, jobKey(j), a.JobKey)
+	require.Equal(t, "completed", a.Job.Status)
+	live := replay
+	live.Id++
+	live.Status = "in_progress"
+	require.ErrorContains(t, s.observe(ctx, src, live, false), "conflicting assignment")
+}
