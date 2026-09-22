@@ -194,7 +194,7 @@ func TestDiscoveryRejectsLegacyMagicLabelLikeWebhooks(t *testing.T) {
 	sent := 0
 	s.queueFn = func(context.Context, string, string, interface{}, time.Duration) error { sent++; return nil }
 	legacy := j
-	legacy.Labels = []string{"spock", "@machine:n2-standard-8"}
+	legacy.Labels = []string{"builder", "@machine:n2-standard-8"}
 	require.NoError(t, s.observeDiscoveredJobs(context.Background(), src, j.RepositoryFullName, []Job{legacy}))
 	require.Empty(t, m.rows)
 	require.Equal(t, 0, sent)
@@ -219,9 +219,9 @@ func TestDiscoveryPagesRepositoriesAndRunJobs(t *testing.T) {
 		case strings.HasSuffix(req.URL.Path, "/repos"):
 			body = `[{"full_name":"acme/last","archived":false}]`
 		case strings.HasSuffix(req.URL.Path, "/jobs") && page == "1":
-			body = `{"jobs":[` + strings.TrimSuffix(strings.Repeat(fmt.Sprintf(`{"id":%d,"status":"queued","labels":["spock"]},`, j.Id), 100), ",") + `]}`
+			body = `{"jobs":[` + strings.TrimSuffix(strings.Repeat(fmt.Sprintf(`{"id":%d,"status":"queued","labels":["builder"]},`, j.Id), 100), ",") + `]}`
 		default:
-			body = fmt.Sprintf(`{"jobs":[{"id":%d,"status":"queued","labels":["spock"]}]}`, j.Id+1)
+			body = fmt.Sprintf(`{"jobs":[{"id":%d,"status":"queued","labels":["builder"]}]}`, j.Id+1)
 		}
 		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})}

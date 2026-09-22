@@ -32,7 +32,7 @@ import (
 //
 // The sensor assumes the runner image ships the Ops Agent with its default syslog
 // receiver, so the line lands in projects/<project>/logs/syslog. This module does
-// not install the agent; the consumer's image does (spock-runner bakes it in with
+// not install the agent; the consumer's image must (for example, baked in with
 // Packer). Without it the failing side is always empty and the breaker never
 // trips, silently. Disable it with ZoneBenchMinVMs=0 on images without the agent.
 
