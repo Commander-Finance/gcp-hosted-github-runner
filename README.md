@@ -1,8 +1,6 @@
-> Lifecycle and migration details for the durable autoscaler: [ENG-2345 implementation](AUDIT-FIXES.md). The lifecycle described there supersedes the historical flow below.
-
 # gcp-hosted-github-runner
 
-[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/Privatehive/gcp-hosted-github-runner/main.yml?branch=master&style=flat&logo=github&label=Docker+build)](https://github.com/Privatehive/gcp-hosted-github-runner/actions?query=branch%3Amaster)
+[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/Commander-Finance/gcp-hosted-github-runner/main.yml?branch=master&style=flat&logo=github&label=Docker+build)](https://github.com/Commander-Finance/gcp-hosted-github-runner/actions?query=branch%3Amaster)
 [![awesome-runners](https://img.shields.io/badge/listed%20on-awesome--runners-blue.svg)](https://github.com/jonico/awesome-runners)
 
 
@@ -39,7 +37,9 @@ output "runner_webhook_config" {
 }
 ```
 
-Authenticate with `gcloud` and apply the terraform module. On a brand-new GCP project, the first `apply` may fail with an API-not-enabled or NotFound error while newly enabled Google APIs (Cloud Run, Artifact Registry, Cloud Tasks, Secret Manager, Compute) finish propagating — wait a minute and re-run `apply`.
+The module requires Terraform 1.9 or newer. Authenticate with `gcloud` and apply the terraform module. On a brand-new GCP project, the first `apply` may fail with an API-not-enabled or NotFound error while newly enabled Google APIs (Cloud Run, Artifact Registry, Cloud Tasks, Secret Manager, Compute, Firestore, Cloud Scheduler, Monitoring) finish propagating — wait a minute and re-run `apply`.
+
+The module creates a Firestore database named `github-runners` in the runtime region (override with `firestore_location`). Terraform abandons the database on destroy rather than deleting it, and its location cannot be changed in place.
 
 ``` bash
 $ gcloud auth application-default login --project <gcp_project>
@@ -101,6 +101,8 @@ Have a look at the Terraform output `runner_webhook_config`. There you find the 
 * For an **Organization**: Create a [Fine-grained personal access token (PAT)](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token) with the **Organization** Read/Write permission "Self-hosted runners". 
 * For **Repositories**: Create a [Fine-grained personal access token (PAT)](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token) with the **Repository** permissions Read/Write "Administration".
 
+Discovery and job-status checks also need the PAT to have **Actions: Read** on every participating repository.
+
 This PAT is needed to automatically create a [Enterprise](https://docs.github.com/en/enterprise-cloud@latest/rest/actions/self-hosted-runners?apiVersion=2022-11-28#create-configuration-for-a-just-in-time-runner-for-an-enterprise), [Organization](https://docs.github.com/en/rest/actions/self-hosted-runners?apiVersion=2022-11-28#create-configuration-for-a-just-in-time-runner-for-an-organization), [Repository](https://docs.github.com/en/rest/actions/self-hosted-runners?apiVersion=2022-11-28#create-configuration-for-a-just-in-time-runner-for-a-repository) jit-config for each ephemeral runner to join the Repository or the runner group of an Enterprise/Organization. Then open the [Secret Manager](https://console.cloud.google.com/security/secret-manager) in the Google Cloud Console and add a new Version to the already existing secret "github-pat-token". Paste the PAT into the Secret value field and click "ADD NEW VERSION".
 
 > [!TIP]
@@ -108,24 +110,36 @@ This PAT is needed to automatically create a [Enterprise](https://docs.github.co
 
 That's it 👍
 
-As soon as you start a GitHub workflow whose job's `runs-on` labels fully satisfy all non-magic labels of at least one label group configured via [`github_runner_label_groups`](./variables.tf) (default `[["self-hosted"]]`), a VM instance with the specified `machine_type` starts. The name of the VM instance starts with the `github_runner_prefix`, followed by a random string to make the name unique; the same name is the runner's name in the GitHub runner group or repository. The spawned runner registers with the **job's** full `runs-on` labels — the groups are a webhook filter, not the registered label set. After the workflow job completes, the VM instance is deleted.
+As soon as you start a GitHub workflow whose job's `runs-on` labels fully satisfy all non-magic labels of at least one label group configured via [`github_runner_label_groups`](./variables.tf) (default `[["self-hosted"]]`), a VM instance with the specified `machine_type` starts. The VM is named `<github_runner_prefix>-<job id>-<random suffix>`; the same name is the runner's name in the GitHub runner group or repository. The spawned runner registers with the **job's** full `runs-on` labels — the groups are a webhook filter, not the registered label set. After the workflow job completes, the VM instance is deleted.
 
 > [!NOTE]
-> Two label-disjoint groups (e.g. `[["spock"], ["spock-prime"]]`) let one autoscaler serve two pools without GitHub's scheduler cross-assigning runners. See [Multiple label-disjoint pools](#multiple-label-disjoint-pools) below.
+> Two label-disjoint groups (e.g. `[["builder"], ["builder-large"]]`) let one autoscaler serve two pools without GitHub's scheduler cross-assigning runners. See [Multiple label-disjoint pools](#multiple-label-disjoint-pools) below.
 
 ## Advanced Configuration
 
 Have a look at the [variables.tf](./variables.tf) file how to further configure the Terraform module.
 
-This are the most common variables you may want to change:
+These are the most common variables you may want to change:
 
-`max_runners`: The fleet ceiling, counted from durable reservations. `max_concurrency` is deprecated and ignored.
+`max_runners`: The fleet ceiling (default 100), counted from durable reservations, including pending inserts and stopped VMs awaiting cleanup. When the fleet is full, queued jobs wait for capacity. `max_concurrency` is deprecated and ignored.
 
-`github_runner_label_groups`: One or more label groups the autoscaler matches against incoming workflow jobs (OR-of-ANDs — a job matches if it carries ALL non-magic labels of ANY one group; `gce-machine-*` labels are ignored for group matching). Examples: `[["self-hosted"]]` (default single-pool), `[["self-hosted", "linux"]]` (single pool, two required labels), `[["spock"], ["spock-prime"]]` (two disjoint pools served by one autoscaler).
+`max_on_demand_runners` / `allow_on_demand`: The ceiling on STANDARD (non-SPOT) VMs (default 10) and whether they are allowed at all (default `true`). With `machine_preemtible = true`, STANDARD VMs are only a fallback when SPOT capacity is exhausted. A non-preemptible fleet requires `allow_on_demand = true` and a positive `max_on_demand_runners`.
 
-`machine_type`: The VM instance machine type where the GitHub runner will run on by default (can be individually overwritten per workflow job, see [Magic Labels](#magic-labels))
+`github_runner_label_groups`: One or more label groups the autoscaler matches against incoming workflow jobs (OR-of-ANDs — a job matches if it carries ALL non-magic labels of ANY one group; `gce-machine-*` labels are ignored for group matching). Examples: `[["self-hosted"]]` (default single-pool), `[["self-hosted", "linux"]]` (single pool, two required labels), `[["builder"], ["builder-large"]]` (two disjoint pools served by one autoscaler).
 
-`disk_size_gb`: The size of the VM disk
+`machine_type`: The VM instance machine type where the GitHub runner will run on by default (can be individually overwritten per workflow job, see [Magic Labels](#magic-labels)).
+
+`allowed_machine_types`: The machine types a job may request with a `gce-machine-*` label. Empty (the default) disables per-job overrides.
+
+`machine_type_fallbacks`: An ordered list of machine types to try when a job has no `gce-machine-*` label and the current type is out of capacity. Every entry must support the configured `disk_type`.
+
+`discovery_repositories`: `owner/repo` names that scheduled discovery scans for queued jobs whose webhook was lost. Empty scans every organization repository visible to the PAT. Required for Enterprise installations.
+
+`create_concurrency` / `create_dispatches_per_second`: Concurrency (default 4) and rate (default 2/s) of VM-create callbacks. Tune against your Compute write quotas.
+
+`alert_notification_channels`: Cloud Monitoring notification channel IDs for the autoscaler's alert policies.
+
+`disk_size_gb`: The size of the VM disk.
 
 
 > [!TIP]
@@ -143,16 +157,16 @@ A single autoscaler can serve multiple workflow-job populations by configuring `
 
 ```hcl
 github_runner_label_groups = [
-  ["spock"],         # default-sized VMs for runs-on: spock
-  ["spock-prime"],   # custom-sized VMs for runs-on: [spock-prime, gce-machine-<type>]
+  ["builder"],         # default-sized VMs for runs-on: builder
+  ["builder-large"],   # custom-sized VMs for runs-on: [builder-large, gce-machine-<type>]
 ]
 ```
 
-Per-pool defaults (disk size, image, preemptibility, runner group, max concurrency) are **not** supported — the instance template is shared across all groups. Only `machine_type` diverges, via the per-job `gce-machine-*` magic label below.
+Per-pool defaults (disk size, image, preemptibility, runner group, fleet limits) are **not** supported — the instance template is shared across all groups. Only `machine_type` diverges, via the per-job `gce-machine-*` magic label below.
 
 ### Magic Labels
 
-Each workflow job can select a different machine type than the configured default `machine_type`. Use the special label `gce-machine-<type>`, e.g. `gce-machine-c2d-standard-16`. Make sure the configured `disk_type` is supported by the machine.
+Each workflow job can select a different machine type than the configured default `machine_type`. Use the special label `gce-machine-<type>`, e.g. `gce-machine-c2d-standard-16`. The type must be listed in `allowed_machine_types`; the autoscaler parks a job that requests any other type as a configuration failure and creates no VM. Make sure the configured `disk_type` is supported by the machine.
 
 ```yaml
 jobs:
@@ -163,7 +177,7 @@ jobs:
 ```
 
 > [!NOTE]
-> Earlier versions of this module documented `@machine:<type>` (e.g. `@machine:c2d-standard-16`). That syntax does not work: GitHub's JIT runner-registration API rejects labels containing `@` or `:`, so runners spawned for such jobs could not match the job's required labels and the job timed out. Replace `@machine:<type>` with `gce-machine-<type>` in any existing workflows. Jobs still using the old syntax are detected in the webhook handler and skipped (no VM is created) with a warning logged pointing at this section.
+> Earlier versions of this module documented `@machine:<type>` (e.g. `@machine:c2d-standard-16`). That syntax does not work: GitHub's JIT runner-registration API rejects labels containing `@` or `:`, so runners spawned for such jobs could not match the job's required labels and the job timed out. Replace `@machine:<type>` with `gce-machine-<type>` in any existing workflows. The webhook handler rejects jobs that still use the old syntax with HTTP 422 (visible under the webhook's Recent Deliveries) and creates no VM.
 
 ## Expected Cost
 
@@ -171,7 +185,10 @@ The following Google Cloud resources are created that may generate cost:
 * Cloud Task (covered by Free Tier)
 * Secret Version (covered by Free Tier)
 * Artifact Registry (covered by Free Tier)
-* Cloud Run (covered by Free Tier)
+* Cloud Run (scales to zero, but scheduled maintenance wakes it every two minutes)
+* Firestore (per-operation charges for lifecycle state)
+* Cloud Scheduler (four jobs)
+* Cloud Monitoring log-based metrics and alert policies
 * (Spot) VM Instance(s) + standard persistent disk + ephemeral external IPv4
 
 Other:
@@ -189,31 +206,27 @@ Standard persistent disk 20 GiB used    ~ $0.0011
                                           $0.053
 ```
 
-Overall, only the compute instance accounts for the "majority" of the costs.
+Overall, the compute instance accounts for the majority of the costs. The baseline cost of scheduled maintenance, Firestore and Cloud Run has not been measured in production.
 
 ## How it works
 
-1. As soon as a new GitHub workflow job signals a "queued" status, the GitHub webhook event "Workflow jobs" invokes the Cloud Run [container](https://github.com/Privatehive/gcp-hosted-github-runner/pkgs/container/github-runner-autoscaler) with path `/webhook`
-2. The Cloud Run validates the caller source (signature) and if valid enqueues a "create-vm" Cloud task callback with a short delay (defaults to 10 seconds).
-   * Edge Case for workflow jobs with a deployment review: if another GitHub webhook is received shortly afterwards indicating that the job status has been changed from "queued" to "waiting", the "create-vm" cloud task callback will be deleted (if it has not yet been processed). As soon as the deployment review for the workflow job is complete, we start again from the beginning.
-   * Edge Case for canceled workflow jobs: If a workflow job is immediately canceled a GitHub webhook signals a "completed" job status. The "create-vm" cloud task callback will be deleted (if it has not yet been processed)
-3. The Cloud task callback invokes the Cloud Run path `/create_vm`.
-4. Cloud Run creates a jit-config (using PAT from Secret Manager). The runner is then already registered (but marked as offline).
-5. The Cloud Run creates the VM instance from the instance template (preemtible spot VM instance by default) and provides it with the runner jit-config via custom metadata attribute.
-6. The runner starts working on the workflow job.
-7. As soon as the workflow job completed, the GitHub webhook event "Workflow jobs" invokes the Cloud Run again.
-8. The Cloud Run validates the caller source (signature) and if valid enqueues a "delete-vm" Cloud task.
-9.  The Cloud task invokes the Cloud Run path `/delete_vm`.
-10. The Cloud Run deletes the VM instance.
+The autoscaler keeps every queued job and every runner VM in Firestore, so a lost, duplicated or reordered webhook cannot lose a job or leak a VM. [LIFECYCLE.md](LIFECYCLE.md) documents the full lifecycle contract, operations and repair procedure.
 
-> [!NOTE]
-> There are webhook related error cases that can lead to duplicate VMs or missing VMs. This happens, for example, if GitHub webhooks are received twice or if webhooks are missing or the received webhooks are in the wrong order. Such errors occur rarely but cannot be completely avoided.
-> Several mechanisms harden the system against these and against transient failures:
-> * **Idempotent VM creation**: the VM name is derived from the workflow job id, so a retried `create-vm` callback reuses the same name and never spawns a duplicate.
-> * **Capacity fallback**: VM creation tries every configured zone, and — when the primary template is a SPOT instance — falls back to an on-demand (STANDARD) VM if SPOT capacity is exhausted everywhere, so a stockout no longer hangs the job. The SPOT-vs-standard split is exposed as a Cloud Monitoring log-based metric (`github_runner/vm_created`).
-> * **Two-phase startup wait**: a runner shuts its VM down quickly only if it never comes online (`runner_register_timeout`, default 120s); once online it waits much longer for GitHub to dispatch the job (`runner_job_dispatch_timeout`, default 600s) instead of the old hard 180s window that abandoned jobs that were still queued.
-> * **Orphan sweep**: a runner that stops without ever running a job (so no `completed` webhook arrives) is reclaimed by an opportunistic sweep that runs from the autoscaler's callbacks.
-> * **Recreate on lost capacity**: every VM carries a shutdown script (GCE runs it on SPOT preemption, self-initiated `shutdown now` and instance deletion). If the runner never accepted a job — meaning a queued job somewhere is now short one runner — the dying VM posts a signed callback to the Cloud Run path `/recreate_vm`, which re-enqueues a delayed `create-vm` task for a replacement. Because any matching runner can take any queued job, this restores pool *capacity* rather than re-pinning a specific job, which is exactly the invariant the webhook flow maintains. The Cloud-Tasks task-name tombstones cap the recreate loop at `maxTaskRetryCount + 1` VMs per job id, so a job cancelled while queued can't spawn replacements forever.
+1. A GitHub "Workflow jobs" webhook calls the Cloud Run path `/webhook`. The autoscaler verifies the signature, matches the job's labels, records the job in Firestore, and enqueues a create task after `machine_creation_delay` (default 10 seconds).
+2. The create task calls `/create_vm` with a Google OIDC token. The autoscaler takes a lease on the job and asks GitHub whether the job is still queued. If it is, the autoscaler reuses an idle spare runner from the same pool or reserves a slot under `max_runners`.
+3. The autoscaler creates a JIT runner configuration with the PAT from Secret Manager, then creates the VM from the instance template with the JIT configuration in its metadata. It tries every zone, then `machine_type_fallbacks`, then an on-demand (STANDARD) template when SPOT capacity is exhausted everywhere.
+4. The runner registers, waits for GitHub to dispatch a job, and runs it. A runner that never comes online shuts down after `runner_register_timeout`; an online runner that is never dispatched shuts down after `runner_job_dispatch_timeout`.
+5. When the job completes, the webhook marks the job terminal and enqueues a delete task. `/delete_vm` deletes the VM and releases its reservation.
+6. If a VM dies before accepting a job (for example, SPOT preemption), its shutdown script calls `/recreate_vm`. The autoscaler replaces the capacity if GitHub still reports the job as queued.
+
+Cloud Scheduler drives recovery independently of webhook traffic:
+
+* `/reconcile` (every 2 minutes) re-dispatches every job record that is due for action.
+* `/sweep` (every 2 minutes) deletes stopped runner VMs and reconciles spare runners.
+* `/discover` (every 5 minutes) lists recent workflow runs and records queued jobs whose webhook never arrived.
+* `/audit` (hourly) compares the fleet counters with the actual VMs and alerts on drift.
+
+Every VM also carries a `max_run_duration` of `machine_timeout`, so Compute deletes it even if every other mechanism fails.
 
 ## Troubleshooting
 
@@ -235,7 +248,7 @@ Error applying IAM policy for cloudrun service "v1/projects/my-gcp-project-id/lo
 
 The VM will stop itself if it does not come online within `runner_register_timeout` (default 120s), which usually means registration at the GitHub runner group failed. This can be caused by:
 * A typo in the GitHub Enterprise, Organization, Repository name. Check the Terraform variables `github_enterprise`, `github_organization`, `github_repositories` for typos.
-* A not existing GitHub runner group within the Enterprise/Organization. Check the Terraform variable `github_runner_group` for typos.
+* A not existing GitHub runner group within the Enterprise/Organization. Check the Terraform variable `github_runner_group_id`.
 * The GitHub runner version is [deprecated](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners#controlling-runner-software-updates-on-self-hosted-runners). The GitHub runner won't accept any Workflow job. Check the Terraform variable `github_runner_download_url` and update to latest GitHub runner version or leave empty to always use the latest version.
 
 You can observer the runner registration process by connecting to the VM instance via SSH (see `enable_ssh`) and running:
@@ -245,7 +258,13 @@ $ sudo journalctl -u google-startup-scripts.service --follow
 
 #### New VM Instance not created (but a lot of instances are already running)
 
-You exceeded your projects vCPU limit for the machine type in the region or for all regions. You may find an error log message in the Cloud Run logs stating `Machine Type vCPU quota exceeded for region`. Request a quota increase from google customer support for the project.
+The fleet may be at `max_runners` (or `max_on_demand_runners` for STANDARD VMs). Queued jobs then wait for capacity, and the "pending job over 15 minutes" alert fires. Raise the limit or wait for running jobs to finish.
+
+Alternatively, you exceeded your projects vCPU limit for the machine type in the region or for all regions. You may find an error log message in the Cloud Run logs stating `Machine Type vCPU quota exceeded for region`. Request a quota increase from google customer support for the project.
+
+#### A job that uses a `gce-machine-*` label never gets a VM
+
+The requested type is not in `allowed_machine_types`. Add it, then clear the job's `Failure` field in Firestore and set its next action due (see [LIFECYCLE.md](LIFECYCLE.md#demand-capacity-and-reconciliation-contract)).
 
 #### Nothing happens at all
 
