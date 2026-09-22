@@ -324,10 +324,10 @@ func TestZoneReportFromEntriesAcceptsMapPayloads(t *testing.T) {
 func TestZoneHealthFiltersScopeByTimeProjectAndService(t *testing.T) {
 
 	since := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
-	failF, createdF := zoneHealthFilters("spock-runner", "runner", "github-runner-autoscaler", since)
+	failF, createdF := zoneHealthFilters("example-project", "runner", "github-runner-autoscaler", since)
 
 	assert.Contains(t, failF, `resource.type="gce_instance"`)
-	assert.Contains(t, failF, `logName="projects/spock-runner/logs/syslog"`)
+	assert.Contains(t, failF, `logName="projects/example-project/logs/syslog"`)
 	assert.Contains(t, failF, `timestamp>="2026-09-04T00:00:00Z"`)
 	assert.Contains(t, failF, `jsonPayload.message:"Exporting failed"`)
 	assert.Contains(t, failF, `jsonPayload.message:"i/o timeout"`)
@@ -342,7 +342,7 @@ func TestZoneHealthFiltersScopeByTimeProjectAndService(t *testing.T) {
 
 	// Without a service name (running outside Cloud Run) the create filter must
 	// still be valid and simply not scope by service.
-	_, unscoped := zoneHealthFilters("spock-runner", "runner", "", since)
+	_, unscoped := zoneHealthFilters("example-project", "runner", "", since)
 	assert.NotContains(t, unscoped, "service_name")
 }
 

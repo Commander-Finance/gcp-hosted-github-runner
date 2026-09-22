@@ -135,7 +135,7 @@ func TestHandleRecreateVmEnqueuesCreateTask(t *testing.T) {
 	var job Job
 	s := recreateHandlerScaler(secret, &kind, &url, &delay, &job, nil)
 
-	w := postRecreate(s, secret, Job{Id: 99999, Labels: []string{"spock"}})
+	w := postRecreate(s, secret, Job{Id: 99999, Labels: []string{"builder"}})
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, TaskKindCreate, kind, "recreate must enqueue a create task, not a delete task")
@@ -323,7 +323,7 @@ func TestHandleCreateVmSetsShutdownScriptMetadata(t *testing.T) {
 	var capturedMetadata []*computepb.Items
 	s := createMetadataScaler(secret, "job_accepted", &capturedMetadata)
 
-	job := Job{Id: 4242, Labels: []string{"spock"}}
+	job := Job{Id: 4242, Labels: []string{"builder"}}
 	body, _ := json.Marshal(job)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -389,7 +389,7 @@ func TestHandleCreateVmDefaultsJobPatternWhenConfigEmpty(t *testing.T) {
 	var capturedMetadata []*computepb.Items
 	s := createMetadataScaler(secret, "", &capturedMetadata)
 
-	job := Job{Id: 4243, Labels: []string{"spock"}}
+	job := Job{Id: 4243, Labels: []string{"builder"}}
 	body, _ := json.Marshal(job)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -460,7 +460,7 @@ func TestHandleCreateVmRecoversFromJitConfigConflict(t *testing.T) {
 	inserted := false
 	s := conflictScaler(secret, &jitCalls, &deleteCalls, &deletedName, &inserted, nil)
 
-	w := postCreate(s, secret, Job{Id: 777, Labels: []string{"spock"}})
+	w := postCreate(s, secret, Job{Id: 777, Labels: []string{"builder"}})
 
 	assert.Equal(t, http.StatusOK, w.Code, "should delete the stale registration, retry, and create the VM")
 	assert.Equal(t, 1, deleteCalls, "the stale registration must be deleted exactly once")
@@ -479,7 +479,7 @@ func TestHandleCreateVmJitConflictDeleteFailureReturns500(t *testing.T) {
 	inserted := false
 	s := conflictScaler(secret, &jitCalls, &deleteCalls, &deletedName, &inserted, fmt.Errorf("github API error"))
 
-	w := postCreate(s, secret, Job{Id: 778, Labels: []string{"spock"}})
+	w := postCreate(s, secret, Job{Id: 778, Labels: []string{"builder"}})
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code, "delete failure should surface as 500")
 	assert.Equal(t, 1, deleteCalls, "the stale registration delete should be attempted once")
