@@ -264,7 +264,7 @@ Alternatively, you exceeded your projects vCPU limit for the machine type in the
 
 #### A job that uses a `gce-machine-*` label never gets a VM
 
-The requested type is not in `allowed_machine_types`. Add it, then clear the job's `Failure` field in Firestore and set its next action due (see [LIFECYCLE.md](LIFECYCLE.md#demand-capacity-and-reconciliation-contract)).
+The requested type is not in `allowed_machine_types`. Add it, then resume the parked job in Firestore by clearing `Failure`, setting `NeedsReconcile` to `true`, and setting `NextActionAt` to now (see [LIFECYCLE.md](LIFECYCLE.md#demand-capacity-and-reconciliation-contract)).
 
 #### Nothing happens at all
 

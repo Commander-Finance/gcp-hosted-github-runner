@@ -45,7 +45,15 @@ Fleet admission is transactional. `control/fleet` counts every reservation, incl
 
 The hot query uses the explicit indexed pair `NeedsReconcile=true` and `NextActionAt<=now`, ordered by due time and document ID. Settled terminal records keep a seven-day TTL but never enter that query. Terminal records with pending deletion or an unreleased claim remain actionable. Queued demand normally checks after two minutes; in-progress demand and healthy detached runners check after ten minutes, with completion webhooks and stopped-VM sweeps accelerating cleanup.
 
-`EnqueueToken` and `EnqueuedUntil` cover one bounded retry chain, sized from `TASK_RETRY_*`. The marker is written before enqueue; a crash or ambiguous enqueue result is recovered after marker expiry. Workers reject obsolete dispatch tokens. Lease contention is acknowledged, fleet saturation schedules a later attempt, and permanent configuration failures (for example a `gce-machine-*` type missing from `allowed_machine_types`) are persisted and alerted instead of hot-retried. After correcting a parked configuration failure, an operator must clear that job's `Failure` field and set its next action due. Active reservations still reconcile for cleanup.
+`EnqueueToken` and `EnqueuedUntil` cover one bounded retry chain, sized from `TASK_RETRY_*`. The marker is written before enqueue; a crash or ambiguous enqueue result is recovered after marker expiry. Workers reject obsolete dispatch tokens. Lease contention is acknowledged, fleet saturation schedules a later attempt, and permanent configuration failures (for example a `gce-machine-*` type missing from `allowed_machine_types`) are persisted and alerted instead of hot-retried. A parked job has `NeedsReconcile=false`, so the due query skips it. Active reservations still reconcile for cleanup.
+
+To resume a parked job after correcting its configuration, edit its `jobs/<key>` document in Firestore:
+
+1. Clear `Failure`.
+2. Set `NeedsReconcile` to `true`. The autoscaler derives this field only when it writes the record, so a manual edit to `Failure` does not recompute it.
+3. Set `NextActionAt` to the current time or earlier.
+
+The next reconciliation pass then dispatches the job.
 
 A JIT configuration is discarded if its VM has not been inserted within 45 minutes, so it cannot outlive a prolonged capacity outage.
 
