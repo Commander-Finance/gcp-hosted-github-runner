@@ -62,7 +62,7 @@ func TestReconcileHandlerSkipsSettledLeasedAndUnknownSourceRows(t *testing.T) {
 	now := time.Now()
 
 	seed := func(id int64, r lifecycleRecord) {
-		job := Job{Id: id, RepositoryFullName: "acme/repo", Labels: []string{"spock"}, Status: "queued"}
+		job := Job{Id: id, RepositoryFullName: "acme/repo", Labels: []string{"builder"}, Status: "queued"}
 		r.Job = job
 		r.SchemaVersion = stateVersion
 		prepareRecord(&r)

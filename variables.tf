@@ -235,7 +235,7 @@ variable "github_runner_label_groups" {
     Examples:
       [["self-hosted"]]                # default single-pool
       [["self-hosted", "linux"]]       # single pool, two required labels
-      [["spock"], ["spock-prime"]]     # two disjoint pools via the same autoscaler
+      [["builder"], ["builder-large"]] # two disjoint pools via the same autoscaler
   EOT
   default     = [["self-hosted"]]
   validation {
