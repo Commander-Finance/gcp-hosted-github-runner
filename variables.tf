@@ -80,6 +80,12 @@ variable "machine_timeout" {
   type        = number
   description = "The maximum time a VM may run. Pick a number that is well outside the expected runner job timeouts but small enough to prevent unnecessary cost if a webhook event was lost or was not processed."
   default     = 14400 // 4 h
+
+  validation {
+    # The autoscaler refuses to start below 60 seconds.
+    condition     = var.machine_timeout >= 60
+    error_message = "machine_timeout must be at least 60 seconds."
+  }
 }
 
 variable "runner_register_timeout" {
