@@ -352,8 +352,13 @@ variable "create_concurrency" {
   default     = 4
   description = "Concurrent slow creates, independent of live fleet size and HTTP concurrency."
   validation {
-    condition     = var.create_concurrency >= 1 && var.create_concurrency <= 16 && floor(var.create_concurrency) == var.create_concurrency
-    error_message = "create_concurrency must be an integer between 1 and 16 to reserve HTTP capacity for intake and cleanup."
+    # Each create callback holds one autoscaler request slot until its insert
+    # finishes. The autoscaler serves at most 96 requests at once (3 instances x
+    # 32 in cloudRun.tf), so creates may take half and leave the rest for webhook
+    # intake, the delete and maintenance queues, and scheduled reconciliation.
+    # Raise this only together with that Cloud Run capacity.
+    condition     = var.create_concurrency >= 1 && var.create_concurrency <= 48 && floor(var.create_concurrency) == var.create_concurrency
+    error_message = "create_concurrency must be an integer between 1 and 48 to reserve HTTP capacity for intake and cleanup."
   }
 }
 variable "create_dispatches_per_second" {
