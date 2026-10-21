@@ -2,6 +2,9 @@ module github.com/Tereius/gcp-hosted-github-runner
 
 go 1.21
 
+// Keep in step with the golang image in Dockerfile; the image build ignores this line.
+toolchain go1.26.10
+
 require (
 	cloud.google.com/go/cloudtasks v1.12.11
 	cloud.google.com/go/compute v1.27.3
