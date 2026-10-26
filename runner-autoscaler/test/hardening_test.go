@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -55,7 +56,7 @@ func TestIsCapacityError(t *testing.T) {
 		"rpc error: code = ResourceExhausted desc = quota",
 	}
 	for _, msg := range capacity {
-		assert.True(t, pkg.IsCapacityError(fmt.Errorf(msg)), "expected %q to be a capacity error", msg)
+		assert.True(t, pkg.IsCapacityError(errors.New(msg)), "expected %q to be a capacity error", msg)
 	}
 
 	other := []string{
@@ -65,7 +66,7 @@ func TestIsCapacityError(t *testing.T) {
 		"",
 	}
 	for _, msg := range other {
-		assert.False(t, pkg.IsCapacityError(fmt.Errorf(msg)), "expected %q NOT to be a capacity error", msg)
+		assert.False(t, pkg.IsCapacityError(errors.New(msg)), "expected %q NOT to be a capacity error", msg)
 	}
 	assert.False(t, pkg.IsCapacityError(nil))
 }
