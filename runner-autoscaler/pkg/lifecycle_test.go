@@ -124,9 +124,9 @@ func (m *memoryStore) get(key string) lifecycleRecord {
 func lifecycleTestScaler() (*Autoscaler, *memoryStore, Source, Job) {
 	gin.SetMode(gin.TestMode)
 	src := Source{Name: "acme", SourceType: TypeOrganization, Secret: "secret"}
-	job := Job{Id: 10, RepositoryFullName: "acme/repo", Labels: []string{"spock"}, Status: "queued"}
+	job := Job{Id: 10, RepositoryFullName: "acme/repo", Labels: []string{"builder"}, Status: "queued"}
 	m := &memoryStore{rows: map[string]lifecycleRecord{}}
-	s := NewAutoscaler(AutoscalerConfig{StateDatabase: "test", RouteWebhook: "/webhook", RouteCreateVm: "/create_vm", RouteDeleteVm: "/delete_vm", RouteRecreateVm: "/recreate_vm", SourceQueryParam: "src", RunnerPrefix: "runner", RunnerLabelGroups: [][]string{{"spock"}}, RegisteredSources: map[string]Source{src.Name: src}, CallbackBaseURL: "https://trusted.example", TaskTimeout: 30, TaskRetryAttempts: 4, TaskRetryMaxBackoff: 30, TaskRetryMaxDuration: 120, MaxRunners: 2, MaxOnDemandRunners: 1, AllowOnDemand: true, Zones: []string{"z1", "z2"}, InstanceTemplate: "spot", FallbackInstanceTemplate: "standard", RunnerJobLogPattern: DefaultRunnerJobLogPattern})
+	s := NewAutoscaler(AutoscalerConfig{StateDatabase: "test", RouteWebhook: "/webhook", RouteCreateVm: "/create_vm", RouteDeleteVm: "/delete_vm", RouteRecreateVm: "/recreate_vm", SourceQueryParam: "src", RunnerPrefix: "runner", RunnerLabelGroups: [][]string{{"builder"}}, RegisteredSources: map[string]Source{src.Name: src}, CallbackBaseURL: "https://trusted.example", TaskTimeout: 30, TaskRetryAttempts: 4, TaskRetryMaxBackoff: 30, TaskRetryMaxDuration: 120, MaxRunners: 2, MaxOnDemandRunners: 1, AllowOnDemand: true, Zones: []string{"z1", "z2"}, InstanceTemplate: "spot", FallbackInstanceTemplate: "standard", RunnerJobLogPattern: DefaultRunnerJobLogPattern})
 	s.store = m
 	s.jobStatusFn = func(context.Context, Job) (string, error) { return "queued", nil }
 	s.instanceStateFn = func(context.Context, string) (bool, State, error) { return false, Unknown, nil }
@@ -320,8 +320,8 @@ func TestRecreateRejectsExpiredOrOldGeneration(t *testing.T) {
 	}
 }
 func TestMixedCaseLabelsAndOverride(t *testing.T) {
-	j := Job{Labels: []string{"SpOcK", "GCE-MACHINE-N4-STANDARD-2"}}
-	ok, _ := j.HasAnyLabelGroup([][]string{{"spock"}})
+	j := Job{Labels: []string{"BuIlDeR", "GCE-MACHINE-N4-STANDARD-2"}}
+	ok, _ := j.HasAnyLabelGroup([][]string{{"builder"}})
 	require.True(t, ok)
 	require.Equal(t, "n4-standard-2", *j.GetMagicLabelValue(MagicLabelMachine))
 	require.True(t, Job{Labels: []string{"@Machine:n2-standard-8"}}.HasLegacyMagicLabel())
