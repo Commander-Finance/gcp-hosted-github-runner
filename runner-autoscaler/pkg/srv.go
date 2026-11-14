@@ -31,6 +31,7 @@ import (
 	ginlogrus "github.com/toorop/gin-logrus"
 	"google.golang.org/api/idtoken"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -853,53 +854,66 @@ const standardFallbackFamilies = 2
 //     familyFallbackPlan): one attempt per machine type on the SPOT template (rotating
 //     zones), then the top few on-demand.
 //
-// benched zones (from the zone circuit breaker) are rotated to the end of the zone
-// order so every plan shape tries a healthy zone first; nil means none.
+// benched zones (from the connectivity breaker) are rotated to the end of the zone
+// order so every plan shape tries a healthy zone first. spotBenched zones (from the
+// preemption breaker) are rotated to the end for SPOT attempts only, ahead of the
+// connectivity-benched zones: a preempted zone loses some jobs, a disconnected one
+// loses all of them, and on-demand VMs are never preempted. nil means none.
 //
 // Pure (no I/O) so the ordering is testable.
-func (s *Autoscaler) creationPlan(instanceName string, override *string, benched map[string]bool) []creationAttempt {
+func (s *Autoscaler) creationPlan(instanceName string, override *string, benched map[string]bool, spotBenched map[string]bool) []creationAttempt {
 
-	zones := s.orderedZonesBenched(instanceName, benched)
-	if len(zones) == 0 {
+	standardZones := s.orderedZonesByTier(instanceName, benched)
+	if len(standardZones) == 0 {
 		return []creationAttempt{}
 	}
+	spotZones := s.orderedZonesByTier(instanceName, spotBenched, benched)
 
 	primaryModel := "standard"
+	primaryZones := standardZones
 	if s.conf.FallbackInstanceTemplate != "" {
 		// A fallback template only exists when the primary is preemptible/SPOT.
 		primaryModel = "spot"
+		primaryZones = spotZones
 	}
 
 	// Family fallback applies only to the default pool (no magic-label override) and
 	// only when a fallback list is configured. Its walk assigns zones round-robin by
 	// attempt index, so with more families than healthy zones a benched-last order
 	// would still land a family on a benched zone mid-incident; the walk therefore
-	// rotates over the healthy zones only (all zones when none or all are benched).
+	// rotates over the best zones only (all zones when none or all are benched).
 	if override == nil && len(s.conf.MachineTypeFallbacks) > 0 {
-		return s.familyFallbackPlan(healthyZones(zones, benched), primaryModel)
+		primaryBest := preferredZones(standardZones, benched)
+		if primaryModel == "spot" {
+			primaryBest = preferredZones(spotZones, spotBenched, benched)
+		}
+		return s.familyFallbackPlan(primaryBest, preferredZones(standardZones, benched), primaryModel)
 	}
 
 	machineType := ""
 	if override != nil {
 		machineType = *override
 	}
-	return s.legacyPlan(zones, primaryModel, machineType)
+	return s.legacyPlan(primaryZones, standardZones, primaryModel, machineType)
 }
 
 // legacyPlan is the original template×zone sweep: the primary template across every
 // zone, then (when the primary is SPOT) the on-demand template across every zone. Every
 // attempt carries the given machineType ("" = template default).
-func (s *Autoscaler) legacyPlan(zones []string, primaryModel string, machineType string) []creationAttempt {
+func (s *Autoscaler) legacyPlan(primaryZones []string, fallbackZones []string, primaryModel string, machineType string) []creationAttempt {
 
-	type tmpl struct{ template, model string }
-	templates := []tmpl{{s.conf.InstanceTemplate, primaryModel}}
+	type tmpl struct {
+		template, model string
+		zones           []string
+	}
+	templates := []tmpl{{s.conf.InstanceTemplate, primaryModel, primaryZones}}
 	if s.conf.FallbackInstanceTemplate != "" {
-		templates = append(templates, tmpl{s.conf.FallbackInstanceTemplate, "standard"})
+		templates = append(templates, tmpl{s.conf.FallbackInstanceTemplate, "standard", fallbackZones})
 	}
 
-	plan := make([]creationAttempt, 0, len(templates)*len(zones))
+	plan := make([]creationAttempt, 0, len(templates)*len(primaryZones))
 	for _, t := range templates {
-		for _, zone := range zones {
+		for _, zone := range t.zones {
 			plan = append(plan, creationAttempt{template: t.template, zone: zone, provisioningModel: t.model, machineType: machineType})
 		}
 	}
@@ -913,7 +927,7 @@ func (s *Autoscaler) legacyPlan(zones []string, primaryModel string, machineType
 // for a family tends to be correlated across a region's zones but uncorrelated across
 // families, so rotating families is far more valuable than rotating zones, and it bounds
 // the attempt count to fit the create deadline.
-func (s *Autoscaler) familyFallbackPlan(zones []string, primaryModel string) []creationAttempt {
+func (s *Autoscaler) familyFallbackPlan(primaryZones []string, fallbackZones []string, primaryModel string) []creationAttempt {
 
 	// De-duplicate (preserving order) so a repeated family can't waste a creation
 	// attempt or let the capped STANDARD pass spend both slots on the same type and
@@ -924,7 +938,7 @@ func (s *Autoscaler) familyFallbackPlan(zones []string, primaryModel string) []c
 	for i, fam := range fams {
 		plan = append(plan, creationAttempt{
 			template:          s.conf.InstanceTemplate,
-			zone:              zones[i%len(zones)],
+			zone:              primaryZones[i%len(primaryZones)],
 			provisioningModel: primaryModel,
 			machineType:       fam,
 		})
@@ -938,7 +952,7 @@ func (s *Autoscaler) familyFallbackPlan(zones []string, primaryModel string) []c
 		for i := 0; i < n; i++ {
 			plan = append(plan, creationAttempt{
 				template:          s.conf.FallbackInstanceTemplate,
-				zone:              zones[i%len(zones)],
+				zone:              fallbackZones[i%len(fallbackZones)],
 				provisioningModel: "standard",
 				machineType:       fams[i],
 			})
@@ -994,7 +1008,7 @@ func (s *Autoscaler) CreateInstanceFromTemplate(ctx context.Context, instanceNam
 
 	// The breaker query is bounded and fails open, so it can sit on the create path
 	// (the service scales to zero; there is no other place for it to run).
-	plan := s.creationPlan(instanceName, machineType, s.benchedZonesCached(ctx))
+	plan := s.creationPlan(instanceName, machineType, s.benchedZonesCached(ctx), s.preemptionBenchedCached(ctx))
 	if len(plan) == 0 {
 		// No attempt would run (no zones configured) - surface it instead of
 		// silently reporting success.
@@ -1846,6 +1860,19 @@ type AutoscalerConfig struct {
 	ZoneBenchMinVMs   int64
 	ZoneBenchMinRatio float64
 	ZoneHealthWindow  int64
+
+	// Preemption breaker (see preemptionhealth.go). A zone is tried last for Spot
+	// when it had at least PreemptionBenchMin Spot preemptions in the last
+	// PreemptionWindowDays days at PreemptionBenchFactor times the rest of the
+	// fleet's rate, on any of the last PreemptionHoldDays+1 days. The counts come
+	// from the log-based metrics PreemptedMetric and SpotCreatedMetric.
+	// PreemptionBenchMin <= 0 disables the breaker.
+	PreemptionBenchMin    int64
+	PreemptionBenchFactor float64
+	PreemptionWindowDays  int64
+	PreemptionHoldDays    int64
+	PreemptedMetric       string
+	SpotCreatedMetric     string
 }
 
 // Validate checks startup invariants that, if violated, would leave the
@@ -1890,6 +1917,19 @@ func (c AutoscalerConfig) Validate() error {
 	// what the breaker does, so refuse to start while the breaker is enabled.
 	if c.ZoneBenchMinVMs > 0 && (c.ZoneBenchMinRatio <= 0 || c.ZoneBenchMinRatio > 1) {
 		return fmt.Errorf("ZoneBenchMinRatio must be in (0, 1] when ZoneBenchMinVMs > 0, got %v", c.ZoneBenchMinRatio)
+	}
+	// A factor of 1 or less benches zones that are no worse than the rest of the
+	// fleet, and a missing metric name reads nothing and silently benches nothing.
+	if c.PreemptionBenchMin > 0 {
+		if c.PreemptionBenchFactor <= 1 {
+			return fmt.Errorf("PreemptionBenchFactor must be greater than 1 when PreemptionBenchMin > 0, got %v", c.PreemptionBenchFactor)
+		}
+		if c.PreemptionWindowDays < 1 || c.PreemptionHoldDays < 0 {
+			return fmt.Errorf("PreemptionWindowDays must be at least 1 and PreemptionHoldDays at least 0, got %d and %d", c.PreemptionWindowDays, c.PreemptionHoldDays)
+		}
+		if c.PreemptedMetric == "" || c.SpotCreatedMetric == "" {
+			return fmt.Errorf("PreemptedMetric and SpotCreatedMetric are required when PreemptionBenchMin > 0")
+		}
 	}
 	return nil
 }
@@ -1939,6 +1979,15 @@ type Autoscaler struct {
 	zoneMu        sync.Mutex
 	zoneBenched   map[string]bool
 	zoneCheckedAt time.Time
+
+	// Preemption breaker state (see preemptionhealth.go), cached the same way.
+	// preemptionReportFn is the test seam for the Monitoring read and
+	// monitoringOpts redirects the real client in tests; both nil in production.
+	preemptionReportFn func(ctx context.Context, end time.Time) (preemptionReport, error)
+	monitoringOpts     []option.ClientOption
+	preemptMu          sync.Mutex
+	preemptBenched     map[string]bool
+	preemptCheckedAt   time.Time
 }
 
 func NewAutoscaler(config AutoscalerConfig) *Autoscaler {

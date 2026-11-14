@@ -174,6 +174,62 @@ variable "zone_health_window" {
   default     = 600
 }
 
+variable "preemption_bench_min" {
+  type        = number
+  description = <<-EOT
+    Preemption breaker: a zone is tried last for Spot VMs (skipped for Spot when
+    machine_type_fallbacks is set) when at least this many of its
+    Spot VMs were preempted in the last preemption_window_days days, at
+    preemption_bench_factor times the rest of the fleet's rate. It stays deprioritized
+    until that has been false for preemption_hold_days days. The counts come from the
+    github_runner/vm_preempted and github_runner/spot_vm_created log-based metrics,
+    read through Cloud Monitoring on the create path, cached 10 minutes, and failing
+    open. Those metrics count only from creation, so the breaker deprioritizes nothing
+    until they have collected data. At most half the zones are deprioritized, and
+    on-demand VMs ignore the breaker. Applies only when machine_preemtible is true.
+    0 disables the breaker.
+  EOT
+  default     = 5
+
+  validation {
+    condition     = var.preemption_bench_min >= 0 && floor(var.preemption_bench_min) == var.preemption_bench_min
+    error_message = "preemption_bench_min must be 0 (disabled) or a positive whole count."
+  }
+}
+
+variable "preemption_bench_factor" {
+  type        = number
+  description = "Preemption breaker: how many times the rest of the fleet's preemption rate a zone's rate must reach (2 = twice as often). Must be greater than 1."
+  default     = 2
+
+  validation {
+    condition     = var.preemption_bench_factor > 1
+    error_message = "preemption_bench_factor must be greater than 1."
+  }
+}
+
+variable "preemption_window_days" {
+  type        = number
+  description = "Preemption breaker lookback in days."
+  default     = 7
+
+  validation {
+    condition     = var.preemption_window_days >= 1 && floor(var.preemption_window_days) == var.preemption_window_days
+    error_message = "preemption_window_days must be a whole number of days, at least 1."
+  }
+}
+
+variable "preemption_hold_days" {
+  type        = number
+  description = "Preemption breaker: days a zone stays deprioritized after its window stops meeting the rule. A deprioritized zone gets almost no Spot VMs, so the hold reads its pre-deprioritization history; recovery is only tested by restoring it."
+  default     = 2
+
+  validation {
+    condition     = var.preemption_hold_days >= 0 && floor(var.preemption_hold_days) == var.preemption_hold_days
+    error_message = "preemption_hold_days must be a whole number of days, at least 0."
+  }
+}
+
 variable "enable_ssh" {
   type        = bool
   description = "Enable SSH access to the VM instances."

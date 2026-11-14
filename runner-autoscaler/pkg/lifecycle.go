@@ -385,7 +385,7 @@ func (s *Autoscaler) processJob(ctx context.Context, src Source, job Job) error 
 			return e
 		}
 	}
-	full := s.creationPlan(r.VMName, override, s.benchedZonesCached(ctx))
+	full := s.creationPlan(r.VMName, override, s.benchedZonesCached(ctx), s.preemptionBenchedCached(ctx))
 	plan := full
 	if r.Zone != "" {
 		// Retry the saved attempt first; the persisted machine, not the job
