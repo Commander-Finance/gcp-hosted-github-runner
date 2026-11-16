@@ -17,6 +17,13 @@ locals {
   // jsonPayload.message never fires on them. format(local.msg_re, "<regex>")
   // matches the pattern against both fields.
   msg_re = "(jsonPayload.message=~\"%[1]s\" OR textPayload=~\"%[1]s\")"
+
+  // The preemption breaker reads these two metrics by name. Cloud Run gets the
+  // literals rather than the resources' names: the spot-created metric filters on
+  // the Cloud Run service name, so referencing it would be a cycle, and both names
+  // are kept here together.
+  preempted_metric_name    = "github_runner/vm_preempted"
+  spot_created_metric_name = "github_runner/spot_vm_created"
 }
 
 // Counts created runner VMs, labelled by provisioning model ("spot" / "standard").
@@ -40,6 +47,55 @@ resource "google_logging_metric" "runner_vm_created" {
 
   label_extractors = {
     "provisioning_model" = "EXTRACT(jsonPayload.provisioning_model)"
+  }
+}
+
+// Spot VMs created per zone: the denominator of the preemption breaker's per-zone
+// rate. It is a separate metric, not a zone label on vm_created, so vm_created and
+// the charts built on it stay unchanged. A create callback retried after the insert
+// succeeded logs "Created instance" again and counts twice; that bias is the same in
+// every zone, so the relative rates the breaker compares hold.
+resource "google_logging_metric" "runner_spot_vm_created" {
+  name   = local.spot_created_metric_name
+  filter = "${local.autoscaler_log_filter} jsonPayload.provisioning_model=\"spot\""
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+    labels {
+      key         = "zone"
+      value_type  = "STRING"
+      description = "Zone the Spot VM was created in"
+    }
+  }
+
+  label_extractors = {
+    "zone" = "EXTRACT(jsonPayload.zone)"
+  }
+}
+
+// Spot preemptions of this fleet's runner VMs per zone: the numerator of the
+// preemption breaker's per-zone rate. GCE writes compute.instances.preempted to the
+// System Event audit log when a preempted VM's 30 s grace period ends. Matching the
+// "/instances/<prefix>-" path keeps other workloads' VMs in the project out.
+resource "google_logging_metric" "runner_vm_preempted" {
+  name   = local.preempted_metric_name
+  filter = "resource.type=\"gce_instance\" logName=\"projects/${local.projectId}/logs/cloudaudit.googleapis.com%2Fsystem_event\" protoPayload.methodName=\"compute.instances.preempted\" protoPayload.resourceName:\"/instances/${var.github_runner_prefix}-\""
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+    labels {
+      key         = "zone"
+      value_type  = "STRING"
+      description = "Zone of the preempted VM"
+    }
+  }
+
+  label_extractors = {
+    "zone" = "EXTRACT(resource.labels.zone)"
   }
 }
 

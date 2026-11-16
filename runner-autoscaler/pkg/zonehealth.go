@@ -68,22 +68,7 @@ type zoneReport struct {
 // summary renders the report as "zone=failing/created ..." in zone order, or
 // "no VMs" when the window was empty.
 func (r zoneReport) summary() string {
-
-	zones := map[string]bool{}
-	for z := range r.failing {
-		zones[z] = true
-	}
-	for z := range r.created {
-		zones[z] = true
-	}
-	if len(zones) == 0 {
-		return "no VMs"
-	}
-	parts := make([]string, 0, len(zones))
-	for _, z := range sortedKeys(zones) {
-		parts = append(parts, fmt.Sprintf("%s=%d/%d", z, r.failing[z], r.created[z]))
-	}
-	return strings.Join(parts, " ")
+	return countsSummary(r.failing, r.created)
 }
 
 // benchedZones applies the thresholds: a zone is benched when at least minVMs of its
@@ -112,49 +97,50 @@ func benchedZones(r zoneReport, minVMs int64, minRatio float64) map[string]bool 
 	return benched
 }
 
-// orderedZonesBenched is OrderedZones with the benched zones moved to the end, each
-// group keeping its rotation order. Benched zones stay in the list: they are the
-// last resort when every healthy zone is out of capacity, not excluded. When every
-// zone is benched there is nothing to prefer, so the plain rotation stands.
-func (s *Autoscaler) orderedZonesBenched(seed string, benched map[string]bool) []string {
+// zoneTier is 0 for a zone in none of the bench sets, otherwise one more than the
+// index of the last set holding it: later sets are worse.
+func zoneTier(zone string, benches []map[string]bool) int {
 
-	ordered := s.OrderedZones(seed)
-	if len(benched) == 0 {
-		return ordered
-	}
-	healthy := make([]string, 0, len(ordered))
-	bad := make([]string, 0, len(benched))
-	for _, z := range ordered {
-		if benched[z] {
-			bad = append(bad, z)
-		} else {
-			healthy = append(healthy, z)
+	tier := 0
+	for i, b := range benches {
+		if b[zone] {
+			tier = i + 1
 		}
 	}
-	if len(healthy) == 0 {
-		return ordered
-	}
-	return append(healthy, bad...)
+	return tier
 }
 
-// healthyZones returns the ordered zones with the benched ones removed, for walks
-// that assign zones by index rather than trying every zone. All zones are returned
-// when none or all are benched, matching orderedZonesBenched.
-func healthyZones(ordered []string, benched map[string]bool) []string {
+// orderedZonesByTier is OrderedZones stably sorted by zoneTier, so each tier keeps
+// its rotation order. Benched zones stay in the list as the last resort when the
+// better zones are out of capacity. When every zone shares one tier there is
+// nothing to prefer and the plain rotation stands.
+func (s *Autoscaler) orderedZonesByTier(seed string, benches ...map[string]bool) []string {
 
-	if len(benched) == 0 {
-		return ordered
-	}
-	healthy := make([]string, 0, len(ordered))
+	ordered := s.OrderedZones(seed)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return zoneTier(ordered[i], benches) < zoneTier(ordered[j], benches)
+	})
+	return ordered
+}
+
+// preferredZones returns the ordered zones in the best tier present, for walks
+// that assign zones by index rather than trying every zone. With no zone benched,
+// or every zone in one tier, that is every zone.
+func preferredZones(ordered []string, benches ...map[string]bool) []string {
+
+	best := -1
 	for _, z := range ordered {
-		if !benched[z] {
-			healthy = append(healthy, z)
+		if t := zoneTier(z, benches); best < 0 || t < best {
+			best = t
 		}
 	}
-	if len(healthy) == 0 {
-		return ordered
+	out := make([]string, 0, len(ordered))
+	for _, z := range ordered {
+		if zoneTier(z, benches) == best {
+			out = append(out, z)
+		}
 	}
-	return healthy
+	return out
 }
 
 // benchedZonesCached returns the zones to try last, querying the sensor at most
@@ -219,6 +205,36 @@ func (s *Autoscaler) logBenchChanges(benched map[string]bool, r zoneReport, wind
 			log.Infof("Released zone %s: back in the normal rotation", zone)
 		}
 	}
+}
+
+func toSet(keys []string) map[string]bool {
+
+	set := map[string]bool{}
+	for _, k := range keys {
+		set[k] = true
+	}
+	return set
+}
+
+// countsSummary renders two per-zone counts as "zone=count/created ..." in zone
+// order, or "no VMs" when both are empty.
+func countsSummary(count map[string]int, created map[string]int) string {
+
+	zones := map[string]bool{}
+	for z := range count {
+		zones[z] = true
+	}
+	for z := range created {
+		zones[z] = true
+	}
+	if len(zones) == 0 {
+		return "no VMs"
+	}
+	parts := make([]string, 0, len(zones))
+	for _, z := range sortedKeys(zones) {
+		parts = append(parts, fmt.Sprintf("%s=%d/%d", z, count[z], created[z]))
+	}
+	return strings.Join(parts, " ")
 }
 
 func sortedKeys(m map[string]bool) []string {

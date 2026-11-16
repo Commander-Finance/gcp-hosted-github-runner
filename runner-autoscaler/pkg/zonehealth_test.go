@@ -88,12 +88,12 @@ func TestBenchedZonesThresholds(t *testing.T) {
 	}
 }
 
-func TestOrderedZonesBenchedMovesBenchedZonesLast(t *testing.T) {
+func TestOrderedZonesByTierMovesBenchedZonesLast(t *testing.T) {
 
 	s := &Autoscaler{conf: AutoscalerConfig{Zones: []string{"a", "b", "c", "f"}}}
 	plain := s.OrderedZones("runner-42")
 
-	got := s.orderedZonesBenched("runner-42", map[string]bool{"b": true})
+	got := s.orderedZonesByTier("runner-42", map[string]bool{"b": true})
 	require.Len(t, got, 4)
 	assert.Equal(t, "b", got[3], "benched zone must be tried last")
 	// The healthy zones keep their rotation order relative to each other.
@@ -107,26 +107,26 @@ func TestOrderedZonesBenchedMovesBenchedZonesLast(t *testing.T) {
 	assert.ElementsMatch(t, plain, got, "every zone still appears exactly once")
 }
 
-func TestOrderedZonesBenchedNoBenchIsPlainRotation(t *testing.T) {
+func TestOrderedZonesByTierNoBenchIsPlainRotation(t *testing.T) {
 
 	s := &Autoscaler{conf: AutoscalerConfig{Zones: []string{"a", "b", "c"}}}
-	assert.Equal(t, s.OrderedZones("x"), s.orderedZonesBenched("x", nil))
-	assert.Equal(t, s.OrderedZones("x"), s.orderedZonesBenched("x", map[string]bool{}))
+	assert.Equal(t, s.OrderedZones("x"), s.orderedZonesByTier("x", nil))
+	assert.Equal(t, s.OrderedZones("x"), s.orderedZonesByTier("x", map[string]bool{}))
 }
 
-func TestOrderedZonesBenchedAllBenchedIsPlainRotation(t *testing.T) {
+func TestOrderedZonesByTierAllBenchedIsPlainRotation(t *testing.T) {
 
 	// If every zone is benched there is nothing to prefer; keep the deterministic
 	// rotation rather than an arbitrary reshuffle.
 	s := &Autoscaler{conf: AutoscalerConfig{Zones: []string{"a", "b", "c"}}}
 	all := map[string]bool{"a": true, "b": true, "c": true}
-	assert.Equal(t, s.OrderedZones("x"), s.orderedZonesBenched("x", all))
+	assert.Equal(t, s.OrderedZones("x"), s.orderedZonesByTier("x", all))
 }
 
 func TestCreationPlanLegacyTriesBenchedZoneLastPerTemplate(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"a", "b", "c"})
-	plan := s.creationPlan("runner-7", nil, map[string]bool{"b": true})
+	plan := s.creationPlan("runner-7", nil, map[string]bool{"b": true}, nil)
 
 	require.Len(t, plan, 6)
 	// Within the SPOT sweep and again within the STANDARD sweep, "b" is last.
@@ -141,7 +141,7 @@ func TestCreationPlanLegacyTriesBenchedZoneLastPerTemplate(t *testing.T) {
 func TestCreationPlanFamilyFallbackAvoidsBenchedZoneFirst(t *testing.T) {
 
 	s := familyScaler([]string{"a", "b"}, []string{"c4d-standard-2", "n4-standard-2", "c3-standard-4"})
-	plan := s.creationPlan("runner-7", nil, map[string]bool{"a": true})
+	plan := s.creationPlan("runner-7", nil, map[string]bool{"a": true}, nil)
 
 	require.Len(t, plan, 5) // 3 spot families + 2 standard
 	// The family walk rotates zones by attempt index. With more families than healthy
@@ -156,7 +156,7 @@ func TestCreationPlanFamilyFallbackUsesAllZonesWhenAllBenched(t *testing.T) {
 
 	// Nothing to prefer: the plain rotation stands so capacity diversity is kept.
 	s := familyScaler([]string{"a", "b"}, []string{"c4d-standard-2", "n4-standard-2", "c3-standard-4"})
-	plan := s.creationPlan("runner-7", nil, map[string]bool{"a": true, "b": true})
+	plan := s.creationPlan("runner-7", nil, map[string]bool{"a": true, "b": true}, nil)
 	require.Len(t, plan, 5)
 	zones := map[string]bool{}
 	for _, attempt := range plan {
@@ -168,8 +168,8 @@ func TestCreationPlanFamilyFallbackUsesAllZonesWhenAllBenched(t *testing.T) {
 func TestCreationPlanNilBenchedMatchesPlainOrder(t *testing.T) {
 
 	s := spotFallbackScaler([]string{"a", "b", "c"})
-	assert.Equal(t, s.creationPlan("runner-7", nil, nil), s.creationPlan("runner-7", nil, map[string]bool{}))
-	assert.Equal(t, s.OrderedZones("runner-7")[0], s.creationPlan("runner-7", nil, nil)[0].zone)
+	assert.Equal(t, s.creationPlan("runner-7", nil, nil, nil), s.creationPlan("runner-7", nil, map[string]bool{}, nil))
+	assert.Equal(t, s.OrderedZones("runner-7")[0], s.creationPlan("runner-7", nil, nil, nil)[0].zone)
 }
 
 // messagesWithPrefix returns every captured log message starting with prefix, in

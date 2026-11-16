@@ -65,6 +65,12 @@ Terraform sets every variable below from the module inputs (`cloudRun.tf`). Vari
 | ZONE_BENCH_MIN_VMS | "3" | Zone circuit breaker: a zone is tried last when at least this many of its runner VMs logged an outbound dial timeout (the Ops Agent's `Exporting failed ... i/o timeout` syslog line) in the last `ZONE_HEALTH_WINDOW` seconds. Read from Cloud Logging on the create path, cached 60 s, fails open. Needs `logging.logEntries.list` and a runner image that ships the Ops Agent. "0" disables the breaker. |
 | ZONE_BENCH_MIN_RATIO | "0.2" | Zone circuit breaker: the failing VMs must also be at least this fraction of the VMs created in that zone in the window. Must be in (0, 1]. |
 | ZONE_HEALTH_WINDOW | "600" | Zone circuit breaker lookback in seconds. |
+| PREEMPTION_BENCH_MIN | "5" | Preemption breaker: a zone is tried last for Spot VMs (skipped for Spot when `RUNNER_MACHINE_TYPE_FALLBACKS` is set) when at least this many of its Spot VMs were preempted in the last `PREEMPTION_WINDOW_DAYS` days at `PREEMPTION_BENCH_FACTOR` times the rest of the fleet's rate. At most half the zones are deprioritized, and on-demand attempts ignore it. Read from Cloud Monitoring on the create path, cached 10 minutes, fails open. Needs `monitoring.timeSeries.list`. Runs only when `INSTANCE_TEMPLATE_FALLBACK` is set. "0" disables the breaker. |
+| PREEMPTION_BENCH_FACTOR | "2.0" | Preemption breaker: multiple of the rest of the fleet's preemption rate a zone must reach. Must be greater than 1. |
+| PREEMPTION_WINDOW_DAYS | "7" | Preemption breaker lookback in days. |
+| PREEMPTION_HOLD_DAYS | "2" | Preemption breaker: days a zone stays deprioritized after its window stops meeting the rule. |
+| PREEMPTED_METRIC | "github_runner/vm_preempted" | Log-based metric counting Spot preemptions, with a `zone` label. |
+| SPOT_CREATED_METRIC | "github_runner/spot_vm_created" | Log-based metric counting Spot VMs created, with a `zone` label. |
 
 #### GitHub
 

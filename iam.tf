@@ -122,6 +122,22 @@ resource "google_project_iam_member" "read_log_entries_member" {
   role    = google_project_iam_custom_role.read_log_entries.id
 }
 
+// monitoring.timeSeries.list is required by the preemption breaker, which reads the
+// per-zone Spot creation and preemption counters. As with log reads, the role holds
+// only that permission rather than the predefined monitoring viewer role, which
+// would also expose dashboards, alert policies and uptime checks.
+resource "google_project_iam_custom_role" "read_time_series" {
+  role_id     = "ReadTimeSeries"
+  title       = "Read time series"
+  permissions = ["monitoring.timeSeries.list"]
+}
+
+resource "google_project_iam_member" "read_time_series_member" {
+  project = local.projectId
+  member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"
+  role    = google_project_iam_custom_role.read_time_series.id
+}
+
 resource "google_project_iam_member" "create_delete_cloud_task_member" {
   project = local.projectId
   member  = "serviceAccount:${google_service_account.autoscaler_sa.email}"

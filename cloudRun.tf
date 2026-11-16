@@ -92,6 +92,32 @@ resource "google_cloud_run_v2_service" "autoscaler" {
         value = var.zone_health_window
       }
       env {
+        name  = "PREEMPTION_BENCH_MIN"
+        value = var.preemption_bench_min
+      }
+      env {
+        name  = "PREEMPTION_BENCH_FACTOR"
+        value = var.preemption_bench_factor
+      }
+      env {
+        name  = "PREEMPTION_WINDOW_DAYS"
+        value = var.preemption_window_days
+      }
+      env {
+        name  = "PREEMPTION_HOLD_DAYS"
+        value = var.preemption_hold_days
+      }
+      env {
+        # Literal names from locals, not the metric resources: the spot-created
+        # metric filters on this service's name, so referencing it would be a cycle.
+        name  = "PREEMPTED_METRIC"
+        value = local.preempted_metric_name
+      }
+      env {
+        name  = "SPOT_CREATED_METRIC"
+        value = local.spot_created_metric_name
+      }
+      env {
         name  = "CREATE_VM_DELAY"
         value = var.machine_creation_delay
       }
